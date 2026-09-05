@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 import shutil
 import sys
 import traceback

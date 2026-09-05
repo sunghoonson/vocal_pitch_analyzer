@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# RVC_TRAINING_MODULE_LAUNCH_HOTFIX
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -331,10 +333,40 @@ class RVCTrainingPipeline:
             0,
         )
 
+        # RVC_TRAINING_PYTHONPATH_HOTFIX
+        process_env = os.environ.copy()
+
+        # RVC scripts import sibling top-level packages such as
+        # infer/configs/tools/train.  When launched as
+        # `python train/preprocess.py`, sys.path[0] is tools/rvc/train,
+        # so explicitly expose the RVC project root to every child.
+        pythonpath_entries = [
+            str(cwd),
+        ]
+
+        existing_pythonpath = process_env.get(
+            "PYTHONPATH",
+            "",
+        )
+
+        if existing_pythonpath:
+            pythonpath_entries.append(
+                existing_pythonpath
+            )
+
+        process_env["PYTHONPATH"] = os.pathsep.join(
+            pythonpath_entries
+        )
+
+        if env:
+            process_env.update(
+                env
+            )
+
         process = subprocess.Popen(
             command,
             cwd=str(cwd),
-            env=env,
+            env=process_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -796,7 +828,8 @@ class RVCTrainingPipeline:
         self._run(
             [
                 str(py),
-                "train/preprocess.py",
+                "-m",
+                "train.preprocess",
                 str(dataset),
                 "40000",
                 str(workers),
@@ -819,7 +852,8 @@ class RVCTrainingPipeline:
         self._run(
             [
                 str(py),
-                "train/dataset/extract_f0.py",
+                "-m",
+                "train.dataset.extract_f0",
                 "cuda",
                 "1",
                 "0",
@@ -839,7 +873,8 @@ class RVCTrainingPipeline:
         self._run(
             [
                 str(py),
-                "train/dataset/extract_hubert_feature.py",
+                "-m",
+                "train.dataset.extract_hubert_feature",
                 f"cuda:{gpu_id}",
                 "1",
                 "0",
@@ -901,7 +936,8 @@ class RVCTrainingPipeline:
         self._run(
             [
                 str(py),
-                "train/train.py",
+                "-m",
+                "train.train",
                 "-e",
                 exp_name,
                 "-sr",
@@ -944,7 +980,8 @@ class RVCTrainingPipeline:
         self._run(
             [
                 str(py),
-                "train/train_index.py",
+                "-m",
+                "train.train_index",
                 exp_name,
                 "v2",
                 str(
