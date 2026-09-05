@@ -22,9 +22,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -74,10 +76,17 @@ from rvc_rmvpe import (
     rvc_available,
     rvc_status_text,
 )
+from rvc_trainer import (
+    RVCTrainingError,
+    RVCTrainingPipeline,
+    dataset_status_text,
+    training_assets_status,
+)
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v1.9 / RVC + RMVPE"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.0 / RVC Training"
 
+# V20_RVC_TRAINING_PATCH
 # V19_RVC_RMVPE_PATCH
 # V18_SEED_VC_SVC_PATCH
 # V17_KEY_TRANSPOSE_PATCH
@@ -516,6 +525,100 @@ class RVCTransposeThread(QThread):
 
 
 
+class RVCTrainingThread(QThread):
+    progress_changed = Signal(
+        int,
+        str,
+    )
+    log_line = Signal(str)
+    training_done = Signal(
+        str,
+        str,
+    )
+    training_failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        dataset_dir: str,
+        experiment_name: str,
+        epochs: int,
+        batch_size: int,
+        save_every: int,
+        workers: int,
+        gpu_id: int,
+        cache_gpu: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+
+        self.dataset_dir = dataset_dir
+        self.experiment_name = (
+            experiment_name
+        )
+        self.epochs = epochs
+        self.batch_size = (
+            batch_size
+        )
+        self.save_every = (
+            save_every
+        )
+        self.workers = workers
+        self.gpu_id = gpu_id
+        self.cache_gpu = (
+            cache_gpu
+        )
+
+        self.pipeline = RVCTrainingPipeline(
+            log_callback=lambda text: (
+                self.log_line.emit(
+                    text
+                )
+            ),
+            progress_callback=lambda p, text: (
+                self.progress_changed.emit(
+                    p,
+                    text,
+                )
+            ),
+        )
+
+    def cancel(self):
+        self.pipeline.cancel()
+
+    def run(self):
+        try:
+            result = self.pipeline.run(
+                dataset_dir=self.dataset_dir,
+                experiment_name=self.experiment_name,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                save_every=self.save_every,
+                workers=self.workers,
+                gpu_id=self.gpu_id,
+                cache_gpu=self.cache_gpu,
+            )
+
+            self.training_done.emit(
+                str(
+                    result.model_path
+                ),
+                (
+                    str(
+                        result.index_path
+                    )
+                    if result.index_path
+                    else ""
+                ),
+            )
+
+        except Exception:
+            self.training_failed.emit(
+                traceback.format_exc()
+            )
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -525,6 +628,7 @@ class MainWindow(QMainWindow):
         self.pipeline_result: PipelineResult | None = None
         self.worker: AnalysisThread | None = None
         self.transpose_worker: QThread | None = None
+        self.rvc_training_worker: RVCTrainingThread | None = None
         self.current_vocal_resource: SeparatedVocal | None = None
         self.seedvc_reference_path = ""
         self.active_transpose_semitones = 0
@@ -581,6 +685,11 @@ class MainWindow(QMainWindow):
             self.transpose_tab
         )
 
+        self.rvc_training_tab = QWidget()
+        rvc_training_root = QVBoxLayout(
+            self.rvc_training_tab
+        )
+
         self.main_tabs.addTab(
             self.analysis_tab,
             "분석 / 설정",
@@ -593,6 +702,265 @@ class MainWindow(QMainWindow):
             self.transpose_tab,
             "키 변환 / 음원 추출",
         )
+        self.main_tabs.addTab(
+            self.rvc_training_tab,
+            "RVC 모델 학습",
+        )
+
+        training_data_group = QGroupBox(
+            "1. 남성/타깃 음성 데이터셋"
+        )
+        training_data_layout = QFormLayout(
+            training_data_group
+        )
+
+        dataset_row = QWidget()
+        dataset_row_layout = QHBoxLayout(
+            dataset_row
+        )
+        dataset_row_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        self.rvc_training_dataset_label = QLabel(
+            "데이터셋 폴더를 선택하세요."
+        )
+        self.rvc_training_dataset_label.setWordWrap(
+            True
+        )
+
+        self.rvc_training_dataset_button = QPushButton(
+            "폴더 선택"
+        )
+        self.rvc_training_dataset_button.clicked.connect(
+            self.choose_rvc_training_dataset
+        )
+
+        dataset_row_layout.addWidget(
+            self.rvc_training_dataset_label,
+            1,
+        )
+        dataset_row_layout.addWidget(
+            self.rvc_training_dataset_button,
+        )
+
+        self.rvc_training_dataset_status = QLabel(
+            "한 사람의 깨끗한 남성 음성/보컬만 넣는 것을 권장합니다. "
+            "반주나 다른 화자가 섞이면 모델 품질이 크게 떨어집니다."
+        )
+        self.rvc_training_dataset_status.setWordWrap(
+            True
+        )
+
+        training_data_layout.addRow(
+            "데이터셋",
+            dataset_row,
+        )
+        training_data_layout.addRow(
+            "",
+            self.rvc_training_dataset_status,
+        )
+
+        rvc_training_root.addWidget(
+            training_data_group
+        )
+
+        training_option_group = QGroupBox(
+            "2. 학습 설정 - Single Speaker / RVC v2 / 40k / RMVPE"
+        )
+        training_option_layout = QFormLayout(
+            training_option_group
+        )
+
+        self.rvc_training_name_edit = QLineEdit()
+        self.rvc_training_name_edit.setText(
+            "male_voice_01"
+        )
+        self.rvc_training_name_edit.setToolTip(
+            "영문/숫자/_/- 만 사용"
+        )
+
+        self.rvc_training_epochs_spin = QSpinBox()
+        self.rvc_training_epochs_spin.setRange(
+            10,
+            1200,
+        )
+        self.rvc_training_epochs_spin.setValue(
+            200
+        )
+
+        self.rvc_training_batch_spin = QSpinBox()
+        self.rvc_training_batch_spin.setRange(
+            1,
+            64,
+        )
+        self.rvc_training_batch_spin.setValue(
+            8
+        )
+
+        self.rvc_training_save_spin = QSpinBox()
+        self.rvc_training_save_spin.setRange(
+            1,
+            200,
+        )
+        self.rvc_training_save_spin.setValue(
+            10
+        )
+        self.rvc_training_save_spin.setSuffix(
+            " epoch"
+        )
+
+        self.rvc_training_workers_spin = QSpinBox()
+        self.rvc_training_workers_spin.setRange(
+            1,
+            32,
+        )
+        self.rvc_training_workers_spin.setValue(
+            8
+        )
+
+        self.rvc_training_gpu_spin = QSpinBox()
+        self.rvc_training_gpu_spin.setRange(
+            0,
+            15,
+        )
+        self.rvc_training_gpu_spin.setValue(
+            0
+        )
+
+        self.rvc_training_cache_gpu_check = QCheckBox(
+            "학습 데이터를 GPU 메모리에 캐시"
+        )
+        self.rvc_training_cache_gpu_check.setChecked(
+            False
+        )
+        self.rvc_training_cache_gpu_check.setToolTip(
+            "VRAM 사용량이 크게 늘 수 있으므로 기본 OFF입니다."
+        )
+
+        self.rvc_training_runtime_label = QLabel()
+        self.rvc_training_runtime_label.setWordWrap(
+            True
+        )
+
+        training_option_layout.addRow(
+            "모델 이름",
+            self.rvc_training_name_edit,
+        )
+        training_option_layout.addRow(
+            "Epochs",
+            self.rvc_training_epochs_spin,
+        )
+        training_option_layout.addRow(
+            "Batch Size",
+            self.rvc_training_batch_spin,
+        )
+        training_option_layout.addRow(
+            "중간 저장",
+            self.rvc_training_save_spin,
+        )
+        training_option_layout.addRow(
+            "CPU Workers",
+            self.rvc_training_workers_spin,
+        )
+        training_option_layout.addRow(
+            "GPU ID",
+            self.rvc_training_gpu_spin,
+        )
+        training_option_layout.addRow(
+            "",
+            self.rvc_training_cache_gpu_check,
+        )
+        training_option_layout.addRow(
+            "환경",
+            self.rvc_training_runtime_label,
+        )
+
+        rvc_training_root.addWidget(
+            training_option_group
+        )
+
+        training_action_group = QGroupBox(
+            "3. 원클릭 학습"
+        )
+        training_action_layout = QVBoxLayout(
+            training_action_group
+        )
+
+        training_button_row = QHBoxLayout()
+
+        self.rvc_training_start_button = QPushButton(
+            "전처리 → RMVPE → HuBERT → 학습 → Index 생성"
+        )
+        self.rvc_training_start_button.clicked.connect(
+            self.start_rvc_training
+        )
+
+        self.rvc_training_stop_button = QPushButton(
+            "학습 중지"
+        )
+        self.rvc_training_stop_button.setEnabled(
+            False
+        )
+        self.rvc_training_stop_button.clicked.connect(
+            self.stop_rvc_training
+        )
+
+        training_button_row.addWidget(
+            self.rvc_training_start_button,
+            1,
+        )
+        training_button_row.addWidget(
+            self.rvc_training_stop_button,
+        )
+
+        self.rvc_training_progress = QProgressBar()
+        self.rvc_training_progress.setRange(
+            0,
+            100,
+        )
+        self.rvc_training_progress.setValue(
+            0
+        )
+
+        self.rvc_training_progress_label = QLabel(
+            "준비"
+        )
+        self.rvc_training_progress_label.setWordWrap(
+            True
+        )
+
+        self.rvc_training_log = QPlainTextEdit()
+        self.rvc_training_log.setReadOnly(
+            True
+        )
+        self.rvc_training_log.setMaximumBlockCount(
+            4000
+        )
+
+        training_action_layout.addLayout(
+            training_button_row
+        )
+        training_action_layout.addWidget(
+            self.rvc_training_progress
+        )
+        training_action_layout.addWidget(
+            self.rvc_training_progress_label
+        )
+        training_action_layout.addWidget(
+            self.rvc_training_log,
+            1,
+        )
+
+        rvc_training_root.addWidget(
+            training_action_group,
+            1,
+        )
+
+        self.refresh_rvc_training_status()
 
         engine_group = QGroupBox(
             "키 변환 엔진"
@@ -2582,6 +2950,385 @@ class MainWindow(QMainWindow):
                     ]
                 )
 
+    def refresh_rvc_training_status(self):
+        if not hasattr(
+            self,
+            "rvc_training_runtime_label",
+        ):
+            return
+
+        ready, status = (
+            training_assets_status()
+        )
+
+        self.rvc_training_runtime_label.setText(
+            status
+        )
+
+        dataset_dir = self.settings.value(
+            "rvc_training_dataset_dir",
+            "",
+            type=str,
+        )
+
+        if dataset_dir:
+            path = Path(
+                dataset_dir
+            )
+
+            if path.is_dir():
+                self.rvc_training_dataset_label.setText(
+                    str(path)
+                )
+                self.rvc_training_dataset_status.setText(
+                    dataset_status_text(
+                        path
+                    )
+                )
+
+        running = bool(
+            self.rvc_training_worker
+            and self.rvc_training_worker.isRunning()
+        )
+
+        self.rvc_training_start_button.setEnabled(
+            ready
+            and not running
+        )
+        self.rvc_training_stop_button.setEnabled(
+            running
+        )
+
+    def choose_rvc_training_dataset(self):
+        current = self.settings.value(
+            "rvc_training_dataset_dir",
+            self._last_open_directory(),
+            type=str,
+        )
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "RVC 학습 데이터셋 폴더 선택",
+            current,
+        )
+
+        if not folder:
+            return
+
+        path = Path(
+            folder
+        ).resolve()
+
+        self.settings.setValue(
+            "rvc_training_dataset_dir",
+            str(path),
+        )
+
+        self.rvc_training_dataset_label.setText(
+            str(path)
+        )
+        self.rvc_training_dataset_status.setText(
+            dataset_status_text(
+                path
+            )
+        )
+
+        self.refresh_rvc_training_status()
+
+    def start_rvc_training(self):
+        if (
+            self.rvc_training_worker
+            and self.rvc_training_worker.isRunning()
+        ):
+            return
+
+        dataset_dir = self.settings.value(
+            "rvc_training_dataset_dir",
+            "",
+            type=str,
+        )
+
+        if not dataset_dir:
+            QMessageBox.information(
+                self,
+                "RVC 모델 학습",
+                "먼저 남성/타깃 음성 데이터셋 폴더를 선택하세요.",
+            )
+            return
+
+        dataset_path = Path(
+            dataset_dir
+        )
+
+        if not dataset_path.is_dir():
+            QMessageBox.warning(
+                self,
+                "RVC 모델 학습",
+                "선택한 데이터셋 폴더를 찾을 수 없습니다.",
+            )
+            return
+
+        name = (
+            self.rvc_training_name_edit.text().strip()
+        )
+
+        if not re.fullmatch(
+            r"[A-Za-z0-9_-]+",
+            name,
+        ):
+            QMessageBox.warning(
+                self,
+                "RVC 모델 학습",
+                "모델 이름은 영문, 숫자, _ , - 만 사용할 수 있습니다.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "RVC 모델 학습 시작",
+            (
+                "RVC 학습은 상당한 시간이 걸릴 수 있습니다.\n\n"
+                "데이터셋에는 한 사람의 남성/타깃 음성만 들어 있어야 하고, "
+                "반주나 다른 화자가 섞이지 않는 것이 좋습니다.\n\n"
+                f"모델: {name}\n"
+                f"Epochs: {self.rvc_training_epochs_spin.value()}\n"
+                f"Batch: {self.rvc_training_batch_spin.value()}\n\n"
+                "학습을 시작할까요?"
+            ),
+        )
+
+        if (
+            answer
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        self.rvc_training_log.clear()
+        self.rvc_training_progress.setValue(
+            0
+        )
+        self.rvc_training_progress_label.setText(
+            "RVC 학습 시작 중..."
+        )
+        self.rvc_training_start_button.setEnabled(
+            False
+        )
+        self.rvc_training_stop_button.setEnabled(
+            True
+        )
+
+        self.rvc_training_worker = RVCTrainingThread(
+            dataset_dir=str(
+                dataset_path
+            ),
+            experiment_name=name,
+            epochs=(
+                self.rvc_training_epochs_spin.value()
+            ),
+            batch_size=(
+                self.rvc_training_batch_spin.value()
+            ),
+            save_every=(
+                self.rvc_training_save_spin.value()
+            ),
+            workers=(
+                self.rvc_training_workers_spin.value()
+            ),
+            gpu_id=(
+                self.rvc_training_gpu_spin.value()
+            ),
+            cache_gpu=(
+                self.rvc_training_cache_gpu_check.isChecked()
+            ),
+            parent=self,
+        )
+
+        self.rvc_training_worker.progress_changed.connect(
+            self.on_rvc_training_progress
+        )
+        self.rvc_training_worker.log_line.connect(
+            self.on_rvc_training_log
+        )
+        self.rvc_training_worker.training_done.connect(
+            self.on_rvc_training_done
+        )
+        self.rvc_training_worker.training_failed.connect(
+            self.on_rvc_training_failed
+        )
+        self.rvc_training_worker.finished.connect(
+            self.on_rvc_training_finished
+        )
+
+        self.rvc_training_worker.start()
+
+    def stop_rvc_training(self):
+        worker = (
+            self.rvc_training_worker
+        )
+
+        if (
+            worker is None
+            or not worker.isRunning()
+        ):
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "RVC 학습 중지",
+            (
+                "현재 RVC 학습 프로세스를 중지할까요?\n\n"
+                "같은 모델 이름으로 다시 시작하면 RVC 체크포인트가 "
+                "남아 있는 경우 자동 resume될 수 있습니다."
+            ),
+        )
+
+        if (
+            answer
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        self.rvc_training_progress_label.setText(
+            "학습 중지 요청 중..."
+        )
+        worker.cancel()
+
+    def on_rvc_training_progress(
+        self,
+        percent: int,
+        text: str,
+    ):
+        self.rvc_training_progress.setValue(
+            percent
+        )
+        self.rvc_training_progress_label.setText(
+            text
+        )
+        self.statusBar().showMessage(
+            text,
+            5000,
+        )
+
+    def on_rvc_training_log(
+        self,
+        text: str,
+    ):
+        self.rvc_training_log.appendPlainText(
+            text
+        )
+
+        scrollbar = (
+            self.rvc_training_log.verticalScrollBar()
+        )
+        scrollbar.setValue(
+            scrollbar.maximum()
+        )
+
+    def on_rvc_training_done(
+        self,
+        model_path: str,
+        index_path: str,
+    ):
+        self.rvc_training_progress.setValue(
+            100
+        )
+        self.rvc_training_progress_label.setText(
+            "RVC 모델 학습 완료"
+        )
+
+        self.rvc_model_path = (
+            model_path
+        )
+        self.rvc_index_path = (
+            index_path
+        )
+
+        self.settings.setValue(
+            "rvc_model_path",
+            self.rvc_model_path,
+        )
+        self.settings.setValue(
+            "rvc_index_path",
+            self.rvc_index_path,
+        )
+
+        self.rvc_model_label.setText(
+            self.rvc_model_path
+        )
+
+        self.rvc_index_label.setText(
+            (
+                self.rvc_index_path
+                if self.rvc_index_path
+                else "Index 생성 결과 없음"
+            )
+        )
+
+        index = self.transpose_engine_combo.findData(
+            "rvc"
+        )
+
+        if index >= 0:
+            self.transpose_engine_combo.setCurrentIndex(
+                index
+            )
+
+        self.main_tabs.setCurrentWidget(
+            self.transpose_tab
+        )
+        self.update_transpose_engine_ui()
+
+        message = (
+            "RVC 모델 학습이 완료됐습니다.\n\n"
+            f"모델:\n{model_path}"
+        )
+
+        if index_path:
+            message += (
+                f"\n\nIndex:\n{index_path}"
+            )
+
+        message += (
+            "\n\nRVC 변환 탭에 자동 선택했습니다."
+        )
+
+        QMessageBox.information(
+            self,
+            "RVC 학습 완료",
+            message,
+        )
+
+    def on_rvc_training_failed(
+        self,
+        error_text: str,
+    ):
+        self.rvc_training_progress_label.setText(
+            "RVC 학습 실패/중지"
+        )
+
+        QMessageBox.critical(
+            self,
+            "RVC 학습 실패",
+            (
+                error_text[-9000:]
+                + "\n\n로그:\n"
+                + str(
+                    Path(__file__).resolve().parent
+                    / "logs"
+                    / "rvc_training_last.log"
+                )
+            ),
+        )
+
+    def on_rvc_training_finished(self):
+        self.rvc_training_start_button.setEnabled(
+            True
+        )
+        self.rvc_training_stop_button.setEnabled(
+            False
+        )
+        self.refresh_rvc_training_status()
+
     def _current_transpose_engine(self) -> str:
         if not hasattr(
             self,
@@ -3885,6 +4632,29 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        if (
+            self.rvc_training_worker
+            and self.rvc_training_worker.isRunning()
+        ):
+            answer = QMessageBox.question(
+                self,
+                "RVC 학습 진행 중",
+                (
+                    "RVC 모델 학습이 진행 중입니다.\n"
+                    "종료하면 현재 학습 프로세스도 중지됩니다.\n\n"
+                    "그래도 종료할까요?"
+                ),
+            )
+
+            if (
+                answer
+                != QMessageBox.StandardButton.Yes
+            ):
+                event.ignore()
+                return
+
+            self.rvc_training_worker.cancel()
+
         if (
             self.transpose_worker
             and self.transpose_worker.isRunning()
