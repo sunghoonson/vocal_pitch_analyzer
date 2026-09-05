@@ -67,10 +67,18 @@ from seed_vc_svc import (
     seed_vc_available,
     seed_vc_status_text,
 )
+from rvc_rmvpe import (
+    RVCRMVPEError,
+    convert_full_mix_rvc,
+    convert_vocal_rvc,
+    rvc_available,
+    rvc_status_text,
+)
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v1.8 / Seed-VC SVC"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v1.9 / RVC + RMVPE"
 
+# V19_RVC_RMVPE_PATCH
 # V18_SEED_VC_SVC_PATCH
 # V17_KEY_TRANSPOSE_PATCH
 
@@ -411,6 +419,103 @@ class SeedVCTransposeThread(QThread):
 
 
 
+class RVCTransposeThread(QThread):
+    progress_changed = Signal(
+        int,
+        str,
+    )
+    transpose_done = Signal(str)
+    transpose_failed = Signal(str)
+    log_line = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        input_path: str,
+        output_path: str,
+        source_mode: str,
+        semitones: int,
+        model_path: str,
+        index_path: str | None,
+        index_rate: float,
+        protect: float,
+        rms_mix_rate: float,
+        speaker_id: int,
+        separator_model: str,
+        separator_cache: bool,
+        separator_autocast: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+
+        self.input_path = input_path
+        self.output_path = output_path
+        self.source_mode = source_mode
+        self.semitones = semitones
+        self.model_path = model_path
+        self.index_path = index_path
+        self.index_rate = index_rate
+        self.protect = protect
+        self.rms_mix_rate = rms_mix_rate
+        self.speaker_id = speaker_id
+        self.separator_model = (
+            separator_model
+        )
+        self.separator_cache = (
+            separator_cache
+        )
+        self.separator_autocast = (
+            separator_autocast
+        )
+
+    def run(self):
+        try:
+            common = dict(
+                model_path=self.model_path,
+                index_path=self.index_path,
+                semitones=self.semitones,
+                index_rate=self.index_rate,
+                protect=self.protect,
+                rms_mix_rate=self.rms_mix_rate,
+                speaker_id=self.speaker_id,
+                progress=lambda p, t: (
+                    self.progress_changed.emit(
+                        p,
+                        t,
+                    )
+                ),
+                log_callback=lambda t: (
+                    self.log_line.emit(t)
+                ),
+            )
+
+            if self.source_mode == "vocals":
+                result = convert_vocal_rvc(
+                    self.input_path,
+                    self.output_path,
+                    **common,
+                )
+            else:
+                result = convert_full_mix_rvc(
+                    self.input_path,
+                    self.output_path,
+                    separator_model=self.separator_model,
+                    separator_cache=self.separator_cache,
+                    separator_autocast=self.separator_autocast,
+                    **common,
+                )
+
+            self.transpose_done.emit(
+                str(result)
+            )
+
+        except Exception:
+            self.transpose_failed.emit(
+                traceback.format_exc()
+            )
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -428,6 +533,17 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(
             "VocalPitchAnalyzer",
             "VocalPitchAnalyzer",
+        )
+
+        self.rvc_model_path = self.settings.value(
+            "rvc_model_path",
+            "",
+            type=str,
+        )
+        self.rvc_index_path = self.settings.value(
+            "rvc_index_path",
+            "",
+            type=str,
         )
 
         self.setWindowTitle(APP_TITLE)
@@ -493,6 +609,10 @@ class MainWindow(QMainWindow):
         self.transpose_engine_combo.addItem(
             "AI 고음질 - Seed-VC SVC",
             "seed_vc",
+        )
+        self.transpose_engine_combo.addItem(
+            "AI 음색 변환 - RVC + RMVPE",
+            "rvc",
         )
         self.transpose_engine_combo.currentIndexChanged.connect(
             self.update_transpose_engine_ui
@@ -777,6 +897,203 @@ class MainWindow(QMainWindow):
             False
         )
         self.seedvc_reference_button.setEnabled(
+            False
+        )
+
+        self.rvc_group = QGroupBox(
+            "RVC + RMVPE 옵션"
+        )
+        rvc_layout = QFormLayout(
+            self.rvc_group
+        )
+
+        model_row = QWidget()
+        model_row_layout = QHBoxLayout(
+            model_row
+        )
+        model_row_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        self.rvc_model_label = QLabel(
+            self.rvc_model_path
+            or "RVC .pth 모델을 선택하세요."
+        )
+        self.rvc_model_label.setWordWrap(
+            True
+        )
+
+        self.rvc_model_button = QPushButton(
+            "모델 선택"
+        )
+        self.rvc_model_button.clicked.connect(
+            self.choose_rvc_model
+        )
+
+        model_row_layout.addWidget(
+            self.rvc_model_label,
+            1,
+        )
+        model_row_layout.addWidget(
+            self.rvc_model_button,
+        )
+
+        index_row = QWidget()
+        index_row_layout = QHBoxLayout(
+            index_row
+        )
+        index_row_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        self.rvc_index_label = QLabel(
+            self.rvc_index_path
+            or "Index 미선택 - 선택하지 않으면 index rate 0으로 처리"
+        )
+        self.rvc_index_label.setWordWrap(
+            True
+        )
+
+        self.rvc_index_button = QPushButton(
+            "Index 선택"
+        )
+        self.rvc_index_button.clicked.connect(
+            self.choose_rvc_index
+        )
+
+        self.rvc_index_clear_button = QPushButton(
+            "해제"
+        )
+        self.rvc_index_clear_button.clicked.connect(
+            self.clear_rvc_index
+        )
+
+        index_row_layout.addWidget(
+            self.rvc_index_label,
+            1,
+        )
+        index_row_layout.addWidget(
+            self.rvc_index_button,
+        )
+        index_row_layout.addWidget(
+            self.rvc_index_clear_button,
+        )
+
+        self.rvc_f0_label = QLabel(
+            "RMVPE (CUDA 자동 사용)"
+        )
+
+        self.rvc_index_rate_spin = QDoubleSpinBox()
+        self.rvc_index_rate_spin.setRange(
+            0.0,
+            1.0,
+        )
+        self.rvc_index_rate_spin.setDecimals(
+            2
+        )
+        self.rvc_index_rate_spin.setSingleStep(
+            0.05
+        )
+        self.rvc_index_rate_spin.setValue(
+            0.75
+        )
+
+        self.rvc_protect_spin = QDoubleSpinBox()
+        self.rvc_protect_spin.setRange(
+            0.0,
+            0.50,
+        )
+        self.rvc_protect_spin.setDecimals(
+            2
+        )
+        self.rvc_protect_spin.setSingleStep(
+            0.01
+        )
+        self.rvc_protect_spin.setValue(
+            0.33
+        )
+        self.rvc_protect_spin.setToolTip(
+            "무성음/자음 보호. 기본 0.33. "
+            "낮출수록 변환 음색이 강해지고, 높일수록 원본 발음 보호가 강해집니다."
+        )
+
+        self.rvc_rms_mix_spin = QDoubleSpinBox()
+        self.rvc_rms_mix_spin.setRange(
+            0.0,
+            1.0,
+        )
+        self.rvc_rms_mix_spin.setDecimals(
+            2
+        )
+        self.rvc_rms_mix_spin.setSingleStep(
+            0.05
+        )
+        self.rvc_rms_mix_spin.setValue(
+            1.00
+        )
+
+        self.rvc_speaker_spin = QSpinBox()
+        self.rvc_speaker_spin.setRange(
+            0,
+            109,
+        )
+        self.rvc_speaker_spin.setValue(
+            0
+        )
+
+        self.rvc_help_label = QLabel(
+            "남성 음색으로 학습된 RVC .pth 모델을 선택하면 "
+            "RMVPE가 원곡 보컬의 F0를 추적하고, 현재 키 변경값을 적용한 뒤 "
+            "선택한 모델 음색으로 보컬을 재합성합니다.\n"
+            ".index 파일은 권장하지만 필수는 아닙니다."
+        )
+        self.rvc_help_label.setWordWrap(
+            True
+        )
+
+        rvc_layout.addRow(
+            "RVC 모델",
+            model_row,
+        )
+        rvc_layout.addRow(
+            "Feature Index",
+            index_row,
+        )
+        rvc_layout.addRow(
+            "F0",
+            self.rvc_f0_label,
+        )
+        rvc_layout.addRow(
+            "Index Rate",
+            self.rvc_index_rate_spin,
+        )
+        rvc_layout.addRow(
+            "Protect",
+            self.rvc_protect_spin,
+        )
+        rvc_layout.addRow(
+            "RMS Mix",
+            self.rvc_rms_mix_spin,
+        )
+        rvc_layout.addRow(
+            "Speaker ID",
+            self.rvc_speaker_spin,
+        )
+        rvc_layout.addRow(
+            "",
+            self.rvc_help_label,
+        )
+
+        transpose_root.addWidget(
+            self.rvc_group
+        )
+        self.rvc_group.setVisible(
             False
         )
 
@@ -2287,27 +2604,46 @@ class MainWindow(QMainWindow):
         engine = (
             self._current_transpose_engine()
         )
+
         is_seed = (
             engine == "seed_vc"
+        )
+        is_rvc = (
+            engine == "rvc"
         )
 
         self.seedvc_group.setVisible(
             is_seed
         )
 
+        if hasattr(
+            self,
+            "rvc_group",
+        ):
+            self.rvc_group.setVisible(
+                is_rvc
+            )
+
         self.transpose_formant_check.setEnabled(
-            not is_seed
+            engine == "rubberband"
         )
 
         if is_seed:
-            self.transpose_quality_combo.setToolTip(
+            tooltip = (
                 "Seed-VC 모드에서는 AI 보컬이 핵심이며 "
                 "반주는 내부적으로 음질 우선 DSP를 사용합니다."
             )
-        else:
-            self.transpose_quality_combo.setToolTip(
-                ""
+        elif is_rvc:
+            tooltip = (
+                "RVC 모드에서는 RMVPE + RVC가 보컬을 변환하고 "
+                "반주는 내부적으로 음질 우선 DSP를 사용합니다."
             )
+        else:
+            tooltip = ""
+
+        self.transpose_quality_combo.setToolTip(
+            tooltip
+        )
 
         self.update_transpose_preview()
 
@@ -2379,6 +2715,210 @@ class MainWindow(QMainWindow):
         )
 
         self.update_seedvc_reference_ui()
+
+    def _auto_find_rvc_index(
+        self,
+        model_path: Path,
+    ) -> Path | None:
+        stem = (
+            model_path.stem.lower()
+        )
+
+        roots = [
+            model_path.parent,
+            model_path.parent.parent / "indices",
+            Path(__file__).resolve().parent
+            / "tools"
+            / "rvc"
+            / "assets"
+            / "indices",
+        ]
+
+        candidates: list[Path] = []
+
+        for folder in roots:
+            if not folder.is_dir():
+                continue
+
+            try:
+                candidates.extend(
+                    p
+                    for p in folder.rglob(
+                        "*.index"
+                    )
+                    if p.is_file()
+                )
+            except OSError:
+                continue
+
+        if not candidates:
+            return None
+
+        def score(path: Path):
+            name = path.stem.lower()
+            value = 0
+
+            if "added" in name:
+                value += 4
+
+            if stem in name:
+                value += 5
+
+            tokens = [
+                token
+                for token in re.split(
+                    r"[^a-z0-9가-힣]+",
+                    stem,
+                )
+                if len(token) >= 2
+            ]
+
+            value += sum(
+                1
+                for token in tokens
+                if token in name
+            )
+
+            return (
+                value,
+                -len(name),
+            )
+
+        best = max(
+            candidates,
+            key=score,
+        )
+
+        if score(best)[0] <= 0:
+            return None
+
+        return best
+
+    def choose_rvc_model(self):
+        current = (
+            Path(self.rvc_model_path)
+            if self.rvc_model_path
+            else None
+        )
+
+        if (
+            current is not None
+            and current.parent.is_dir()
+        ):
+            start_dir = str(
+                current.parent
+            )
+        else:
+            start_dir = self.settings.value(
+                "last_rvc_model_dir",
+                self._last_open_directory(),
+                type=str,
+            )
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "RVC 모델 선택",
+            start_dir,
+            "RVC model (*.pth);;All files (*.*)",
+        )
+
+        if not path:
+            return
+
+        model = Path(
+            path
+        ).resolve()
+
+        self.rvc_model_path = str(
+            model
+        )
+        self.settings.setValue(
+            "rvc_model_path",
+            self.rvc_model_path,
+        )
+        self.settings.setValue(
+            "last_rvc_model_dir",
+            str(
+                model.parent
+            ),
+        )
+
+        self.rvc_model_label.setText(
+            self.rvc_model_path
+        )
+
+        if not self.rvc_index_path:
+            found = (
+                self._auto_find_rvc_index(
+                    model
+                )
+            )
+
+            if found is not None:
+                self.rvc_index_path = str(
+                    found
+                )
+                self.settings.setValue(
+                    "rvc_index_path",
+                    self.rvc_index_path,
+                )
+                self.rvc_index_label.setText(
+                    self.rvc_index_path
+                    + "\n(모델명 기준 자동 발견)"
+                )
+
+        self.update_transpose_preview()
+
+    def choose_rvc_index(self):
+        model = (
+            Path(self.rvc_model_path)
+            if self.rvc_model_path
+            else None
+        )
+
+        if (
+            model is not None
+            and model.parent.is_dir()
+        ):
+            start_dir = str(
+                model.parent
+            )
+        else:
+            start_dir = self._last_open_directory()
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "RVC Feature Index 선택",
+            start_dir,
+            "RVC index (*.index);;All files (*.*)",
+        )
+
+        if not path:
+            return
+
+        self.rvc_index_path = str(
+            Path(path).resolve()
+        )
+        self.settings.setValue(
+            "rvc_index_path",
+            self.rvc_index_path,
+        )
+        self.rvc_index_label.setText(
+            self.rvc_index_path
+        )
+
+        self.update_transpose_preview()
+
+    def clear_rvc_index(self):
+        self.rvc_index_path = ""
+        self.settings.setValue(
+            "rvc_index_path",
+            "",
+        )
+        self.rvc_index_label.setText(
+            "Index 미선택 - 선택하지 않으면 index rate 0으로 처리"
+        )
+        self.update_transpose_preview()
 
     def _current_transpose_input(
         self,
@@ -2544,12 +3084,81 @@ class MainWindow(QMainWindow):
                 "\n엔진: Seed-VC SVC / F0 condition ON / "
                 "auto F0 adjust OFF"
             )
+
+        elif engine == "rvc":
+            status = (
+                rvc_status_text()
+            )
+
+            if source_mode == "original":
+                rb_ok, rb_status = (
+                    rubberband_filter_available()
+                )
+                status += (
+                    "\n반주 Pitch Shift: "
+                    + rb_status
+                )
+                if not rb_ok:
+                    ready = False
+
+            if not rvc_available():
+                ready = False
+
+            model = (
+                Path(self.rvc_model_path)
+                if self.rvc_model_path
+                else None
+            )
+
+            if (
+                model is None
+                or not model.is_file()
+                or model.suffix.lower() != ".pth"
+            ):
+                ready = False
+                status += (
+                    "\nRVC .pth 모델을 선택해야 합니다."
+                )
+            else:
+                status += (
+                    "\nRVC 모델: "
+                    + model.name
+                )
+
+            if self.rvc_index_path:
+                index = Path(
+                    self.rvc_index_path
+                )
+
+                if index.is_file():
+                    status += (
+                        "\nIndex: "
+                        + index.name
+                    )
+                else:
+                    status += (
+                        "\nIndex 파일을 찾을 수 없어 "
+                        "실행 시 index rate 0으로 처리됩니다."
+                    )
+            else:
+                status += (
+                    "\nIndex 미사용: 실행 시 index rate 0"
+                )
+
+            preview += (
+                "\n엔진: RVC + RMVPE / "
+                f"Index Rate {self.rvc_index_rate_spin.value():.2f} / "
+                f"Protect {self.rvc_protect_spin.value():.2f}"
+            )
+
         else:
             rb_ok, status = (
                 rubberband_filter_available()
             )
+
             if not rb_ok:
                 ready = False
+
             preview += (
                 "\n엔진: FFmpeg RubberBand"
             )
@@ -2598,11 +3207,12 @@ class MainWindow(QMainWindow):
         engine = (
             self._current_transpose_engine()
         )
-        engine_text = (
-            "seedvc"
-            if engine == "seed_vc"
-            else "rubberband"
-        )
+        if engine == "seed_vc":
+            engine_text = "seedvc"
+        elif engine == "rvc":
+            engine_text = "rvc"
+        else:
+            engine_text = "rubberband"
 
         return (
             f"{input_path.stem}_{engine_text}_{key_text}.{suffix}"
@@ -2750,6 +3360,50 @@ class MainWindow(QMainWindow):
                 ),
                 fp16=(
                     self.seedvc_fp16_check.isChecked()
+                ),
+                separator_model=(
+                    self.separator_model_combo.currentData()
+                    or DEFAULT_MODEL
+                ),
+                separator_cache=(
+                    self.separator_cache_check.isChecked()
+                ),
+                separator_autocast=(
+                    self.separator_autocast_check.isChecked()
+                ),
+                parent=self,
+            )
+
+            self.transpose_worker.log_line.connect(
+                lambda text: (
+                    self.statusBar().showMessage(
+                        text,
+                        5000,
+                    )
+                )
+            )
+        elif engine == "rvc":
+            self.transpose_worker = RVCTransposeThread(
+                input_path=str(input_path),
+                output_path=output_path,
+                source_mode=source_mode,
+                semitones=semitones,
+                model_path=self.rvc_model_path,
+                index_path=(
+                    self.rvc_index_path
+                    or None
+                ),
+                index_rate=(
+                    self.rvc_index_rate_spin.value()
+                ),
+                protect=(
+                    self.rvc_protect_spin.value()
+                ),
+                rms_mix_rate=(
+                    self.rvc_rms_mix_spin.value()
+                ),
+                speaker_id=(
+                    self.rvc_speaker_spin.value()
                 ),
                 separator_model=(
                     self.separator_model_combo.currentData()
@@ -3036,6 +3690,14 @@ class MainWindow(QMainWindow):
         ):
             error_text = (
                 "Seed-VC SVC 변환 실패\n\n"
+                + error_text
+            )
+        elif (
+            self.active_transpose_engine
+            == "rvc"
+        ):
+            error_text = (
+                "RVC + RMVPE 변환 실패\n\n"
                 + error_text
             )
 

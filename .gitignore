@@ -88,3 +88,10 @@ Desktop.ini
 tools/seed-vc/
 .venv_svc/
 *_seedvc_*.wav
+
+# --- RVC + RMVPE external runtime / voice models ---
+.venv_rvc/
+tools/rvc/
+rvc_models/
+*.index
+*_rvc_*.wav

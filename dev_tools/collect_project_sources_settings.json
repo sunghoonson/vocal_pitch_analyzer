@@ -40,7 +40,10 @@
     "project_snapshots",
     "_project_snapshots",
     ".venv_svc",
-    "seed-vc"
+    "seed-vc",
+    ".venv_rvc",
+    "rvc",
+    "rvc_models"
   ],
   "exclude_dir_globs": [
     "backup_before_*",
@@ -78,7 +81,8 @@
     "*.tmp",
     "*.temp",
     "*.bak",
-    "*.swp"
+    "*.swp",
+    "*.index"
   ],
   "max_text_file_mb": 4
 }
