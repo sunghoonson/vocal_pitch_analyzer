@@ -83,3 +83,8 @@ Desktop.ini
 
 # VS Code project files are intentionally NOT ignored.
 # .vscode/
+
+# --- Seed-VC SVC external runtime ---
+tools/seed-vc/
+.venv_svc/
+*_seedvc_*.wav

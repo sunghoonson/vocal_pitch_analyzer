@@ -38,7 +38,9 @@
     "build",
     "dist",
     "project_snapshots",
-    "_project_snapshots"
+    "_project_snapshots",
+    ".venv_svc",
+    "seed-vc"
   ],
   "exclude_dir_globs": [
     "backup_before_*",

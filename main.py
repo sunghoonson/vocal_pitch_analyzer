@@ -60,10 +60,18 @@ from audio_transposer import (
     semitone_to_ratio,
     transpose_audio,
 )
+from seed_vc_svc import (
+    SeedVCSVCError,
+    convert_full_mix_seed_vc,
+    convert_vocal_seed_vc,
+    seed_vc_available,
+    seed_vc_status_text,
+)
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v1.7 / Key Transpose"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v1.8 / Seed-VC SVC"
 
+# V18_SEED_VC_SVC_PATCH
 # V17_KEY_TRANSPOSE_PATCH
 
 # V16_TABBED_UI_PATCH
@@ -313,6 +321,96 @@ class TransposeThread(QThread):
 
 
 
+class SeedVCTransposeThread(QThread):
+    progress_changed = Signal(
+        int,
+        str,
+    )
+    transpose_done = Signal(str)
+    transpose_failed = Signal(str)
+    log_line = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        input_path: str,
+        output_path: str,
+        source_mode: str,
+        semitones: int,
+        auto_reference: bool,
+        reference_path: str | None,
+        diffusion_steps: int,
+        cfg_rate: float,
+        fp16: bool,
+        separator_model: str,
+        separator_cache: bool,
+        separator_autocast: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+
+        self.input_path = input_path
+        self.output_path = output_path
+        self.source_mode = source_mode
+        self.semitones = semitones
+        self.auto_reference = auto_reference
+        self.reference_path = reference_path
+        self.diffusion_steps = diffusion_steps
+        self.cfg_rate = cfg_rate
+        self.fp16 = fp16
+        self.separator_model = separator_model
+        self.separator_cache = separator_cache
+        self.separator_autocast = (
+            separator_autocast
+        )
+
+    def run(self):
+        try:
+            common = dict(
+                semitones=self.semitones,
+                reference_path=self.reference_path,
+                auto_reference=self.auto_reference,
+                diffusion_steps=self.diffusion_steps,
+                cfg_rate=self.cfg_rate,
+                fp16=self.fp16,
+                progress=lambda p, t: (
+                    self.progress_changed.emit(
+                        p,
+                        t,
+                    )
+                ),
+                log_callback=lambda t: (
+                    self.log_line.emit(t)
+                ),
+            )
+
+            if self.source_mode == "vocals":
+                result = convert_vocal_seed_vc(
+                    self.input_path,
+                    self.output_path,
+                    **common,
+                )
+            else:
+                result = convert_full_mix_seed_vc(
+                    self.input_path,
+                    self.output_path,
+                    separator_model=self.separator_model,
+                    separator_cache=self.separator_cache,
+                    separator_autocast=self.separator_autocast,
+                    **common,
+                )
+
+            self.transpose_done.emit(
+                str(result)
+            )
+
+        except Exception:
+            self.transpose_failed.emit(
+                traceback.format_exc()
+            )
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -321,8 +419,11 @@ class MainWindow(QMainWindow):
         self.result: AnalysisResult | None = None
         self.pipeline_result: PipelineResult | None = None
         self.worker: AnalysisThread | None = None
-        self.transpose_worker: TransposeThread | None = None
+        self.transpose_worker: QThread | None = None
         self.current_vocal_resource: SeparatedVocal | None = None
+        self.seedvc_reference_path = ""
+        self.active_transpose_semitones = 0
+        self.active_transpose_engine = "rubberband"
 
         self.settings = QSettings(
             "VocalPitchAnalyzer",
@@ -375,6 +476,46 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(
             self.transpose_tab,
             "키 변환 / 음원 추출",
+        )
+
+        engine_group = QGroupBox(
+            "키 변환 엔진"
+        )
+        engine_layout = QFormLayout(
+            engine_group
+        )
+
+        self.transpose_engine_combo = QComboBox()
+        self.transpose_engine_combo.addItem(
+            "빠른 DSP - FFmpeg RubberBand",
+            "rubberband",
+        )
+        self.transpose_engine_combo.addItem(
+            "AI 고음질 - Seed-VC SVC",
+            "seed_vc",
+        )
+        self.transpose_engine_combo.currentIndexChanged.connect(
+            self.update_transpose_engine_ui
+        )
+
+        self.transpose_engine_status_label = QLabel(
+            "엔진 상태 확인 전"
+        )
+        self.transpose_engine_status_label.setWordWrap(
+            True
+        )
+
+        engine_layout.addRow(
+            "변환 방식",
+            self.transpose_engine_combo,
+        )
+        engine_layout.addRow(
+            "상태",
+            self.transpose_engine_status_label,
+        )
+
+        transpose_root.addWidget(
+            engine_group
         )
 
         source_group = QGroupBox(
@@ -503,6 +644,142 @@ class MainWindow(QMainWindow):
             key_group
         )
 
+        self.seedvc_group = QGroupBox(
+            "Seed-VC SVC 옵션"
+        )
+        seedvc_layout = QFormLayout(
+            self.seedvc_group
+        )
+
+        self.seedvc_reference_combo = QComboBox()
+        self.seedvc_reference_combo.addItem(
+            "같은 가수 음색 유지 - 보컬 stem에서 자동 참조",
+            "auto",
+        )
+        self.seedvc_reference_combo.addItem(
+            "별도 참조 음성 파일 사용",
+            "custom",
+        )
+        self.seedvc_reference_combo.currentIndexChanged.connect(
+            self.update_seedvc_reference_ui
+        )
+
+        reference_row = QWidget()
+        reference_row_layout = QHBoxLayout(
+            reference_row
+        )
+        reference_row_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        self.seedvc_reference_label = QLabel(
+            "자동 참조: 보컬이 잘 들리는 약 12초 구간을 자동 선택"
+        )
+        self.seedvc_reference_label.setWordWrap(
+            True
+        )
+
+        self.seedvc_reference_button = QPushButton(
+            "참조 파일 선택"
+        )
+        self.seedvc_reference_button.clicked.connect(
+            self.choose_seedvc_reference
+        )
+
+        reference_row_layout.addWidget(
+            self.seedvc_reference_label,
+            1,
+        )
+        reference_row_layout.addWidget(
+            self.seedvc_reference_button,
+        )
+
+        self.seedvc_steps_spin = QSpinBox()
+        self.seedvc_steps_spin.setRange(
+            4,
+            50,
+        )
+        self.seedvc_steps_spin.setValue(
+            30
+        )
+        self.seedvc_steps_spin.setSuffix(
+            " steps"
+        )
+        self.seedvc_steps_spin.setToolTip(
+            "노래 변환은 30~50 step이 고음질 권장 범위입니다. "
+            "값이 높을수록 느려집니다."
+        )
+
+        self.seedvc_cfg_spin = QDoubleSpinBox()
+        self.seedvc_cfg_spin.setRange(
+            0.0,
+            1.2,
+        )
+        self.seedvc_cfg_spin.setDecimals(
+            2
+        )
+        self.seedvc_cfg_spin.setSingleStep(
+            0.05
+        )
+        self.seedvc_cfg_spin.setValue(
+            0.70
+        )
+
+        self.seedvc_fp16_check = QCheckBox(
+            "FP16 사용 (CUDA 권장)"
+        )
+        self.seedvc_fp16_check.setChecked(
+            True
+        )
+
+        self.seedvc_help_label = QLabel(
+            "원곡 전체 모드: BS-RoFormer 2-stem → "
+            "보컬 Seed-VC SVC → 반주 동일 키 이동 → 재합성\n"
+            "첫 실행은 Seed-VC/Whisper/RMVPE/BigVGAN 모델 다운로드 때문에 오래 걸릴 수 있습니다."
+        )
+        self.seedvc_help_label.setWordWrap(
+            True
+        )
+
+        seedvc_layout.addRow(
+            "참조 음색",
+            self.seedvc_reference_combo,
+        )
+        seedvc_layout.addRow(
+            "참조",
+            reference_row,
+        )
+        seedvc_layout.addRow(
+            "Diffusion",
+            self.seedvc_steps_spin,
+        )
+        seedvc_layout.addRow(
+            "CFG",
+            self.seedvc_cfg_spin,
+        )
+        seedvc_layout.addRow(
+            "",
+            self.seedvc_fp16_check,
+        )
+        seedvc_layout.addRow(
+            "",
+            self.seedvc_help_label,
+        )
+
+        transpose_root.addWidget(
+            self.seedvc_group
+        )
+
+        self.seedvc_group.setVisible(
+            False
+        )
+        self.seedvc_reference_button.setEnabled(
+            False
+        )
+
         output_group = QGroupBox(
             "출력"
         )
@@ -584,6 +861,10 @@ class MainWindow(QMainWindow):
         transpose_root.addWidget(
             self.transpose_progress_text
         )
+
+        self.update_transpose_engine_ui()
+        self.update_seedvc_reference_ui()
+
         transpose_root.addStretch(1)
 
         root.addWidget(
@@ -1984,6 +2265,121 @@ class MainWindow(QMainWindow):
                     ]
                 )
 
+    def _current_transpose_engine(self) -> str:
+        if not hasattr(
+            self,
+            "transpose_engine_combo",
+        ):
+            return "rubberband"
+
+        return (
+            self.transpose_engine_combo.currentData()
+            or "rubberband"
+        )
+
+    def update_transpose_engine_ui(self):
+        if not hasattr(
+            self,
+            "seedvc_group",
+        ):
+            return
+
+        engine = (
+            self._current_transpose_engine()
+        )
+        is_seed = (
+            engine == "seed_vc"
+        )
+
+        self.seedvc_group.setVisible(
+            is_seed
+        )
+
+        self.transpose_formant_check.setEnabled(
+            not is_seed
+        )
+
+        if is_seed:
+            self.transpose_quality_combo.setToolTip(
+                "Seed-VC 모드에서는 AI 보컬이 핵심이며 "
+                "반주는 내부적으로 음질 우선 DSP를 사용합니다."
+            )
+        else:
+            self.transpose_quality_combo.setToolTip(
+                ""
+            )
+
+        self.update_transpose_preview()
+
+    def update_seedvc_reference_ui(self):
+        if not hasattr(
+            self,
+            "seedvc_reference_combo",
+        ):
+            return
+
+        custom = (
+            self.seedvc_reference_combo.currentData()
+            == "custom"
+        )
+
+        self.seedvc_reference_button.setEnabled(
+            custom
+        )
+
+        if custom:
+            if self.seedvc_reference_path:
+                self.seedvc_reference_label.setText(
+                    self.seedvc_reference_path
+                )
+            else:
+                self.seedvc_reference_label.setText(
+                    "참조 음성 파일을 선택하세요. "
+                    "1~30초 정도의 깨끗한 음성이 좋습니다."
+                )
+        else:
+            self.seedvc_reference_label.setText(
+                "자동 참조: 보컬 stem에서 "
+                "활동량이 높은 약 12초 구간을 자동 선택"
+            )
+
+        self.update_transpose_preview()
+
+    def choose_seedvc_reference(self):
+        last_dir = self.settings.value(
+            "last_seedvc_reference_dir",
+            self._last_open_directory(),
+            type=str,
+        )
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Seed-VC 참조 음성 선택",
+            last_dir,
+            (
+                "Audio "
+                "(*.wav *.flac *.mp3 *.m4a *.aac *.ogg *.mp4 *.webm);;"
+                "All files (*.*)"
+            ),
+        )
+
+        if not path:
+            return
+
+        self.seedvc_reference_path = (
+            str(
+                Path(path).resolve()
+            )
+        )
+        self.settings.setValue(
+            "last_seedvc_reference_dir",
+            str(
+                Path(path).resolve().parent
+            ),
+        )
+
+        self.update_seedvc_reference_ui()
+
     def _current_transpose_input(
         self,
     ) -> Path | None:
@@ -2027,15 +2423,25 @@ class MainWindow(QMainWindow):
         ):
             return
 
+        engine = (
+            self._current_transpose_engine()
+        )
+        source_mode = (
+            self.transpose_source_combo.currentData()
+            if hasattr(
+                self,
+                "transpose_source_combo",
+            )
+            else "original"
+        )
+
         input_path = (
             self._current_transpose_input()
         )
 
-        if input_path is None:
-            source_mode = (
-                self.transpose_source_combo.currentData()
-            )
+        ready = True
 
+        if input_path is None:
             if source_mode == "vocals":
                 source_text = (
                     "분리된 보컬 stem이 아직 없습니다. "
@@ -2049,18 +2455,10 @@ class MainWindow(QMainWindow):
             self.transpose_source_label.setText(
                 source_text
             )
-            self.transpose_button.setEnabled(
-                False
-            )
+            ready = False
         else:
             self.transpose_source_label.setText(
                 str(input_path)
-            )
-            self.transpose_button.setEnabled(
-                not (
-                    self.transpose_worker
-                    and self.transpose_worker.isRunning()
-                )
             )
 
         semitones = (
@@ -2106,21 +2504,75 @@ class MainWindow(QMainWindow):
                 f" ~ {midi_to_note_name(shifted_max)}"
             )
 
-        self.transpose_preview_label.setText(
-            preview
-        )
+        if engine == "seed_vc":
+            status = (
+                seed_vc_status_text()
+            )
 
-        available, status = (
-            rubberband_filter_available()
+            if source_mode == "original":
+                rb_ok, rb_status = (
+                    rubberband_filter_available()
+                )
+                status += (
+                    "\n반주 Pitch Shift: "
+                    + rb_status
+                )
+                if not rb_ok:
+                    ready = False
+
+            if not seed_vc_available():
+                ready = False
+
+            if (
+                self.seedvc_reference_combo.currentData()
+                == "custom"
+            ):
+                reference = Path(
+                    self.seedvc_reference_path
+                ) if self.seedvc_reference_path else None
+
+                if (
+                    reference is None
+                    or not reference.is_file()
+                ):
+                    ready = False
+                    status += (
+                        "\n참조 음성 파일을 선택해야 합니다."
+                    )
+
+            preview += (
+                "\n엔진: Seed-VC SVC / F0 condition ON / "
+                "auto F0 adjust OFF"
+            )
+        else:
+            rb_ok, status = (
+                rubberband_filter_available()
+            )
+            if not rb_ok:
+                ready = False
+            preview += (
+                "\n엔진: FFmpeg RubberBand"
+            )
+
+        self.transpose_engine_status_label.setText(
+            status
         )
         self.rubberband_status_label.setText(
             status
         )
+        self.transpose_preview_label.setText(
+            preview
+        )
 
-        if not available:
-            self.transpose_button.setEnabled(
-                False
-            )
+        running = bool(
+            self.transpose_worker
+            and self.transpose_worker.isRunning()
+        )
+
+        self.transpose_button.setEnabled(
+            ready
+            and not running
+        )
 
     def _default_transpose_filename(
         self,
@@ -2143,8 +2595,17 @@ class MainWindow(QMainWindow):
         else:
             key_text = "key_0"
 
+        engine = (
+            self._current_transpose_engine()
+        )
+        engine_text = (
+            "seedvc"
+            if engine == "seed_vc"
+            else "rubberband"
+        )
+
         return (
-            f"{input_path.stem}_{key_text}.{suffix}"
+            f"{input_path.stem}_{engine_text}_{key_text}.{suffix}"
         )
 
     def start_transpose(self):
@@ -2247,19 +2708,84 @@ class MainWindow(QMainWindow):
             "키 변경 준비 중..."
         )
 
-        self.transpose_worker = TransposeThread(
-            input_path=str(input_path),
-            output_path=output_path,
-            semitones=semitones,
-            preserve_formant=(
-                self.transpose_formant_check.isChecked()
-            ),
-            quality=(
-                self.transpose_quality_combo.currentData()
-                or "quality"
-            ),
-            parent=self,
+        engine = (
+            self._current_transpose_engine()
         )
+        source_mode = (
+            self.transpose_source_combo.currentData()
+            or "original"
+        )
+
+        self.active_transpose_semitones = (
+            semitones
+        )
+        self.active_transpose_engine = (
+            engine
+        )
+
+        if engine == "seed_vc":
+            auto_reference = (
+                self.seedvc_reference_combo.currentData()
+                != "custom"
+            )
+
+            reference_path = (
+                None
+                if auto_reference
+                else self.seedvc_reference_path
+            )
+
+            self.transpose_worker = SeedVCTransposeThread(
+                input_path=str(input_path),
+                output_path=output_path,
+                source_mode=source_mode,
+                semitones=semitones,
+                auto_reference=auto_reference,
+                reference_path=reference_path,
+                diffusion_steps=(
+                    self.seedvc_steps_spin.value()
+                ),
+                cfg_rate=(
+                    self.seedvc_cfg_spin.value()
+                ),
+                fp16=(
+                    self.seedvc_fp16_check.isChecked()
+                ),
+                separator_model=(
+                    self.separator_model_combo.currentData()
+                    or DEFAULT_MODEL
+                ),
+                separator_cache=(
+                    self.separator_cache_check.isChecked()
+                ),
+                separator_autocast=(
+                    self.separator_autocast_check.isChecked()
+                ),
+                parent=self,
+            )
+
+            self.transpose_worker.log_line.connect(
+                lambda text: (
+                    self.statusBar().showMessage(
+                        text,
+                        5000,
+                    )
+                )
+            )
+        else:
+            self.transpose_worker = TransposeThread(
+                input_path=str(input_path),
+                output_path=output_path,
+                semitones=semitones,
+                preserve_formant=(
+                    self.transpose_formant_check.isChecked()
+                ),
+                quality=(
+                    self.transpose_quality_combo.currentData()
+                    or "quality"
+                ),
+                parent=self,
+            )
 
         self.transpose_worker.progress_changed.connect(
             self.on_transpose_progress
@@ -2274,6 +2800,9 @@ class MainWindow(QMainWindow):
             self.on_transpose_finished
         )
 
+        self.transpose_progress_text.setText(
+            "키 변경 작업 시작 중..."
+        )
         self.transpose_worker.start()
 
     def on_transpose_progress(
@@ -2438,7 +2967,7 @@ class MainWindow(QMainWindow):
         output_path: str,
     ):
         semitones = (
-            self.key_semitone_spin.value()
+            self.active_transpose_semitones
         )
 
         subtitle_files = []
@@ -2500,6 +3029,15 @@ class MainWindow(QMainWindow):
         self.transpose_progress_text.setText(
             "키 변경 실패"
         )
+
+        if (
+            self.active_transpose_engine
+            == "seed_vc"
+        ):
+            error_text = (
+                "Seed-VC SVC 변환 실패\n\n"
+                + error_text
+            )
 
         QMessageBox.critical(
             self,

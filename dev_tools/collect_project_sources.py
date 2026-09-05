@@ -30,6 +30,8 @@ DEFAULT_SETTINGS = {
         ".git",
         ".venv",
         ".venv_separator",
+        ".venv_svc",
+        "seed-vc",
         "__pycache__",
         ".pytest_cache",
         ".mypy_cache",
