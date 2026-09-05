@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -82,10 +83,16 @@ from rvc_trainer import (
     dataset_status_text,
     training_assets_status,
 )
+from batch_vocal_extractor import (
+    BatchVocalExtractionCancelled,
+    BatchVocalExtractionError,
+    extract_vocals_batch,
+)
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.0 / RVC Training"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.1 / Batch Vocal Dataset"
 
+# V21_BATCH_VOCAL_DATASET_PATCH
 # V20_RVC_TRAINING_PATCH
 # V19_RVC_RMVPE_PATCH
 # V18_SEED_VC_SVC_PATCH
@@ -525,6 +532,102 @@ class RVCTransposeThread(QThread):
 
 
 
+class BatchVocalExtractionThread(QThread):
+    progress_changed = Signal(
+        int,
+        str,
+    )
+    log_line = Signal(str)
+    extraction_done = Signal(
+        str,
+        int,
+        int,
+        int,
+    )
+    extraction_failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        input_files: list[str],
+        output_dir: str,
+        model_filename: str,
+        use_cache: bool,
+        use_autocast: bool,
+        overwrite: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+
+        self.input_files = list(
+            input_files
+        )
+        self.output_dir = (
+            output_dir
+        )
+        self.model_filename = (
+            model_filename
+        )
+        self.use_cache = (
+            use_cache
+        )
+        self.use_autocast = (
+            use_autocast
+        )
+        self.overwrite = (
+            overwrite
+        )
+        self._cancel_requested = False
+
+    def request_cancel(self):
+        self._cancel_requested = True
+
+    def run(self):
+        try:
+            result = extract_vocals_batch(
+                self.input_files,
+                self.output_dir,
+                model_filename=self.model_filename,
+                use_cache=self.use_cache,
+                use_autocast=self.use_autocast,
+                overwrite=self.overwrite,
+                log_callback=lambda text: (
+                    self.log_line.emit(
+                        text
+                    )
+                ),
+                progress_callback=lambda p, text: (
+                    self.progress_changed.emit(
+                        p,
+                        text,
+                    )
+                ),
+                cancel_check=lambda: (
+                    self._cancel_requested
+                ),
+            )
+
+            self.extraction_done.emit(
+                str(
+                    result.output_dir
+                ),
+                result.completed,
+                result.skipped,
+                result.failed,
+            )
+
+        except BatchVocalExtractionCancelled:
+            self.extraction_failed.emit(
+                "사용자가 보컬 일괄 추출을 중지했습니다."
+            )
+
+        except Exception:
+            self.extraction_failed.emit(
+                traceback.format_exc()
+            )
+
+
+
 class RVCTrainingThread(QThread):
     progress_changed = Signal(
         int,
@@ -629,6 +732,8 @@ class MainWindow(QMainWindow):
         self.worker: AnalysisThread | None = None
         self.transpose_worker: QThread | None = None
         self.rvc_training_worker: RVCTrainingThread | None = None
+        self.batch_vocal_worker: BatchVocalExtractionThread | None = None
+        self.batch_vocal_files: list[str] = []
         self.current_vocal_resource: SeparatedVocal | None = None
         self.seedvc_reference_path = ""
         self.active_transpose_semitones = 0
@@ -705,6 +810,185 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(
             self.rvc_training_tab,
             "RVC 모델 학습",
+        )
+
+        batch_prep_group = QGroupBox(
+            "0. 학습 데이터 준비 - 여러 곡에서 보컬 일괄 추출"
+        )
+        batch_prep_layout = QVBoxLayout(
+            batch_prep_group
+        )
+
+        batch_help = QLabel(
+            "유튜브 등에서 모아둔 같은 가수의 여러 곡을 한 번에 선택하면 "
+            "현재 BS-RoFormer 보컬 분리기를 이용해 한 곡씩 순차 처리합니다. "
+            "완료된 vocals WAV 폴더를 그대로 RVC 학습 데이터셋으로 사용할 수 있습니다."
+        )
+        batch_help.setWordWrap(
+            True
+        )
+        batch_prep_layout.addWidget(
+            batch_help
+        )
+
+        batch_select_row = QHBoxLayout()
+
+        self.batch_vocal_select_button = QPushButton(
+            "음원 여러 개 선택"
+        )
+        self.batch_vocal_select_button.clicked.connect(
+            self.choose_batch_vocal_files
+        )
+
+        self.batch_vocal_clear_button = QPushButton(
+            "목록 비우기"
+        )
+        self.batch_vocal_clear_button.clicked.connect(
+            self.clear_batch_vocal_files
+        )
+
+        batch_select_row.addWidget(
+            self.batch_vocal_select_button
+        )
+        batch_select_row.addWidget(
+            self.batch_vocal_clear_button
+        )
+        batch_select_row.addStretch(
+            1
+        )
+
+        batch_prep_layout.addLayout(
+            batch_select_row
+        )
+
+        self.batch_vocal_file_list = QListWidget()
+        self.batch_vocal_file_list.setMinimumHeight(
+            130
+        )
+        batch_prep_layout.addWidget(
+            self.batch_vocal_file_list
+        )
+
+        batch_output_row = QHBoxLayout()
+
+        self.batch_vocal_output_label = QLabel(
+            "출력 폴더 미선택"
+        )
+        self.batch_vocal_output_label.setWordWrap(
+            True
+        )
+
+        self.batch_vocal_output_button = QPushButton(
+            "출력 폴더 선택"
+        )
+        self.batch_vocal_output_button.clicked.connect(
+            self.choose_batch_vocal_output_dir
+        )
+
+        batch_output_row.addWidget(
+            QLabel("출력:")
+        )
+        batch_output_row.addWidget(
+            self.batch_vocal_output_label,
+            1,
+        )
+        batch_output_row.addWidget(
+            self.batch_vocal_output_button
+        )
+
+        batch_prep_layout.addLayout(
+            batch_output_row
+        )
+
+        batch_option_row = QHBoxLayout()
+
+        self.batch_vocal_overwrite_check = QCheckBox(
+            "기존 _vocals.wav 덮어쓰기"
+        )
+        self.batch_vocal_overwrite_check.setChecked(
+            False
+        )
+
+        self.batch_vocal_auto_dataset_check = QCheckBox(
+            "완료 후 이 폴더를 RVC 학습 데이터셋으로 자동 지정"
+        )
+        self.batch_vocal_auto_dataset_check.setChecked(
+            True
+        )
+
+        batch_option_row.addWidget(
+            self.batch_vocal_overwrite_check
+        )
+        batch_option_row.addWidget(
+            self.batch_vocal_auto_dataset_check
+        )
+        batch_option_row.addStretch(
+            1
+        )
+
+        batch_prep_layout.addLayout(
+            batch_option_row
+        )
+
+        batch_action_row = QHBoxLayout()
+
+        self.batch_vocal_start_button = QPushButton(
+            "선택한 곡들에서 보컬 일괄 추출"
+        )
+        self.batch_vocal_start_button.clicked.connect(
+            self.start_batch_vocal_extraction
+        )
+        self.batch_vocal_start_button.setEnabled(
+            False
+        )
+
+        self.batch_vocal_stop_button = QPushButton(
+            "현재 곡 완료 후 중지"
+        )
+        self.batch_vocal_stop_button.clicked.connect(
+            self.stop_batch_vocal_extraction
+        )
+        self.batch_vocal_stop_button.setEnabled(
+            False
+        )
+
+        batch_action_row.addWidget(
+            self.batch_vocal_start_button,
+            1,
+        )
+        batch_action_row.addWidget(
+            self.batch_vocal_stop_button
+        )
+
+        batch_prep_layout.addLayout(
+            batch_action_row
+        )
+
+        self.batch_vocal_progress = QProgressBar()
+        self.batch_vocal_progress.setRange(
+            0,
+            100,
+        )
+        self.batch_vocal_progress.setValue(
+            0
+        )
+
+        self.batch_vocal_progress_label = QLabel(
+            "준비"
+        )
+        self.batch_vocal_progress_label.setWordWrap(
+            True
+        )
+
+        batch_prep_layout.addWidget(
+            self.batch_vocal_progress
+        )
+        batch_prep_layout.addWidget(
+            self.batch_vocal_progress_label
+        )
+
+        rvc_training_root.addWidget(
+            batch_prep_group
         )
 
         training_data_group = QGroupBox(
@@ -2950,12 +3234,477 @@ class MainWindow(QMainWindow):
                     ]
                 )
 
+    def _refresh_batch_vocal_ui(self):
+        if not hasattr(
+            self,
+            "batch_vocal_start_button",
+        ):
+            return
+
+        running = bool(
+            self.batch_vocal_worker
+            and self.batch_vocal_worker.isRunning()
+        )
+
+        output_dir = self.settings.value(
+            "batch_vocal_output_dir",
+            "",
+            type=str,
+        )
+
+        ready = bool(
+            self.batch_vocal_files
+            and output_dir
+        )
+
+        self.batch_vocal_start_button.setEnabled(
+            ready
+            and not running
+        )
+        self.batch_vocal_stop_button.setEnabled(
+            running
+        )
+
+        self.batch_vocal_select_button.setEnabled(
+            not running
+        )
+        self.batch_vocal_clear_button.setEnabled(
+            not running
+        )
+        self.batch_vocal_output_button.setEnabled(
+            not running
+        )
+
+    def choose_batch_vocal_files(self):
+        start_dir = self.settings.value(
+            "batch_vocal_last_input_dir",
+            self._last_open_directory(),
+            type=str,
+        )
+
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "보컬을 추출할 음원/영상 여러 개 선택",
+            start_dir,
+            (
+                "Supported media "
+                "(*.mp3 *.wav *.flac *.ogg *.m4a *.mp4 *.aac *.webm "
+                "*.mkv *.mov *.wma *.opus *.m4v);;"
+                "All files (*.*)"
+            ),
+        )
+
+        if not paths:
+            return
+
+        existing = {
+            value.lower()
+            for value in self.batch_vocal_files
+        }
+
+        added = 0
+
+        for value in paths:
+            path = Path(
+                value
+            ).resolve()
+
+            key = str(
+                path
+            ).lower()
+
+            if key in existing:
+                continue
+
+            self.batch_vocal_files.append(
+                str(path)
+            )
+            existing.add(
+                key
+            )
+            added += 1
+
+        if not self.batch_vocal_files:
+            return
+
+        self.batch_vocal_files.sort(
+            key=lambda value: (
+                Path(value).name.lower()
+            )
+        )
+
+        self.batch_vocal_file_list.clear()
+
+        for value in self.batch_vocal_files:
+            self.batch_vocal_file_list.addItem(
+                str(
+                    Path(value).name
+                )
+            )
+
+        first = Path(
+            self.batch_vocal_files[0]
+        )
+
+        self.settings.setValue(
+            "batch_vocal_last_input_dir",
+            str(
+                first.parent
+            ),
+        )
+
+        current_output = self.settings.value(
+            "batch_vocal_output_dir",
+            "",
+            type=str,
+        )
+
+        if not current_output:
+            default_output = (
+                first.parent
+                / "_rvc_vocals"
+            )
+
+            self.settings.setValue(
+                "batch_vocal_output_dir",
+                str(
+                    default_output
+                ),
+            )
+            self.batch_vocal_output_label.setText(
+                str(
+                    default_output
+                )
+            )
+
+        self.batch_vocal_progress_label.setText(
+            (
+                f"{len(self.batch_vocal_files)}개 선택됨 "
+                f"(이번에 {added}개 추가)"
+            )
+        )
+
+        self._refresh_batch_vocal_ui()
+
+    def clear_batch_vocal_files(self):
+        if (
+            self.batch_vocal_worker
+            and self.batch_vocal_worker.isRunning()
+        ):
+            return
+
+        self.batch_vocal_files.clear()
+        self.batch_vocal_file_list.clear()
+        self.batch_vocal_progress.setValue(
+            0
+        )
+        self.batch_vocal_progress_label.setText(
+            "준비"
+        )
+        self._refresh_batch_vocal_ui()
+
+    def choose_batch_vocal_output_dir(self):
+        current = self.settings.value(
+            "batch_vocal_output_dir",
+            self._last_open_directory(),
+            type=str,
+        )
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "보컬 WAV 저장 폴더 선택",
+            current,
+        )
+
+        if not folder:
+            return
+
+        path = Path(
+            folder
+        ).resolve()
+
+        self.settings.setValue(
+            "batch_vocal_output_dir",
+            str(
+                path
+            ),
+        )
+        self.batch_vocal_output_label.setText(
+            str(
+                path
+            )
+        )
+
+        self._refresh_batch_vocal_ui()
+
+    def start_batch_vocal_extraction(self):
+        if (
+            self.batch_vocal_worker
+            and self.batch_vocal_worker.isRunning()
+        ):
+            return
+
+        if not self.batch_vocal_files:
+            QMessageBox.information(
+                self,
+                "보컬 일괄 추출",
+                "먼저 음원/영상 파일을 여러 개 선택하세요.",
+            )
+            return
+
+        output_dir = self.settings.value(
+            "batch_vocal_output_dir",
+            "",
+            type=str,
+        )
+
+        if not output_dir:
+            QMessageBox.information(
+                self,
+                "보컬 일괄 추출",
+                "출력 폴더를 선택하세요.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "보컬 일괄 추출 시작",
+            (
+                f"선택 파일: {len(self.batch_vocal_files)}개\n"
+                f"출력 폴더:\n{output_dir}\n\n"
+                "GPU 메모리 충돌을 피하기 위해 한 곡씩 순차 처리합니다.\n"
+                "기존 보컬 분리 캐시가 있으면 재사용합니다.\n\n"
+                "시작할까요?"
+            ),
+        )
+
+        if (
+            answer
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        self.batch_vocal_progress.setValue(
+            0
+        )
+        self.batch_vocal_progress_label.setText(
+            "보컬 일괄 추출 시작 중..."
+        )
+
+        self.batch_vocal_worker = BatchVocalExtractionThread(
+            input_files=list(
+                self.batch_vocal_files
+            ),
+            output_dir=output_dir,
+            model_filename=(
+                self.separator_model_combo.currentData()
+                or DEFAULT_MODEL
+            ),
+            use_cache=(
+                self.separator_cache_check.isChecked()
+            ),
+            use_autocast=(
+                self.separator_autocast_check.isChecked()
+            ),
+            overwrite=(
+                self.batch_vocal_overwrite_check.isChecked()
+            ),
+            parent=self,
+        )
+
+        self.batch_vocal_worker.progress_changed.connect(
+            self.on_batch_vocal_progress
+        )
+        self.batch_vocal_worker.log_line.connect(
+            self.on_batch_vocal_log
+        )
+        self.batch_vocal_worker.extraction_done.connect(
+            self.on_batch_vocal_done
+        )
+        self.batch_vocal_worker.extraction_failed.connect(
+            self.on_batch_vocal_failed
+        )
+        self.batch_vocal_worker.finished.connect(
+            self.on_batch_vocal_finished
+        )
+
+        self._refresh_batch_vocal_ui()
+        self.batch_vocal_worker.start()
+
+    def stop_batch_vocal_extraction(self):
+        worker = (
+            self.batch_vocal_worker
+        )
+
+        if (
+            worker is None
+            or not worker.isRunning()
+        ):
+            return
+
+        worker.request_cancel()
+
+        self.batch_vocal_progress_label.setText(
+            "중지 요청됨 - 현재 처리 중인 곡이 끝난 뒤 중지합니다."
+        )
+
+    def on_batch_vocal_progress(
+        self,
+        percent: int,
+        text: str,
+    ):
+        self.batch_vocal_progress.setValue(
+            percent
+        )
+        self.batch_vocal_progress_label.setText(
+            text
+        )
+        self.statusBar().showMessage(
+            text,
+            5000,
+        )
+
+    def on_batch_vocal_log(
+        self,
+        text: str,
+    ):
+        if hasattr(
+            self,
+            "rvc_training_log",
+        ):
+            self.rvc_training_log.appendPlainText(
+                "[VOCAL] " + text
+            )
+
+    def on_batch_vocal_done(
+        self,
+        output_dir: str,
+        completed: int,
+        skipped: int,
+        failed: int,
+    ):
+        self.batch_vocal_progress.setValue(
+            100
+        )
+
+        self.batch_vocal_progress_label.setText(
+            (
+                f"완료 - 새로 생성 {completed}, "
+                f"기존 사용 {skipped}, 실패 {failed}"
+            )
+        )
+
+        if (
+            self.batch_vocal_auto_dataset_check.isChecked()
+        ):
+            self.settings.setValue(
+                "rvc_training_dataset_dir",
+                output_dir,
+            )
+
+            self.rvc_training_dataset_label.setText(
+                output_dir
+            )
+            self.rvc_training_dataset_status.setText(
+                dataset_status_text(
+                    output_dir
+                )
+            )
+
+        message = (
+            "여러 곡 보컬 추출이 완료됐습니다.\n\n"
+            f"새로 생성: {completed}\n"
+            f"기존 출력/캐시 사용: {skipped}\n"
+            f"실패: {failed}\n\n"
+            f"출력 폴더:\n{output_dir}"
+        )
+
+        if (
+            self.batch_vocal_auto_dataset_check.isChecked()
+        ):
+            message += (
+                "\n\n이 폴더를 RVC 학습 데이터셋으로 자동 지정했습니다."
+            )
+
+        message += (
+            "\n\n전체 로그:\n"
+            + str(
+                Path(__file__).resolve().parent
+                / "logs"
+                / "batch_vocal_extract_last.log"
+            )
+        )
+
+        QMessageBox.information(
+            self,
+            "보컬 일괄 추출 완료",
+            message,
+        )
+
+        self.refresh_rvc_training_status()
+
+    def on_batch_vocal_failed(
+        self,
+        error_text: str,
+    ):
+        self.batch_vocal_progress_label.setText(
+            "보컬 일괄 추출 실패/중지"
+        )
+
+        if (
+            "사용자가 보컬 일괄 추출을 중지했습니다."
+            in error_text
+        ):
+            QMessageBox.information(
+                self,
+                "보컬 일괄 추출",
+                (
+                    error_text
+                    + "\n\n이미 완료된 vocals WAV는 그대로 유지됩니다."
+                ),
+            )
+            return
+
+        QMessageBox.critical(
+            self,
+            "보컬 일괄 추출 실패",
+            (
+                error_text[-8000:]
+                + "\n\n로그:\n"
+                + str(
+                    Path(__file__).resolve().parent
+                    / "logs"
+                    / "batch_vocal_extract_last.log"
+                )
+            ),
+        )
+
+    def on_batch_vocal_finished(self):
+        self._refresh_batch_vocal_ui()
+
     def refresh_rvc_training_status(self):
         if not hasattr(
             self,
             "rvc_training_runtime_label",
         ):
             return
+
+        if hasattr(
+            self,
+            "batch_vocal_output_label",
+        ):
+            batch_output = self.settings.value(
+                "batch_vocal_output_dir",
+                "",
+                type=str,
+            )
+
+            self.batch_vocal_output_label.setText(
+                batch_output
+                or "출력 폴더 미선택"
+            )
+
+            self._refresh_batch_vocal_ui()
 
         ready, status = (
             training_assets_status()
@@ -4632,6 +5381,29 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
+        if (
+            self.batch_vocal_worker
+            and self.batch_vocal_worker.isRunning()
+        ):
+            answer = QMessageBox.question(
+                self,
+                "보컬 일괄 추출 진행 중",
+                (
+                    "여러 곡 보컬 추출이 진행 중입니다.\n"
+                    "종료하면 현재 처리 중인 곡은 중간에 끊길 수 있습니다.\n\n"
+                    "그래도 종료할까요?"
+                ),
+            )
+
+            if (
+                answer
+                != QMessageBox.StandardButton.Yes
+            ):
+                event.ignore()
+                return
+
+            self.batch_vocal_worker.request_cancel()
+
         if (
             self.rvc_training_worker
             and self.rvc_training_worker.isRunning()

@@ -95,3 +95,7 @@ tools/rvc/
 rvc_models/
 *.index
 *_rvc_*.wav
+
+# --- Prepared RVC audio datasets ---
+rvc_datasets/
+*_vocals.wav
