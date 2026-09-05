@@ -1,0 +1,85 @@
+# ============================================
+# Vocal Pitch Analyzer
+# Python / AI / local runtime / generated files
+# ============================================
+
+# --- Python virtual environments ---
+.venv/
+.venv*/
+venv/
+env/
+
+# --- Python cache / bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- AI separator runtime / model cache ---
+.venv_separator/
+cache/
+models/
+*.ckpt
+*.onnx
+*.pth
+*.pt
+*.safetensors
+
+# --- Logs / temporary files ---
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+~$*
+
+# --- Project-generated backup folders ---
+backup_before_*/
+backup_*/
+
+# --- PyInstaller build output ---
+build/
+dist/
+*.manifest
+
+# Keep .spec files tracked if/when a release spec is added.
+# *.spec
+
+# --- Local packaged tools / binaries ---
+# Do not commit large FFmpeg binaries or other downloaded executables.
+tools/ffmpeg/
+tools/*.exe
+ffmpeg.exe
+ffprobe.exe
+
+# --- Generated analysis / export artifacts ---
+*_pitch_segments_v*.csv
+*_raw_pitch_v*.csv
+*_vocals.wav
+*_note_timeline.ass
+*_note_timeline.srt
+*_notes.ass
+*_notes.srt
+*_key_plus_*.wav
+*_key_minus_*.wav
+*_key_plus_*.flac
+*_key_minus_*.flac
+*_key_plus_*.mp3
+*_key_minus_*.mp3
+*_key_plus_*.m4a
+*_key_minus_*.m4a
+
+# --- Installer / archive output ---
+*.zip
+*.7z
+
+# --- IDE / OS noise ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# VS Code project files are intentionally NOT ignored.
+# .vscode/
