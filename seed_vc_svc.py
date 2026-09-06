@@ -19,6 +19,11 @@ from audio_transposer import (
     rubberband_filter_available,
     transpose_audio,
 )
+from instrument_smart_shift import (
+    DEFAULT_INSTRUMENT_MODEL,
+    InstrumentSmartShiftError,
+    prepare_shifted_instrumental,
+)
 from vocal_separator import (
     DEFAULT_MODEL,
     VocalSeparationError,
@@ -35,6 +40,7 @@ from vocal_separator import (
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, str], None]
 
+# V30_INSTRUMENT_SMART_SHIFT_PATCH
 SEED_VC_REPOSITORY = "https://github.com/Plachtaa/seed-vc.git"
 SEED_VC_PINNED_COMMIT = "51383efd921027683c89e5348211d93ff12ac2a8"
 
@@ -1347,6 +1353,9 @@ def convert_full_mix_seed_vc(
     separator_model: str = DEFAULT_MODEL,
     separator_cache: bool = True,
     separator_autocast: bool = True,
+    instrument_smart_shift: bool = True,
+    instrument_preserve_drums: bool = True,
+    instrument_model: str = DEFAULT_INSTRUMENT_MODEL,
     progress: ProgressCallback | None = None,
     log_callback: LogCallback | None = None,
 ) -> Path:
@@ -1454,7 +1463,11 @@ def convert_full_mix_seed_vc(
         _progress(
             progress,
             78,
-            "반주를 같은 키로 이동하는 중...",
+            (
+                "Instrument Smart Shift 준비 중..."
+                if instrument_smart_shift
+                else "반주를 같은 키로 이동하는 중..."
+            ),
         )
 
         shifted_instrumental = (
@@ -1486,23 +1499,52 @@ def convert_full_mix_seed_vc(
                     90,
                     mapped,
                 ),
-                "반주 키 변경: " + text,
+                "반주 Smart Shift: " + text,
             )
 
         try:
-            transpose_audio(
+            smart_result = prepare_shifted_instrumental(
                 pair.instrumental_path,
                 shifted_instrumental,
                 semitones=semitones,
-                preserve_formant=False,
-                quality="quality",
+                smart_enabled=bool(
+                    instrument_smart_shift
+                ),
+                preserve_drums=bool(
+                    instrument_preserve_drums
+                ),
+                model_filename=str(
+                    instrument_model
+                ),
+                use_cache=separator_cache,
+                use_autocast=separator_autocast,
+                fallback_legacy=True,
                 progress=instrumental_progress,
+                log_callback=log_callback,
             )
-        except AudioTransposeError as exc:
+        except InstrumentSmartShiftError as exc:
             raise SeedVCSVCError(
-                "Seed-VC 보컬은 생성됐지만 반주 키 변경에 실패했습니다.\n\n"
+                "Seed-VC 보컬은 생성됐지만 반주 Smart Shift에 실패했습니다.\n\n"
                 f"{exc}"
             ) from exc
+
+        if smart_result.smart_used:
+            _emit(
+                log_callback,
+                (
+                    "Instrument Smart Shift 적용 완료 / "
+                    + (
+                        "Drums 원키 유지"
+                        if smart_result.preserve_drums
+                        else "Drums도 키 이동"
+                    )
+                ),
+            )
+        elif smart_result.fallback_used:
+            _emit(
+                log_callback,
+                "Instrument Smart Shift 실패로 기존 반주 전체 Pitch Shift fallback 사용",
+            )
 
         _progress(
             progress,

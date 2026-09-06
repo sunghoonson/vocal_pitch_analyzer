@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from media_input import ffmpeg_status_text
+from instrument_smart_shift import DEFAULT_INSTRUMENT_MODEL
 from pitch_analyzer import (
     AnalysisResult,
     analyze_audio,
@@ -111,8 +112,9 @@ from rvc_training_dataset_cleaner import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.9 / Lead Melody Analysis"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.0 / Instrument Smart Shift"
 
+# V30_INSTRUMENT_SMART_SHIFT_PATCH
 # V29_LEAD_MELODY_ANALYSIS_PATCH
 # V28_TRAINING_LEAD_DATASET_CLEANER_PATCH
 # V27_LEAD_VOCAL_SELECTOR_PATCH
@@ -486,6 +488,8 @@ class SeedVCTransposeThread(QThread):
         separator_model: str,
         separator_cache: bool,
         separator_autocast: bool,
+        instrument_smart_shift: bool,
+        instrument_preserve_drums: bool,
         parent=None,
     ):
         super().__init__(parent)
@@ -503,6 +507,12 @@ class SeedVCTransposeThread(QThread):
         self.separator_cache = separator_cache
         self.separator_autocast = (
             separator_autocast
+        )
+        self.instrument_smart_shift = bool(
+            instrument_smart_shift
+        )
+        self.instrument_preserve_drums = bool(
+            instrument_preserve_drums
         )
 
     def run(self):
@@ -538,6 +548,9 @@ class SeedVCTransposeThread(QThread):
                     separator_model=self.separator_model,
                     separator_cache=self.separator_cache,
                     separator_autocast=self.separator_autocast,
+                    instrument_smart_shift=self.instrument_smart_shift,
+                    instrument_preserve_drums=self.instrument_preserve_drums,
+                    instrument_model=DEFAULT_INSTRUMENT_MODEL,
                     **common,
                 )
 
@@ -583,6 +596,8 @@ class RVCTransposeThread(QThread):
         separator_model: str,
         separator_cache: bool,
         separator_autocast: bool,
+        instrument_smart_shift: bool,
+        instrument_preserve_drums: bool,
         parent=None,
     ):
         super().__init__(parent)
@@ -625,6 +640,12 @@ class RVCTransposeThread(QThread):
         self.separator_autocast = (
             separator_autocast
         )
+        self.instrument_smart_shift = bool(
+            instrument_smart_shift
+        )
+        self.instrument_preserve_drums = bool(
+            instrument_preserve_drums
+        )
 
     def run(self):
         try:
@@ -666,6 +687,9 @@ class RVCTransposeThread(QThread):
                     separator_model=self.separator_model,
                     separator_cache=self.separator_cache,
                     separator_autocast=self.separator_autocast,
+                    instrument_smart_shift=self.instrument_smart_shift,
+                    instrument_preserve_drums=self.instrument_preserve_drums,
+                    instrument_model=DEFAULT_INSTRUMENT_MODEL,
                     **common,
                 )
 
@@ -1868,7 +1892,7 @@ class MainWindow(QMainWindow):
             "vocals",
         )
         self.transpose_source_combo.currentIndexChanged.connect(
-            self.update_transpose_preview
+            self.on_instrument_smart_shift_settings_changed
         )
 
         self.transpose_source_label = QLabel(
@@ -1900,6 +1924,76 @@ class MainWindow(QMainWindow):
 
         transpose_root.addWidget(
             source_group
+        )
+
+        self.instrument_smart_group = QGroupBox(
+            "반주 Instrument Smart Shift"
+        )
+        instrument_layout = QFormLayout(
+            self.instrument_smart_group
+        )
+
+        self.instrument_smart_shift_check = QCheckBox(
+            "AI 4-stem 분리로 반주 키 변경 (권장)"
+        )
+        self.instrument_smart_shift_check.setChecked(
+            self.settings.value(
+                "instrument_smart_shift_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.instrument_smart_shift_check.setToolTip(
+            "원곡 전체 + Seed-VC/RVC 모드에서 BS-RoFormer 반주를 "
+            "Demucs Drums/Bass/Other/Residual로 한 번 더 분리합니다. "
+            "타악기는 기본 원키 유지, 나머지 악기만 지정 semitone으로 이동합니다."
+        )
+
+        self.instrument_preserve_drums_check = QCheckBox(
+            "Drums / Percussion은 원래 Pitch 유지"
+        )
+        self.instrument_preserve_drums_check.setChecked(
+            self.settings.value(
+                "instrument_preserve_drums",
+                True,
+                type=bool,
+            )
+        )
+        self.instrument_preserve_drums_check.setToolTip(
+            "체크 권장. 킥/스네어/하이햇/심벌의 전체 pitch가 "
+            "같이 내려가 둔탁해지는 현상을 줄입니다. "
+            "튜닝된 808/톰까지 키를 같이 옮기고 싶으면 해제하세요."
+        )
+
+        self.instrument_smart_status_label = QLabel(
+            "Demucs 4-stem: htdemucs_ft / 첫 실행 시 모델 자동 다운로드"
+        )
+        self.instrument_smart_status_label.setWordWrap(
+            True
+        )
+
+        self.instrument_smart_shift_check.toggled.connect(
+            self.on_instrument_smart_shift_settings_changed
+        )
+        self.instrument_preserve_drums_check.toggled.connect(
+            self.on_instrument_smart_shift_settings_changed
+        )
+
+        instrument_layout.addRow(
+            "",
+            self.instrument_smart_shift_check,
+        )
+        instrument_layout.addRow(
+            "",
+            self.instrument_preserve_drums_check,
+        )
+        instrument_layout.addRow(
+            "모델",
+            self.instrument_smart_status_label,
+        )
+
+        transpose_root.addWidget(
+            self.instrument_smart_group
         )
 
         key_group = QGroupBox(
@@ -2069,8 +2163,8 @@ class MainWindow(QMainWindow):
         )
 
         self.seedvc_help_label = QLabel(
-            "원곡 전체 모드: BS-RoFormer 2-stem → "
-            "보컬 Seed-VC SVC → 반주 동일 키 이동 → 재합성\n"
+            "원곡 전체 모드: BS-RoFormer 2-stem → 보컬 Seed-VC SVC → "
+            "반주 Demucs Smart Shift(Drums 원키, Bass/Other 키 이동) → 재합성\n"
             "첫 실행은 Seed-VC/Whisper/RMVPE/BigVGAN 모델 다운로드 때문에 오래 걸릴 수 있습니다."
         )
         self.seedvc_help_label.setWordWrap(
@@ -2444,7 +2538,10 @@ class MainWindow(QMainWindow):
         )
 
         self.rvc_help_label = QLabel(
-            "v2.7은 RVC 전에 Lead Vocal Selector를 먼저 적용합니다. "
+            "v3.0은 RVC Lead Vocal Selector에 더해 원곡 전체 변환 시 "
+            "반주를 Demucs 4-stem으로 분리해 Drums는 기본 원키 유지하고 "
+            "Bass/Other/Residual만 같은 semitone으로 이동합니다.\n"
+            "RVC 전에 Lead Vocal Selector를 적용해 "
             "메인 보컬 후보만 RVC로 보내고 Non-lead/화음 residual은 Pitch Shift only로 처리합니다.\n"
             "마지막 선별 결과는 cache\\rvc_lead_selector\\last_lead_candidate.wav 와 "
             "last_nonlead_residual.wav 에 저장되어 직접 들어볼 수 있습니다. "
@@ -2604,6 +2701,7 @@ class MainWindow(QMainWindow):
             self.transpose_progress_text
         )
 
+        self.on_instrument_smart_shift_settings_changed()
         self.update_transpose_engine_ui()
         self.update_seedvc_reference_ui()
 
@@ -5701,6 +5799,93 @@ class MainWindow(QMainWindow):
             tooltip
         )
 
+        if hasattr(
+            self,
+            "instrument_smart_group",
+        ):
+            self.on_instrument_smart_shift_settings_changed()
+        else:
+            self.update_transpose_preview()
+
+    def on_instrument_smart_shift_settings_changed(
+        self,
+        *_args,
+    ):
+        if not hasattr(
+            self,
+            "instrument_smart_shift_check",
+        ):
+            return
+
+        engine = (
+            self._current_transpose_engine()
+            if hasattr(
+                self,
+                "transpose_engine_combo",
+            )
+            else "rubberband"
+        )
+        source_mode = (
+            self.transpose_source_combo.currentData()
+            if hasattr(
+                self,
+                "transpose_source_combo",
+            )
+            else "original"
+        )
+
+        available_here = bool(
+            engine
+            in {
+                "seed_vc",
+                "rvc",
+            }
+            and source_mode
+            == "original"
+        )
+
+        enabled = (
+            self.instrument_smart_shift_check.isChecked()
+        )
+
+        self.instrument_smart_group.setEnabled(
+            available_here
+        )
+        self.instrument_preserve_drums_check.setEnabled(
+            available_here
+            and enabled
+        )
+
+        self.settings.setValue(
+            "instrument_smart_shift_enabled",
+            enabled,
+        )
+        self.settings.setValue(
+            "instrument_preserve_drums",
+            self.instrument_preserve_drums_check.isChecked(),
+        )
+
+        if not available_here:
+            self.instrument_smart_status_label.setText(
+                "원곡 전체 + Seed-VC/RVC에서만 사용됩니다."
+            )
+        elif enabled:
+            drum_text = (
+                "Drums 원키 유지"
+                if self.instrument_preserve_drums_check.isChecked()
+                else "Drums도 동일 키 이동"
+            )
+            self.instrument_smart_status_label.setText(
+                (
+                    f"{DEFAULT_INSTRUMENT_MODEL} / "
+                    f"{drum_text} / 실패 시 기존 반주 전체 Shift로 자동 fallback"
+                )
+            )
+        else:
+            self.instrument_smart_status_label.setText(
+                "OFF - 기존처럼 반주 전체를 한 번에 Pitch Shift"
+            )
+
         self.update_transpose_preview()
 
     def update_seedvc_reference_ui(self):
@@ -6118,6 +6303,21 @@ class MainWindow(QMainWindow):
             if not seed_vc_available():
                 ready = False
 
+            if source_mode == "original":
+                preview += (
+                    "\n반주 Smart Shift: "
+                    + (
+                        "ON / Demucs 4-stem / "
+                        + (
+                            "Drums 원키 유지"
+                            if self.instrument_preserve_drums_check.isChecked()
+                            else "Drums도 키 이동"
+                        )
+                        if self.instrument_smart_shift_check.isChecked()
+                        else "OFF / 반주 전체 Pitch Shift"
+                    )
+                )
+
             if (
                 self.seedvc_reference_combo.currentData()
                 == "custom"
@@ -6205,6 +6405,23 @@ class MainWindow(QMainWindow):
                 f"Index Rate {self.rvc_index_rate_spin.value():.2f} / "
                 f"Protect {self.rvc_protect_spin.value():.2f}"
             )
+
+            if (
+                source_mode == "original"
+                and self.instrument_smart_shift_check.isChecked()
+            ):
+                preview += (
+                    "\n반주 Smart Shift: ON / Demucs 4-stem / "
+                    + (
+                        "Drums 원키 유지"
+                        if self.instrument_preserve_drums_check.isChecked()
+                        else "Drums도 키 이동"
+                    )
+                )
+            elif source_mode == "original":
+                preview += (
+                    "\n반주 Smart Shift: OFF / 반주 전체 Pitch Shift"
+                )
 
             if self.rvc_lead_selector_check.isChecked():
                 lead_strength_label = {
@@ -6530,6 +6747,12 @@ class MainWindow(QMainWindow):
                 separator_autocast=(
                     self.separator_autocast_check.isChecked()
                 ),
+                instrument_smart_shift=(
+                    self.instrument_smart_shift_check.isChecked()
+                ),
+                instrument_preserve_drums=(
+                    self.instrument_preserve_drums_check.isChecked()
+                ),
                 parent=self,
             )
 
@@ -6593,6 +6816,12 @@ class MainWindow(QMainWindow):
                 ),
                 separator_autocast=(
                     self.separator_autocast_check.isChecked()
+                ),
+                instrument_smart_shift=(
+                    self.instrument_smart_shift_check.isChecked()
+                ),
+                instrument_preserve_drums=(
+                    self.instrument_preserve_drums_check.isChecked()
                 ),
                 parent=self,
             )
