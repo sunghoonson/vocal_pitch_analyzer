@@ -18,6 +18,9 @@ from seed_vc_svc import (
     ensure_stem_pair,
 )
 from vocal_separator import DEFAULT_MODEL
+from rvc_harmony_guard import blend_adaptive_vocals
+
+# V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
 
 
 LogCallback = Callable[[str], None]
@@ -484,6 +487,161 @@ def run_rvc_vocal(
     return output_wav
 
 
+def _prepare_adaptive_rvc_vocal(
+    source_vocal: Path,
+    temp_dir: Path,
+    *,
+    model_path: str | Path,
+    index_path: str | Path | None,
+    semitones: int,
+    index_rate: float,
+    protect: float,
+    rms_mix_rate: float,
+    speaker_id: int,
+    harmony_guard_enabled: bool,
+    harmony_guard_sensitivity: str,
+    harmony_guard_crossfade_ms: int,
+    progress: ProgressCallback | None,
+    progress_points: tuple[int, int, int, int],
+    log_callback: LogCallback | None,
+) -> Path:
+    start_percent, rvc_percent, fallback_percent, blend_percent = (
+        progress_points
+    )
+
+    raw_rvc = (
+        temp_dir
+        / "rvc_vocal_raw.wav"
+    )
+
+    _progress(
+        progress,
+        start_percent,
+        "RMVPE F0 추출 + RVC 음색 변환 중...",
+    )
+
+    run_rvc_vocal(
+        source_vocal,
+        raw_rvc,
+        model_path=model_path,
+        index_path=index_path,
+        semitones=semitones,
+        index_rate=index_rate,
+        protect=protect,
+        rms_mix_rate=rms_mix_rate,
+        speaker_id=speaker_id,
+        log_callback=log_callback,
+    )
+
+    _progress(
+        progress,
+        rvc_percent,
+        "RVC 보컬 생성 완료.",
+    )
+
+    if not harmony_guard_enabled:
+        _emit(
+            log_callback,
+            "[Harmony Guard] 비활성화 - 기존 RVC 출력 그대로 사용",
+        )
+        return raw_rvc
+
+    rb_ok, rb_status = (
+        rubberband_filter_available()
+    )
+
+    if not rb_ok:
+        _emit(
+            log_callback,
+            (
+                "[Harmony Guard] Pitch-only 우회용 RubberBand를 사용할 수 없어 "
+                "Harmony Guard를 건너뜁니다: "
+                + rb_status
+            ),
+        )
+        return raw_rvc
+
+    pitch_only = (
+        temp_dir
+        / "pitch_only_vocal.wav"
+    )
+
+    _progress(
+        progress,
+        min(
+            fallback_percent,
+            99,
+        ),
+        "Harmony Guard: 안전 우회용 Pitch-only 보컬 생성 중...",
+    )
+
+    try:
+        transpose_audio(
+            source_vocal,
+            pitch_only,
+            semitones=semitones,
+            preserve_formant=True,
+            quality="quality",
+        )
+    except AudioTransposeError as exc:
+        _emit(
+            log_callback,
+            (
+                "[Harmony Guard] Pitch-only 보컬 생성 실패 - "
+                "기존 RVC 출력으로 계속합니다: "
+                f"{exc}"
+            ),
+        )
+        return raw_rvc
+
+    adaptive = (
+        temp_dir
+        / "rvc_vocal_harmony_guard.wav"
+    )
+
+    _progress(
+        progress,
+        min(
+            blend_percent,
+            99,
+        ),
+        "Harmony Guard: 화음/코러스 위험도 분석 + Adaptive Blend 중...",
+    )
+
+    try:
+        report = blend_adaptive_vocals(
+            source_vocal,
+            raw_rvc,
+            pitch_only,
+            adaptive,
+            sensitivity=harmony_guard_sensitivity,
+            crossfade_ms=harmony_guard_crossfade_ms,
+            log_callback=log_callback,
+        )
+    except Exception as exc:
+        _emit(
+            log_callback,
+            (
+                "[Harmony Guard] 분석/Blend 실패 - "
+                "기존 RVC 출력으로 계속합니다: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+        return raw_rvc
+
+    _emit(
+        log_callback,
+        (
+            "[Harmony Guard] 적용 완료: "
+            f"위험 구간 {report.risky_region_count}개, "
+            f"Pitch-only 우회 {report.fallback_seconds:.1f}s, "
+            f"부분 Blend {report.blend_seconds:.1f}s"
+        ),
+    )
+
+    return adaptive
+
+
 def convert_vocal_rvc(
     vocal_path: str | Path,
     output_path: str | Path,
@@ -495,6 +653,9 @@ def convert_vocal_rvc(
     protect: float = 0.33,
     rms_mix_rate: float = 1.0,
     speaker_id: int = 0,
+    harmony_guard_enabled: bool = True,
+    harmony_guard_sensitivity: str = "medium",
+    harmony_guard_crossfade_ms: int = 500,
     progress: ProgressCallback | None = None,
     log_callback: LogCallback | None = None,
 ) -> Path:
@@ -524,32 +685,39 @@ def convert_vocal_rvc(
         )
 
         converted_wav = (
-            temp_dir
-            / "rvc_vocal.wav"
+            _prepare_adaptive_rvc_vocal(
+                vocal,
+                temp_dir,
+                model_path=model_path,
+                index_path=index_path,
+                semitones=semitones,
+                index_rate=index_rate,
+                protect=protect,
+                rms_mix_rate=rms_mix_rate,
+                speaker_id=speaker_id,
+                harmony_guard_enabled=bool(
+                    harmony_guard_enabled
+                ),
+                harmony_guard_sensitivity=str(
+                    harmony_guard_sensitivity
+                ),
+                harmony_guard_crossfade_ms=int(
+                    harmony_guard_crossfade_ms
+                ),
+                progress=progress,
+                progress_points=(
+                    15,
+                    68,
+                    76,
+                    86,
+                ),
+                log_callback=log_callback,
+            )
         )
 
         _progress(
             progress,
-            15,
-            "RMVPE F0 추출 + RVC 음색 변환 중...",
-        )
-
-        run_rvc_vocal(
-            vocal,
-            converted_wav,
-            model_path=model_path,
-            index_path=index_path,
-            semitones=semitones,
-            index_rate=index_rate,
-            protect=protect,
-            rms_mix_rate=rms_mix_rate,
-            speaker_id=speaker_id,
-            log_callback=log_callback,
-        )
-
-        _progress(
-            progress,
-            90,
+            92,
             "RVC 보컬 출력 인코딩 중...",
         )
 
@@ -578,6 +746,9 @@ def convert_full_mix_rvc(
     protect: float = 0.33,
     rms_mix_rate: float = 1.0,
     speaker_id: int = 0,
+    harmony_guard_enabled: bool = True,
+    harmony_guard_sensitivity: str = "medium",
+    harmony_guard_crossfade_ms: int = 500,
     separator_model: str = DEFAULT_MODEL,
     separator_cache: bool = True,
     separator_autocast: bool = True,
@@ -643,32 +814,41 @@ def convert_full_mix_rvc(
         )
 
         converted_vocal = (
-            temp_dir
-            / "rvc_vocal.wav"
+            _prepare_adaptive_rvc_vocal(
+                Path(
+                    pair.vocals_path
+                ),
+                temp_dir,
+                model_path=model_path,
+                index_path=index_path,
+                semitones=semitones,
+                index_rate=index_rate,
+                protect=protect,
+                rms_mix_rate=rms_mix_rate,
+                speaker_id=speaker_id,
+                harmony_guard_enabled=bool(
+                    harmony_guard_enabled
+                ),
+                harmony_guard_sensitivity=str(
+                    harmony_guard_sensitivity
+                ),
+                harmony_guard_crossfade_ms=int(
+                    harmony_guard_crossfade_ms
+                ),
+                progress=progress,
+                progress_points=(
+                    30,
+                    66,
+                    71,
+                    78,
+                ),
+                log_callback=log_callback,
+            )
         )
 
         _progress(
             progress,
-            30,
-            "RMVPE F0 추출 + RVC 남성/타깃 음색 변환 중...",
-        )
-
-        run_rvc_vocal(
-            pair.vocals_path,
-            converted_vocal,
-            model_path=model_path,
-            index_path=index_path,
-            semitones=semitones,
-            index_rate=index_rate,
-            protect=protect,
-            rms_mix_rate=rms_mix_rate,
-            speaker_id=speaker_id,
-            log_callback=log_callback,
-        )
-
-        _progress(
-            progress,
-            78,
+            82,
             "반주를 같은 키로 이동하는 중...",
         )
 
@@ -682,7 +862,7 @@ def convert_full_mix_rvc(
             text: str,
         ) -> None:
             mapped = (
-                78
+                82
                 + int(
                     max(
                         0,
@@ -691,7 +871,7 @@ def convert_full_mix_rvc(
                             percent,
                         ),
                     )
-                    * 0.12
+                    * 0.08
                 )
             )
 
@@ -722,7 +902,7 @@ def convert_full_mix_rvc(
         _progress(
             progress,
             92,
-            "RVC 보컬과 변환 반주를 재합성하는 중...",
+            "Adaptive RVC 보컬과 변환 반주를 재합성하는 중...",
         )
 
         _mix_stems(

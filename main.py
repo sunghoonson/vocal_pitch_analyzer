@@ -98,8 +98,9 @@ from batch_vocal_extractor import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.3 / RVC Experiment Browser"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.4 / Adaptive RVC Harmony Guard"
 
+# V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
 # V23_RVC_EXPERIMENT_BROWSER_PATCH
 # V22_RVC_FINETUNE_PATCH
 # V21_BATCH_VOCAL_DATASET_PATCH
@@ -467,6 +468,9 @@ class RVCTransposeThread(QThread):
         protect: float,
         rms_mix_rate: float,
         speaker_id: int,
+        harmony_guard_enabled: bool,
+        harmony_guard_sensitivity: str,
+        harmony_guard_crossfade_ms: int,
         separator_model: str,
         separator_cache: bool,
         separator_autocast: bool,
@@ -484,6 +488,15 @@ class RVCTransposeThread(QThread):
         self.protect = protect
         self.rms_mix_rate = rms_mix_rate
         self.speaker_id = speaker_id
+        self.harmony_guard_enabled = (
+            harmony_guard_enabled
+        )
+        self.harmony_guard_sensitivity = (
+            harmony_guard_sensitivity
+        )
+        self.harmony_guard_crossfade_ms = (
+            harmony_guard_crossfade_ms
+        )
         self.separator_model = (
             separator_model
         )
@@ -504,6 +517,9 @@ class RVCTransposeThread(QThread):
                 protect=self.protect,
                 rms_mix_rate=self.rms_mix_rate,
                 speaker_id=self.speaker_id,
+                harmony_guard_enabled=self.harmony_guard_enabled,
+                harmony_guard_sensitivity=self.harmony_guard_sensitivity,
+                harmony_guard_crossfade_ms=self.harmony_guard_crossfade_ms,
                 progress=lambda p, t: (
                     self.progress_changed.emit(
                         p,
@@ -1812,11 +1828,94 @@ class MainWindow(QMainWindow):
             0
         )
 
+        self.rvc_harmony_guard_check = QCheckBox(
+            "Adaptive RVC / Harmony Guard 사용"
+        )
+        self.rvc_harmony_guard_check.setChecked(
+            self.settings.value(
+                "rvc_harmony_guard_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.rvc_harmony_guard_check.setToolTip(
+            "화음/코러스/F0 불안정 구간을 자동 감지해 "
+            "RVC 출력 대신 같은 키의 Pitch-only 보컬을 부분적으로 섞습니다."
+        )
+
+        self.rvc_harmony_sensitivity_combo = QComboBox()
+        self.rvc_harmony_sensitivity_combo.addItem(
+            "낮음 - 심한 구간만 우회",
+            "low",
+        )
+        self.rvc_harmony_sensitivity_combo.addItem(
+            "보통 - 권장",
+            "medium",
+        )
+        self.rvc_harmony_sensitivity_combo.addItem(
+            "높음 - 적극적으로 우회",
+            "high",
+        )
+        saved_harmony_sensitivity = self.settings.value(
+            "rvc_harmony_guard_sensitivity",
+            "medium",
+            type=str,
+        )
+        saved_harmony_index = (
+            self.rvc_harmony_sensitivity_combo.findData(
+                saved_harmony_sensitivity
+            )
+        )
+        self.rvc_harmony_sensitivity_combo.setCurrentIndex(
+            saved_harmony_index
+            if saved_harmony_index >= 0
+            else 1
+        )
+
+        self.rvc_harmony_crossfade_spin = QSpinBox()
+        self.rvc_harmony_crossfade_spin.setRange(
+            100,
+            2000,
+        )
+        self.rvc_harmony_crossfade_spin.setSingleStep(
+            50
+        )
+        self.rvc_harmony_crossfade_spin.setSuffix(
+            " ms"
+        )
+        self.rvc_harmony_crossfade_spin.setValue(
+            self.settings.value(
+                "rvc_harmony_guard_crossfade_ms",
+                500,
+                type=int,
+            )
+        )
+
+        harmony_guard_enabled = (
+            self.rvc_harmony_guard_check.isChecked()
+        )
+        self.rvc_harmony_sensitivity_combo.setEnabled(
+            harmony_guard_enabled
+        )
+        self.rvc_harmony_crossfade_spin.setEnabled(
+            harmony_guard_enabled
+        )
+
+        self.rvc_harmony_guard_check.toggled.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+        self.rvc_harmony_sensitivity_combo.currentIndexChanged.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+        self.rvc_harmony_crossfade_spin.valueChanged.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+
         self.rvc_help_label = QLabel(
-            "남성 음색으로 학습된 RVC .pth 모델을 선택하면 "
-            "RMVPE가 원곡 보컬의 F0를 추적하고, 현재 키 변경값을 적용한 뒤 "
-            "선택한 모델 음색으로 보컬을 재합성합니다.\n"
-            ".index 파일은 권장하지만 필수는 아닙니다."
+            "목표 음색으로 학습된 RVC .pth 모델을 사용합니다. "
+            "Harmony Guard는 화음/코러스처럼 단일 F0 추적이 불안정한 구간을 "
+            "자동 감지해 Pitch-only 보컬로 부분 우회하고 Crossfade로 연결합니다.\n"
+            "우회 구간은 원본 음색이 일부 남을 수 있지만 삑사리/뭉개짐을 줄이는 것이 목적입니다."
         )
         self.rvc_help_label.setWordWrap(
             True
@@ -1849,6 +1948,18 @@ class MainWindow(QMainWindow):
         rvc_layout.addRow(
             "Speaker ID",
             self.rvc_speaker_spin,
+        )
+        rvc_layout.addRow(
+            "",
+            self.rvc_harmony_guard_check,
+        )
+        rvc_layout.addRow(
+            "Harmony 민감도",
+            self.rvc_harmony_sensitivity_combo,
+        )
+        rvc_layout.addRow(
+            "Crossfade",
+            self.rvc_harmony_crossfade_spin,
         )
         rvc_layout.addRow(
             "",
@@ -4536,6 +4647,43 @@ class MainWindow(QMainWindow):
             or "rubberband"
         )
 
+    def on_rvc_harmony_guard_settings_changed(
+        self,
+        *_args,
+    ):
+        if not hasattr(
+            self,
+            "rvc_harmony_guard_check",
+        ):
+            return
+
+        enabled = (
+            self.rvc_harmony_guard_check.isChecked()
+        )
+
+        self.rvc_harmony_sensitivity_combo.setEnabled(
+            enabled
+        )
+        self.rvc_harmony_crossfade_spin.setEnabled(
+            enabled
+        )
+
+        self.settings.setValue(
+            "rvc_harmony_guard_enabled",
+            enabled,
+        )
+        self.settings.setValue(
+            "rvc_harmony_guard_sensitivity",
+            self.rvc_harmony_sensitivity_combo.currentData()
+            or "medium",
+        )
+        self.settings.setValue(
+            "rvc_harmony_guard_crossfade_ms",
+            self.rvc_harmony_crossfade_spin.value(),
+        )
+
+        self.update_transpose_preview()
+
     def update_transpose_engine_ui(self):
         if not hasattr(
             self,
@@ -5093,6 +5241,25 @@ class MainWindow(QMainWindow):
                 f"Protect {self.rvc_protect_spin.value():.2f}"
             )
 
+            if self.rvc_harmony_guard_check.isChecked():
+                sensitivity_label = {
+                    "low": "낮음",
+                    "medium": "보통",
+                    "high": "높음",
+                }.get(
+                    self.rvc_harmony_sensitivity_combo.currentData(),
+                    "보통",
+                )
+                preview += (
+                    "\nHarmony Guard: ON / "
+                    f"민감도 {sensitivity_label} / "
+                    f"Crossfade {self.rvc_harmony_crossfade_spin.value()} ms"
+                )
+            else:
+                preview += (
+                    "\nHarmony Guard: OFF"
+                )
+
         else:
             rb_ok, status = (
                 rubberband_filter_available()
@@ -5346,6 +5513,16 @@ class MainWindow(QMainWindow):
                 ),
                 speaker_id=(
                     self.rvc_speaker_spin.value()
+                ),
+                harmony_guard_enabled=(
+                    self.rvc_harmony_guard_check.isChecked()
+                ),
+                harmony_guard_sensitivity=(
+                    self.rvc_harmony_sensitivity_combo.currentData()
+                    or "medium"
+                ),
+                harmony_guard_crossfade_ms=(
+                    self.rvc_harmony_crossfade_spin.value()
                 ),
                 separator_model=(
                     self.separator_model_combo.currentData()
