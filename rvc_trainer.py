@@ -51,6 +51,7 @@ class RVCExperimentInfo:
 
 
 # V23_RVC_EXPERIMENT_BROWSER_PATCH
+# V23_RVC_FINETUNE_INDEX_REFRESH_HOTFIX
 # V22_RVC_FINETUNE_PATCH
 TRAINING_MODE_NEW = "new"
 TRAINING_MODE_RESUME = "resume"
@@ -1516,6 +1517,216 @@ class RVCTrainingPipeline:
 
         return backup_dir
 
+    def _feature_index_candidates(
+        self,
+        exp_name: str,
+        exp_dir: Path,
+        *,
+        include_permanent: bool = True,
+    ) -> list[Path]:
+        candidates: list[Path] = []
+
+        try:
+            candidates.extend(
+                exp_dir.glob(
+                    "*.index"
+                )
+            )
+        except OSError:
+            pass
+
+        shared_dir = (
+            rvc_root()
+            / "assets"
+            / "indices"
+        )
+
+        if shared_dir.is_dir():
+            try:
+                for path in shared_dir.glob(
+                    "*.index"
+                ):
+                    if (
+                        exp_name.lower()
+                        in path.name.lower()
+                    ):
+                        candidates.append(
+                            path
+                        )
+            except OSError:
+                pass
+
+        if include_permanent:
+            permanent_dir = (
+                trained_models_root()
+                / exp_name
+            )
+
+            if permanent_dir.is_dir():
+                try:
+                    candidates.extend(
+                        permanent_dir.glob(
+                            "*.index"
+                        )
+                    )
+                except OSError:
+                    pass
+
+        unique: dict[str, Path] = {}
+
+        for path in candidates:
+            try:
+                key = str(
+                    path.resolve()
+                ).lower()
+            except OSError:
+                key = str(
+                    path
+                ).lower()
+
+            unique[key] = path
+
+        return list(
+            unique.values()
+        )
+
+    def _backup_and_remove_feature_indexes(
+        self,
+        exp_name: str,
+        exp_dir: Path,
+        backup_dir: Path,
+    ) -> None:
+        candidates = (
+            self._feature_index_candidates(
+                exp_name,
+                exp_dir,
+                include_permanent=True,
+            )
+        )
+
+        if not candidates:
+            self._log(
+                "[INDEX] 제거할 기존 Feature Index가 없습니다."
+            )
+            return
+
+        index_backup_dir = (
+            backup_dir
+            / "feature_indexes"
+        )
+        index_backup_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        shared_dir = (
+            rvc_root()
+            / "assets"
+            / "indices"
+        )
+        permanent_dir = (
+            trained_models_root()
+            / exp_name
+        )
+
+        removed = 0
+
+        for source in candidates:
+            try:
+                if source.parent == exp_dir:
+                    prefix = "experiment__"
+                elif source.parent == shared_dir:
+                    prefix = "assets_indices__"
+                elif source.parent == permanent_dir:
+                    prefix = "rvc_models__"
+                else:
+                    prefix = "other__"
+
+                target = (
+                    index_backup_dir
+                    / (
+                        prefix
+                        + source.name
+                    )
+                )
+
+                counter = 1
+
+                while target.exists():
+                    target = (
+                        index_backup_dir
+                        / (
+                            prefix
+                            + str(counter)
+                            + "__"
+                            + source.name
+                        )
+                    )
+                    counter += 1
+
+                shutil.copy2(
+                    source,
+                    target,
+                )
+                source.unlink()
+                removed += 1
+
+                self._log(
+                    f"[INDEX] 기존 Index 백업/제거: {source}"
+                )
+
+            except Exception as exc:
+                raise RVCTrainingError(
+                    "기존 Feature Index를 백업/제거하지 못했습니다.\n"
+                    f"파일: {source}\n"
+                    f"오류: {type(exc).__name__}: {exc}"
+                ) from exc
+
+        self._log(
+            f"[INDEX] 기존 Feature Index {removed}개 제거 완료. "
+            "이번 파인튜닝의 새 HuBERT 특징으로 다시 생성합니다."
+        )
+
+    def _validate_generated_feature_index(
+        self,
+        exp_name: str,
+        exp_dir: Path,
+    ) -> Path:
+        candidates = (
+            self._feature_index_candidates(
+                exp_name,
+                exp_dir,
+                include_permanent=False,
+            )
+        )
+
+        added = [
+            path
+            for path in candidates
+            if "added" in path.name.lower()
+        ]
+
+        if added:
+            candidates = added
+
+        if not candidates:
+            raise RVCTrainingError(
+                "Feature Index 생성 단계는 종료됐지만 새 .index 파일을 찾지 못했습니다.\n"
+                "기존 Index는 파인튜닝 전에 제거했으므로 이전 Index를 계속 "
+                "사용하지 않도록 완료 처리를 중단합니다."
+            )
+
+        newest = max(
+            candidates,
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+
+        self._log(
+            f"[INDEX] 새 Feature Index 확인: {newest}"
+        )
+
+        return newest
+
     def _clear_derived_training_data(
         self,
         exp_dir: Path,
@@ -2071,9 +2282,16 @@ class RVCTrainingPipeline:
                 exp_dir,
                 files,
             )
-            self._backup_training_state(
+            finetune_backup_dir = (
+                self._backup_training_state(
+                    exp_name,
+                    exp_dir,
+                )
+            )
+            self._backup_and_remove_feature_indexes(
                 exp_name,
                 exp_dir,
+                finetune_backup_dir,
             )
             self._clear_derived_training_data(
                 exp_dir
@@ -2292,6 +2510,15 @@ class RVCTrainingPipeline:
             cwd=root,
             stage="6/6 Feature Index 생성",
         )
+
+        if (
+            training_mode
+            == TRAINING_MODE_FINETUNE_ADD
+        ):
+            self._validate_generated_feature_index(
+                exp_name,
+                exp_dir,
+            )
 
         result = (
             self._copy_final_outputs(
