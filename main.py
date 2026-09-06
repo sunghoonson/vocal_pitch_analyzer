@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QMainWindow,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -101,6 +103,7 @@ from batch_vocal_extractor import (
 APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.4 / Adaptive RVC Harmony Guard"
 
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
+# V24_SCROLLABLE_TABS_HOTFIX
 # V23_RVC_EXPERIMENT_BROWSER_PATCH
 # V22_RVC_FINETUNE_PATCH
 # V21_BATCH_VOCAL_DATASET_PATCH
@@ -806,24 +809,106 @@ class MainWindow(QMainWindow):
 
         self.main_tabs = QTabWidget()
 
-        self.analysis_tab = QWidget()
-        analysis_root = QVBoxLayout(
-            self.analysis_tab
+        def create_scrollable_tab(
+            object_name: str,
+        ):
+            tab = QWidget()
+            tab.setObjectName(
+                object_name
+            )
+
+            tab_shell = QVBoxLayout(
+                tab
+            )
+            tab_shell.setContentsMargins(
+                0,
+                0,
+                0,
+                0,
+            )
+            tab_shell.setSpacing(
+                0
+            )
+
+            scroll = QScrollArea(
+                tab
+            )
+            scroll.setObjectName(
+                object_name
+                + "_scroll"
+            )
+            scroll.setWidgetResizable(
+                True
+            )
+            scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+            scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            )
+
+            content = QWidget()
+            content.setObjectName(
+                object_name
+                + "_content"
+            )
+
+            content_layout = QVBoxLayout(
+                content
+            )
+            content_layout.setSizeConstraint(
+                QLayout.SizeConstraint.SetMinAndMaxSize
+            )
+
+            scroll.setWidget(
+                content
+            )
+            tab_shell.addWidget(
+                scroll,
+                1,
+            )
+
+            return (
+                tab,
+                content,
+                content_layout,
+                scroll,
+            )
+
+        (
+            self.analysis_tab,
+            self.analysis_tab_content,
+            analysis_root,
+            self.analysis_tab_scroll,
+        ) = create_scrollable_tab(
+            "analysis_tab"
         )
 
-        self.result_tab = QWidget()
-        result_root = QVBoxLayout(
-            self.result_tab
+        (
+            self.result_tab,
+            self.result_tab_content,
+            result_root,
+            self.result_tab_scroll,
+        ) = create_scrollable_tab(
+            "result_tab"
         )
 
-        self.transpose_tab = QWidget()
-        transpose_root = QVBoxLayout(
-            self.transpose_tab
+        (
+            self.transpose_tab,
+            self.transpose_tab_content,
+            transpose_root,
+            self.transpose_tab_scroll,
+        ) = create_scrollable_tab(
+            "transpose_tab"
         )
 
-        self.rvc_training_tab = QWidget()
-        rvc_training_root = QVBoxLayout(
-            self.rvc_training_tab
+        (
+            self.rvc_training_tab,
+            self.rvc_training_tab_content,
+            rvc_training_root,
+            self.rvc_training_tab_scroll,
+        ) = create_scrollable_tab(
+            "rvc_training_tab"
         )
 
         self.main_tabs.addTab(
