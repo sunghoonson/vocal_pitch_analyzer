@@ -101,8 +101,9 @@ from batch_vocal_extractor import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.6 / Artifact Priority + Manual Bypass"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.7 / Lead Vocal Selector"
 
+# V27_LEAD_VOCAL_SELECTOR_PATCH
 # V26_ARTIFACT_PRIORITY_MANUAL_BYPASS_PATCH
 # V25_RVC_ARTIFACT_GUARD_PATCH
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
@@ -474,6 +475,8 @@ class RVCTransposeThread(QThread):
         protect: float,
         rms_mix_rate: float,
         speaker_id: int,
+        lead_selector_enabled: bool,
+        lead_selector_strength: str,
         harmony_guard_enabled: bool,
         harmony_guard_sensitivity: str,
         harmony_guard_crossfade_ms: int,
@@ -495,6 +498,12 @@ class RVCTransposeThread(QThread):
         self.protect = protect
         self.rms_mix_rate = rms_mix_rate
         self.speaker_id = speaker_id
+        self.lead_selector_enabled = (
+            lead_selector_enabled
+        )
+        self.lead_selector_strength = (
+            lead_selector_strength
+        )
         self.harmony_guard_enabled = (
             harmony_guard_enabled
         )
@@ -528,6 +537,8 @@ class RVCTransposeThread(QThread):
                 protect=self.protect,
                 rms_mix_rate=self.rms_mix_rate,
                 speaker_id=self.speaker_id,
+                lead_selector_enabled=self.lead_selector_enabled,
+                lead_selector_strength=self.lead_selector_strength,
                 harmony_guard_enabled=self.harmony_guard_enabled,
                 harmony_guard_sensitivity=self.harmony_guard_sensitivity,
                 harmony_guard_crossfade_ms=self.harmony_guard_crossfade_ms,
@@ -1922,6 +1933,63 @@ class MainWindow(QMainWindow):
             0
         )
 
+        self.rvc_lead_selector_check = QCheckBox(
+            "Lead Vocal Selector 사용 (RVC 전 메인 보컬 선별)"
+        )
+        self.rvc_lead_selector_check.setChecked(
+            self.settings.value(
+                "rvc_lead_selector_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.rvc_lead_selector_check.setToolTip(
+            "BS-RoFormer vocals stem을 바로 RVC에 넣지 않고, "
+            "F0/배음/센터 성분을 분석해 메인 보컬 후보와 "
+            "Non-lead/화음 residual로 나눕니다. "
+            "Lead만 RVC, 나머지는 Pitch Shift only로 처리합니다."
+        )
+
+        self.rvc_lead_selector_strength_combo = QComboBox()
+        self.rvc_lead_selector_strength_combo.addItem(
+            "약함 - 발음/음색 보존 우선",
+            "gentle",
+        )
+        self.rvc_lead_selector_strength_combo.addItem(
+            "보통 - 권장",
+            "balanced",
+        )
+        self.rvc_lead_selector_strength_combo.addItem(
+            "강함 - 화음/백킹 제거 우선",
+            "strict",
+        )
+
+        saved_lead_strength = self.settings.value(
+            "rvc_lead_selector_strength",
+            "balanced",
+            type=str,
+        )
+        saved_lead_index = (
+            self.rvc_lead_selector_strength_combo.findData(
+                saved_lead_strength
+            )
+        )
+        self.rvc_lead_selector_strength_combo.setCurrentIndex(
+            saved_lead_index
+            if saved_lead_index >= 0
+            else 1
+        )
+        self.rvc_lead_selector_strength_combo.setEnabled(
+            self.rvc_lead_selector_check.isChecked()
+        )
+
+        self.rvc_lead_selector_check.toggled.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+        self.rvc_lead_selector_strength_combo.currentIndexChanged.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+
         self.rvc_harmony_guard_check = QCheckBox(
             "Adaptive RVC / Harmony + Artifact Guard 사용"
         )
@@ -2049,10 +2117,11 @@ class MainWindow(QMainWindow):
         )
 
         self.rvc_help_label = QLabel(
-            "v2.6은 목표 가수 음색을 보존하도록 Artifact 우선 방식으로 동작합니다. "
-            "1차 Harmony 분석은 보조 힌트만 주며 단독으로는 최대 12~32%까지만 우회합니다. "
-            "실제 RVC 출력에서 Artifact가 확인된 구간만 최대 98%까지 강하게 우회합니다.\n"
-            "수동 우회는 Auto Guard와 독립적이며, 지정한 시간만 Pitch-only로 강제 우회할 수 있습니다."
+            "v2.7은 RVC 전에 Lead Vocal Selector를 먼저 적용합니다. "
+            "메인 보컬 후보만 RVC로 보내고 Non-lead/화음 residual은 Pitch Shift only로 처리합니다.\n"
+            "마지막 선별 결과는 cache\\rvc_lead_selector\\last_lead_candidate.wav 와 "
+            "last_nonlead_residual.wav 에 저장되어 직접 들어볼 수 있습니다. "
+            "Artifact Guard와 수동 우회는 이후의 최종 안전망으로 그대로 유지됩니다."
         )
         self.rvc_help_label.setWordWrap(
             True
@@ -2085,6 +2154,14 @@ class MainWindow(QMainWindow):
         rvc_layout.addRow(
             "Speaker ID",
             self.rvc_speaker_spin,
+        )
+        rvc_layout.addRow(
+            "",
+            self.rvc_lead_selector_check,
+        )
+        rvc_layout.addRow(
+            "Lead 선별 강도",
+            self.rvc_lead_selector_strength_combo,
         )
         rvc_layout.addRow(
             "",
@@ -4806,6 +4883,13 @@ class MainWindow(QMainWindow):
             self.rvc_harmony_guard_check.isChecked()
         )
 
+        lead_selector_enabled = (
+            self.rvc_lead_selector_check.isChecked()
+        )
+        self.rvc_lead_selector_strength_combo.setEnabled(
+            lead_selector_enabled
+        )
+
         self.rvc_harmony_sensitivity_combo.setEnabled(
             enabled
         )
@@ -4820,6 +4904,15 @@ class MainWindow(QMainWindow):
             manual_enabled
         )
 
+        self.settings.setValue(
+            "rvc_lead_selector_enabled",
+            lead_selector_enabled,
+        )
+        self.settings.setValue(
+            "rvc_lead_selector_strength",
+            self.rvc_lead_selector_strength_combo.currentData()
+            or "balanced",
+        )
         self.settings.setValue(
             "rvc_harmony_guard_enabled",
             enabled,
@@ -5400,6 +5493,25 @@ class MainWindow(QMainWindow):
                 f"Protect {self.rvc_protect_spin.value():.2f}"
             )
 
+            if self.rvc_lead_selector_check.isChecked():
+                lead_strength_label = {
+                    "gentle": "약함",
+                    "balanced": "보통",
+                    "strict": "강함",
+                }.get(
+                    self.rvc_lead_selector_strength_combo.currentData(),
+                    "보통",
+                )
+                preview += (
+                    "\nLead Vocal Selector: ON / "
+                    f"강도 {lead_strength_label} / "
+                    "Lead만 RVC"
+                )
+            else:
+                preview += (
+                    "\nLead Vocal Selector: OFF / 전체 vocals를 RVC"
+                )
+
             if self.rvc_harmony_guard_check.isChecked():
                 sensitivity_label = {
                     "low": "낮음",
@@ -5738,6 +5850,13 @@ class MainWindow(QMainWindow):
                 ),
                 speaker_id=(
                     self.rvc_speaker_spin.value()
+                ),
+                lead_selector_enabled=(
+                    self.rvc_lead_selector_check.isChecked()
+                ),
+                lead_selector_strength=(
+                    self.rvc_lead_selector_strength_combo.currentData()
+                    or "balanced"
                 ),
                 harmony_guard_enabled=(
                     self.rvc_harmony_guard_check.isChecked()

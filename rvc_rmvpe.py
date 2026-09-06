@@ -24,8 +24,13 @@ from seed_vc_svc import (
 )
 from vocal_separator import DEFAULT_MODEL
 from rvc_harmony_guard import blend_adaptive_vocals
+from rvc_lead_selector import (
+    LeadVocalSelectorError,
+    select_lead_vocal,
+)
 
 # V25_RVC_ARTIFACT_GUARD_PATCH
+# V27_LEAD_VOCAL_SELECTOR_PATCH
 # V26_ARTIFACT_PRIORITY_MANUAL_BYPASS_PATCH
 # V25_ADAPTIVE_GUARD_DIAGNOSTICS_HOTFIX
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
@@ -1409,6 +1414,250 @@ def _prepare_adaptive_rvc_vocal(
 
     return adaptive
 
+def _prepare_rvc_vocal_pipeline(
+    source_vocal: Path,
+    temp_dir: Path,
+    *,
+    model_path: str | Path,
+    index_path: str | Path | None,
+    semitones: int,
+    index_rate: float,
+    protect: float,
+    rms_mix_rate: float,
+    speaker_id: int,
+    lead_selector_enabled: bool,
+    lead_selector_strength: str,
+    harmony_guard_enabled: bool,
+    harmony_guard_sensitivity: str,
+    harmony_guard_crossfade_ms: int,
+    manual_bypass_ranges: list[tuple[float, float]] | None,
+    progress: ProgressCallback | None,
+    selector_progress: tuple[int, int, int],
+    adaptive_progress: tuple[int, int, int, int],
+    log_callback: LogCallback | None,
+) -> Path:
+    (
+        selector_start,
+        selector_done,
+        residual_shift_percent,
+    ) = selector_progress
+
+    if not lead_selector_enabled:
+        _emit(
+            log_callback,
+            (
+                "[Lead Selector] OFF - 기존 전체 vocal stem을 "
+                "그대로 RVC에 전달합니다."
+            ),
+        )
+
+        return _prepare_adaptive_rvc_vocal(
+            source_vocal,
+            temp_dir,
+            model_path=model_path,
+            index_path=index_path,
+            semitones=semitones,
+            index_rate=index_rate,
+            protect=protect,
+            rms_mix_rate=rms_mix_rate,
+            speaker_id=speaker_id,
+            harmony_guard_enabled=harmony_guard_enabled,
+            harmony_guard_sensitivity=harmony_guard_sensitivity,
+            harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
+            manual_bypass_ranges=manual_bypass_ranges,
+            progress=progress,
+            progress_points=adaptive_progress,
+            log_callback=log_callback,
+        )
+
+    lead_candidate = (
+        temp_dir
+        / "lead_candidate.wav"
+    )
+    nonlead_residual = (
+        temp_dir
+        / "nonlead_residual.wav"
+    )
+
+    _progress(
+        progress,
+        selector_start,
+        "Lead Vocal Selector: 메인 보컬 선별 중...",
+    )
+
+    try:
+        selector_report = select_lead_vocal(
+            source_vocal,
+            lead_candidate,
+            nonlead_residual,
+            strength=lead_selector_strength,
+            log_callback=log_callback,
+            save_debug_copy=True,
+        )
+    except Exception as exc:
+        _emit(
+            log_callback,
+            (
+                "[Lead Selector] 실패 - 안전하게 기존 전체 vocal "
+                "RVC 경로로 되돌립니다: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+        return _prepare_adaptive_rvc_vocal(
+            source_vocal,
+            temp_dir,
+            model_path=model_path,
+            index_path=index_path,
+            semitones=semitones,
+            index_rate=index_rate,
+            protect=protect,
+            rms_mix_rate=rms_mix_rate,
+            speaker_id=speaker_id,
+            harmony_guard_enabled=harmony_guard_enabled,
+            harmony_guard_sensitivity=harmony_guard_sensitivity,
+            harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
+            manual_bypass_ranges=manual_bypass_ranges,
+            progress=progress,
+            progress_points=adaptive_progress,
+            log_callback=log_callback,
+        )
+
+    minimum_seconds = max(
+        1.0,
+        selector_report.duration_seconds
+        * 0.025,
+    )
+
+    if (
+        selector_report.selected_seconds
+        < minimum_seconds
+        or selector_report.lead_energy_ratio
+        < 0.008
+    ):
+        _emit(
+            log_callback,
+            (
+                "[Lead Selector] 선택된 Lead가 너무 적어 "
+                "전체 vocal RVC 경로로 되돌립니다. "
+                f"(selected={selector_report.selected_seconds:.1f}s, "
+                f"energy={selector_report.lead_energy_ratio * 100.0:.2f}%)"
+            ),
+        )
+
+        return _prepare_adaptive_rvc_vocal(
+            source_vocal,
+            temp_dir,
+            model_path=model_path,
+            index_path=index_path,
+            semitones=semitones,
+            index_rate=index_rate,
+            protect=protect,
+            rms_mix_rate=rms_mix_rate,
+            speaker_id=speaker_id,
+            harmony_guard_enabled=harmony_guard_enabled,
+            harmony_guard_sensitivity=harmony_guard_sensitivity,
+            harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
+            manual_bypass_ranges=manual_bypass_ranges,
+            progress=progress,
+            progress_points=adaptive_progress,
+            log_callback=log_callback,
+        )
+
+    _progress(
+        progress,
+        selector_done,
+        (
+            "Lead Vocal Selector 완료: "
+            f"Lead {selector_report.selected_ratio * 100.0:.1f}%"
+        ),
+    )
+
+    converted_lead = _prepare_adaptive_rvc_vocal(
+        lead_candidate,
+        temp_dir,
+        model_path=model_path,
+        index_path=index_path,
+        semitones=semitones,
+        index_rate=index_rate,
+        protect=protect,
+        rms_mix_rate=rms_mix_rate,
+        speaker_id=speaker_id,
+        harmony_guard_enabled=harmony_guard_enabled,
+        harmony_guard_sensitivity=harmony_guard_sensitivity,
+        harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
+        manual_bypass_ranges=manual_bypass_ranges,
+        progress=progress,
+        progress_points=adaptive_progress,
+        log_callback=log_callback,
+    )
+
+    shifted_nonlead = (
+        temp_dir
+        / "nonlead_residual_shifted.wav"
+    )
+
+    _progress(
+        progress,
+        residual_shift_percent,
+        (
+            "Backing/Harmony residual을 RVC 없이 "
+            "같은 키로 이동하는 중..."
+        ),
+    )
+
+    try:
+        transpose_audio(
+            nonlead_residual,
+            shifted_nonlead,
+            semitones=semitones,
+            preserve_formant=True,
+            quality="quality",
+        )
+    except AudioTransposeError as exc:
+        raise RVCRMVPEError(
+            "Lead RVC는 생성됐지만 Non-lead/화음 residual "
+            "Pitch Shift에 실패했습니다.\n\n"
+            f"{exc}"
+        ) from exc
+
+    combined_vocal = (
+        temp_dir
+        / "lead_selected_rvc_vocal.wav"
+    )
+
+    def mix_log(
+        text: str,
+    ) -> None:
+        _emit(
+            log_callback,
+            str(
+                text
+            ).replace(
+                "Seed-VC 보컬 레벨 보정",
+                "RVC Lead 보컬 레벨 보정",
+            ),
+        )
+
+    _mix_stems(
+        converted_lead,
+        shifted_nonlead,
+        lead_candidate,
+        combined_vocal,
+        log_callback=mix_log,
+    )
+
+    _emit(
+        log_callback,
+        (
+            "[Lead Selector] 재합성 완료: "
+            "Lead=RVC / Non-lead·Harmony=Pitch Shift only"
+        ),
+    )
+
+    return combined_vocal
+
+
 def convert_vocal_rvc(
     vocal_path: str | Path,
     output_path: str | Path,
@@ -1420,6 +1669,8 @@ def convert_vocal_rvc(
     protect: float = 0.33,
     rms_mix_rate: float = 1.0,
     speaker_id: int = 0,
+    lead_selector_enabled: bool = True,
+    lead_selector_strength: str = "balanced",
     harmony_guard_enabled: bool = True,
     harmony_guard_sensitivity: str = "medium",
     harmony_guard_crossfade_ms: int = 500,
@@ -1453,7 +1704,7 @@ def convert_vocal_rvc(
         )
 
         converted_wav = (
-            _prepare_adaptive_rvc_vocal(
+            _prepare_rvc_vocal_pipeline(
                 vocal,
                 temp_dir,
                 model_path=model_path,
@@ -1463,6 +1714,12 @@ def convert_vocal_rvc(
                 protect=protect,
                 rms_mix_rate=rms_mix_rate,
                 speaker_id=speaker_id,
+                lead_selector_enabled=bool(
+                    lead_selector_enabled
+                ),
+                lead_selector_strength=str(
+                    lead_selector_strength
+                ),
                 harmony_guard_enabled=bool(
                     harmony_guard_enabled
                 ),
@@ -1477,11 +1734,16 @@ def convert_vocal_rvc(
                     or []
                 ),
                 progress=progress,
-                progress_points=(
-                    15,
-                    68,
-                    76,
-                    86,
+                selector_progress=(
+                    10,
+                    20,
+                    84,
+                ),
+                adaptive_progress=(
+                    24,
+                    66,
+                    72,
+                    78,
                 ),
                 log_callback=log_callback,
             )
@@ -1518,6 +1780,8 @@ def convert_full_mix_rvc(
     protect: float = 0.33,
     rms_mix_rate: float = 1.0,
     speaker_id: int = 0,
+    lead_selector_enabled: bool = True,
+    lead_selector_strength: str = "balanced",
     harmony_guard_enabled: bool = True,
     harmony_guard_sensitivity: str = "medium",
     harmony_guard_crossfade_ms: int = 500,
@@ -1587,7 +1851,7 @@ def convert_full_mix_rvc(
         )
 
         converted_vocal = (
-            _prepare_adaptive_rvc_vocal(
+            _prepare_rvc_vocal_pipeline(
                 Path(
                     pair.vocals_path
                 ),
@@ -1599,6 +1863,12 @@ def convert_full_mix_rvc(
                 protect=protect,
                 rms_mix_rate=rms_mix_rate,
                 speaker_id=speaker_id,
+                lead_selector_enabled=bool(
+                    lead_selector_enabled
+                ),
+                lead_selector_strength=str(
+                    lead_selector_strength
+                ),
                 harmony_guard_enabled=bool(
                     harmony_guard_enabled
                 ),
@@ -1613,11 +1883,16 @@ def convert_full_mix_rvc(
                     or []
                 ),
                 progress=progress,
-                progress_points=(
-                    30,
+                selector_progress=(
+                    27,
+                    36,
+                    79,
+                ),
+                adaptive_progress=(
+                    40,
                     66,
                     71,
-                    78,
+                    76,
                 ),
                 log_callback=log_callback,
             )
