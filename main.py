@@ -44,6 +44,15 @@ from PySide6.QtWidgets import (
 
 from media_input import ffmpeg_status_text
 from instrument_smart_shift import DEFAULT_INSTRUMENT_MODEL
+from ai_remix import (
+    AIRemixCancelled,
+    AIRemixError,
+    STYLE_PRESETS,
+    ace_step_available,
+    ace_step_status_text,
+    generate_ai_remix,
+    style_prompt,
+)
 from pitch_analyzer import (
     AnalysisResult,
     analyze_audio,
@@ -112,8 +121,9 @@ from rvc_training_dataset_cleaner import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.0 / Instrument Smart Shift"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.1 / AI Remix"
 
+# V31_AI_REMIX_ACESTEP_PATCH
 # V30_INSTRUMENT_SMART_SHIFT_PATCH
 # V29_LEAD_MELODY_ANALYSIS_PATCH
 # V28_TRAINING_LEAD_DATASET_CLEANER_PATCH
@@ -704,6 +714,121 @@ class RVCTransposeThread(QThread):
 
 
 
+class AIRemixThread(QThread):
+    progress_changed = Signal(
+        int,
+        str,
+    )
+    log_line = Signal(str)
+    remix_done = Signal(
+        str,
+        str,
+    )
+    remix_failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        source_path: str,
+        output_path: str,
+        style_key: str,
+        custom_prompt: str,
+        lyrics: str,
+        cover_strength: float,
+        random_seed: bool,
+        seed: int,
+        vocal_language: str,
+        parent=None,
+    ):
+        super().__init__(
+            parent
+        )
+
+        self.source_path = (
+            source_path
+        )
+        self.output_path = (
+            output_path
+        )
+        self.style_key = (
+            style_key
+        )
+        self.custom_prompt = (
+            custom_prompt
+        )
+        self.lyrics = (
+            lyrics
+        )
+        self.cover_strength = float(
+            cover_strength
+        )
+        self.random_seed = bool(
+            random_seed
+        )
+        self.seed = int(
+            seed
+        )
+        self.vocal_language = (
+            vocal_language
+            or "ko"
+        )
+        self._cancelled = False
+
+    def cancel(
+        self,
+    ):
+        self._cancelled = True
+
+    def run(
+        self,
+    ):
+        try:
+            result = generate_ai_remix(
+                self.source_path,
+                self.output_path,
+                style_key=self.style_key,
+                custom_prompt=self.custom_prompt,
+                lyrics=self.lyrics,
+                cover_strength=self.cover_strength,
+                random_seed=self.random_seed,
+                seed=self.seed,
+                vocal_language=self.vocal_language,
+                progress=lambda p, text: (
+                    self.progress_changed.emit(
+                        p,
+                        text,
+                    )
+                ),
+                log_callback=lambda text: (
+                    self.log_line.emit(
+                        text
+                    )
+                ),
+                cancel_check=lambda: (
+                    self._cancelled
+                ),
+            )
+
+            self.remix_done.emit(
+                str(
+                    result.output_path
+                ),
+                result.task_id,
+            )
+
+        except AIRemixCancelled as exc:
+            self.remix_failed.emit(
+                str(
+                    exc
+                )
+            )
+
+        except Exception:
+            self.remix_failed.emit(
+                traceback.format_exc()
+            )
+
+
 class BatchVocalExtractionThread(QThread):
     progress_changed = Signal(
         int,
@@ -1060,6 +1185,9 @@ class MainWindow(QMainWindow):
         self.transpose_worker: QThread | None = None
         self.rvc_training_worker: RVCTrainingThread | None = None
         self.batch_vocal_worker: BatchVocalExtractionThread | None = None
+        self.ai_remix_worker: AIRemixThread | None = None
+        self.ai_remix_source_path = ""
+        self.ai_remix_last_output = ""
         self.batch_vocal_files: list[str] = []
         self.current_vocal_resource: SeparatedVocal | None = None
         self.seedvc_reference_path = ""
@@ -1204,6 +1332,15 @@ class MainWindow(QMainWindow):
             "rvc_training_tab"
         )
 
+        (
+            self.ai_remix_tab,
+            self.ai_remix_tab_content,
+            ai_remix_root,
+            self.ai_remix_tab_scroll,
+        ) = create_scrollable_tab(
+            "ai_remix_tab"
+        )
+
         self.main_tabs.addTab(
             self.analysis_tab,
             "분석 / 설정",
@@ -1217,9 +1354,482 @@ class MainWindow(QMainWindow):
             "키 변환 / 음원 추출",
         )
         self.main_tabs.addTab(
+            self.ai_remix_tab,
+            "AI 리믹스 / 재편곡",
+        )
+        self.main_tabs.addTab(
             self.rvc_training_tab,
             "RVC 모델 학습",
         )
+
+        # ====================================================
+        # AI Remix / Arrangement - ACE-Step 1.5
+        # ====================================================
+
+        remix_intro_group = QGroupBox(
+            "AI 리믹스 / 재편곡 - ACE-Step 1.5"
+        )
+        remix_intro_layout = QVBoxLayout(
+            remix_intro_group
+        )
+
+        remix_intro = QLabel(
+            "원곡의 기본 구조를 참고하면서 반주, 리듬, 악기 구성과 분위기를 "
+            "Blues / 7080 / R&B / Jazz / City Pop 등 다른 스타일로 새로 생성합니다. "
+            "단순 Pitch Shift가 아니라 생성형 AI Cover/Remix입니다."
+        )
+        remix_intro.setWordWrap(
+            True
+        )
+        remix_intro_layout.addWidget(
+            remix_intro
+        )
+
+        self.ai_remix_runtime_label = QLabel(
+            ace_step_status_text()
+        )
+        self.ai_remix_runtime_label.setWordWrap(
+            True
+        )
+        self.ai_remix_runtime_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        remix_intro_layout.addWidget(
+            self.ai_remix_runtime_label
+        )
+
+        ai_remix_root.addWidget(
+            remix_intro_group
+        )
+
+        remix_source_group = QGroupBox(
+            "1. 원곡"
+        )
+        remix_source_layout = QFormLayout(
+            remix_source_group
+        )
+
+        remix_source_row = QWidget()
+        remix_source_row_layout = QHBoxLayout(
+            remix_source_row
+        )
+        remix_source_row_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        self.ai_remix_source_label = QLabel(
+            "현재 선택된 음원 사용"
+        )
+        self.ai_remix_source_label.setWordWrap(
+            True
+        )
+        self.ai_remix_source_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self.ai_remix_source_button = QPushButton(
+            "리믹스 원곡 선택"
+        )
+        self.ai_remix_source_button.clicked.connect(
+            self.choose_ai_remix_source
+        )
+
+        self.ai_remix_use_current_button = QPushButton(
+            "현재 음원 사용"
+        )
+        self.ai_remix_use_current_button.clicked.connect(
+            self.use_current_audio_for_remix
+        )
+
+        remix_source_row_layout.addWidget(
+            self.ai_remix_source_label,
+            1,
+        )
+        remix_source_row_layout.addWidget(
+            self.ai_remix_source_button
+        )
+        remix_source_row_layout.addWidget(
+            self.ai_remix_use_current_button
+        )
+
+        remix_source_layout.addRow(
+            "Source",
+            remix_source_row,
+        )
+
+        ai_remix_root.addWidget(
+            remix_source_group
+        )
+
+        remix_style_group = QGroupBox(
+            "2. 재편곡 스타일"
+        )
+        remix_style_layout = QFormLayout(
+            remix_style_group
+        )
+
+        self.ai_remix_style_combo = QComboBox()
+
+        for style_key, style_info in STYLE_PRESETS.items():
+            self.ai_remix_style_combo.addItem(
+                style_info[
+                    "label"
+                ],
+                style_key,
+            )
+
+        saved_style = self.settings.value(
+            "ai_remix_style",
+            "blues",
+            type=str,
+        )
+        saved_style_index = (
+            self.ai_remix_style_combo.findData(
+                saved_style
+            )
+        )
+        self.ai_remix_style_combo.setCurrentIndex(
+            saved_style_index
+            if saved_style_index >= 0
+            else 0
+        )
+
+        self.ai_remix_prompt_edit = QPlainTextEdit()
+        self.ai_remix_prompt_edit.setPlaceholderText(
+            "선택한 프리셋에 추가할 세부 지시를 입력하세요.\n"
+            "예: slower tempo, more expressive guitar solo, warm tape saturation"
+        )
+        self.ai_remix_prompt_edit.setMinimumHeight(
+            105
+        )
+        self.ai_remix_prompt_edit.setPlainText(
+            self.settings.value(
+                "ai_remix_custom_prompt",
+                "",
+                type=str,
+            )
+        )
+
+        self.ai_remix_prompt_preview = QLabel()
+        self.ai_remix_prompt_preview.setWordWrap(
+            True
+        )
+        self.ai_remix_prompt_preview.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self.ai_remix_cover_strength_spin = QDoubleSpinBox()
+        self.ai_remix_cover_strength_spin.setRange(
+            0.05,
+            0.95,
+        )
+        self.ai_remix_cover_strength_spin.setSingleStep(
+            0.05
+        )
+        self.ai_remix_cover_strength_spin.setDecimals(
+            2
+        )
+        self.ai_remix_cover_strength_spin.setValue(
+            float(
+                self.settings.value(
+                    "ai_remix_cover_strength",
+                    0.45,
+                )
+            )
+        )
+        self.ai_remix_cover_strength_spin.setToolTip(
+            "낮을수록 장르 변화가 커지고, 높을수록 원곡 구조/성격을 더 강하게 따르는 경향이 있습니다."
+        )
+
+        self.ai_remix_style_combo.currentIndexChanged.connect(
+            self.on_ai_remix_settings_changed
+        )
+        self.ai_remix_prompt_edit.textChanged.connect(
+            self.on_ai_remix_settings_changed
+        )
+        self.ai_remix_cover_strength_spin.valueChanged.connect(
+            self.on_ai_remix_settings_changed
+        )
+
+        remix_style_layout.addRow(
+            "스타일",
+            self.ai_remix_style_combo,
+        )
+        remix_style_layout.addRow(
+            "추가 Prompt",
+            self.ai_remix_prompt_edit,
+        )
+        remix_style_layout.addRow(
+            "실제 Prompt",
+            self.ai_remix_prompt_preview,
+        )
+        remix_style_layout.addRow(
+            "원곡 유지 강도",
+            self.ai_remix_cover_strength_spin,
+        )
+
+        ai_remix_root.addWidget(
+            remix_style_group
+        )
+
+        remix_lyrics_group = QGroupBox(
+            "3. 가사 / 생성 옵션"
+        )
+        remix_lyrics_layout = QFormLayout(
+            remix_lyrics_group
+        )
+
+        self.ai_remix_lyrics_edit = QPlainTextEdit()
+        self.ai_remix_lyrics_edit.setPlaceholderText(
+            "선택 사항. 원래 가사를 정확히 유지하고 싶다면 가사를 붙여넣는 것을 권장합니다.\n"
+            "비워두면 ACE-Step이 소스 오디오와 스타일 조건을 중심으로 Cover를 생성합니다."
+        )
+        self.ai_remix_lyrics_edit.setMinimumHeight(
+            150
+        )
+
+        self.ai_remix_language_combo = QComboBox()
+        self.ai_remix_language_combo.addItem(
+            "한국어",
+            "ko",
+        )
+        self.ai_remix_language_combo.addItem(
+            "English",
+            "en",
+        )
+        self.ai_remix_language_combo.addItem(
+            "日本語",
+            "ja",
+        )
+        self.ai_remix_language_combo.addItem(
+            "中文",
+            "zh",
+        )
+
+        saved_language = self.settings.value(
+            "ai_remix_language",
+            "ko",
+            type=str,
+        )
+        language_index = (
+            self.ai_remix_language_combo.findData(
+                saved_language
+            )
+        )
+        self.ai_remix_language_combo.setCurrentIndex(
+            language_index
+            if language_index >= 0
+            else 0
+        )
+
+        self.ai_remix_random_seed_check = QCheckBox(
+            "매번 랜덤 Seed 사용"
+        )
+        self.ai_remix_random_seed_check.setChecked(
+            self.settings.value(
+                "ai_remix_random_seed",
+                True,
+                type=bool,
+            )
+        )
+
+        self.ai_remix_seed_spin = QSpinBox()
+        self.ai_remix_seed_spin.setRange(
+            0,
+            2147483647,
+        )
+        self.ai_remix_seed_spin.setValue(
+            int(
+                self.settings.value(
+                    "ai_remix_seed",
+                    12345,
+                )
+            )
+        )
+
+        self.ai_remix_random_seed_check.toggled.connect(
+            self.on_ai_remix_settings_changed
+        )
+        self.ai_remix_seed_spin.valueChanged.connect(
+            self.on_ai_remix_settings_changed
+        )
+        self.ai_remix_language_combo.currentIndexChanged.connect(
+            self.on_ai_remix_settings_changed
+        )
+
+        remix_lyrics_layout.addRow(
+            "가사",
+            self.ai_remix_lyrics_edit,
+        )
+        remix_lyrics_layout.addRow(
+            "보컬 언어",
+            self.ai_remix_language_combo,
+        )
+        remix_lyrics_layout.addRow(
+            "",
+            self.ai_remix_random_seed_check,
+        )
+        remix_lyrics_layout.addRow(
+            "고정 Seed",
+            self.ai_remix_seed_spin,
+        )
+
+        ai_remix_root.addWidget(
+            remix_lyrics_group
+        )
+
+        remix_output_group = QGroupBox(
+            "4. 출력 / 실행"
+        )
+        remix_output_layout = QVBoxLayout(
+            remix_output_group
+        )
+
+        remix_output_row = QHBoxLayout()
+
+        self.ai_remix_output_label = QLabel(
+            "출력 폴더: 현재 원곡 폴더"
+        )
+        self.ai_remix_output_label.setWordWrap(
+            True
+        )
+        self.ai_remix_output_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self.ai_remix_output_button = QPushButton(
+            "출력 폴더 선택"
+        )
+        self.ai_remix_output_button.clicked.connect(
+            self.choose_ai_remix_output_dir
+        )
+
+        remix_output_row.addWidget(
+            self.ai_remix_output_label,
+            1,
+        )
+        remix_output_row.addWidget(
+            self.ai_remix_output_button
+        )
+
+        remix_output_layout.addLayout(
+            remix_output_row
+        )
+
+        remix_action_row = QHBoxLayout()
+
+        self.ai_remix_start_button = QPushButton(
+            "ACE-Step AI Remix 생성"
+        )
+        self.ai_remix_start_button.clicked.connect(
+            self.start_ai_remix
+        )
+
+        self.ai_remix_stop_button = QPushButton(
+            "대기 중지"
+        )
+        self.ai_remix_stop_button.clicked.connect(
+            self.stop_ai_remix
+        )
+        self.ai_remix_stop_button.setEnabled(
+            False
+        )
+
+        remix_action_row.addWidget(
+            self.ai_remix_start_button,
+            1,
+        )
+        remix_action_row.addWidget(
+            self.ai_remix_stop_button
+        )
+
+        remix_output_layout.addLayout(
+            remix_action_row
+        )
+
+        self.ai_remix_progress = QProgressBar()
+        self.ai_remix_progress.setRange(
+            0,
+            100,
+        )
+        self.ai_remix_progress.setValue(
+            0
+        )
+
+        self.ai_remix_progress_label = QLabel(
+            "준비"
+        )
+        self.ai_remix_progress_label.setWordWrap(
+            True
+        )
+
+        self.ai_remix_result_label = QLabel(
+            "아직 생성된 AI Remix가 없습니다."
+        )
+        self.ai_remix_result_label.setWordWrap(
+            True
+        )
+        self.ai_remix_result_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self.ai_remix_use_result_button = QPushButton(
+            "생성 결과를 현재 음원으로 사용"
+        )
+        self.ai_remix_use_result_button.clicked.connect(
+            self.use_ai_remix_result_as_current
+        )
+        self.ai_remix_use_result_button.setEnabled(
+            False
+        )
+
+        remix_output_layout.addWidget(
+            self.ai_remix_progress
+        )
+        remix_output_layout.addWidget(
+            self.ai_remix_progress_label
+        )
+        remix_output_layout.addWidget(
+            self.ai_remix_result_label
+        )
+        remix_output_layout.addWidget(
+            self.ai_remix_use_result_button
+        )
+
+        ai_remix_root.addWidget(
+            remix_output_group
+        )
+
+        remix_log_group = QGroupBox(
+            "5. AI Remix 로그"
+        )
+        remix_log_layout = QVBoxLayout(
+            remix_log_group
+        )
+
+        self.ai_remix_log = QPlainTextEdit()
+        self.ai_remix_log.setReadOnly(
+            True
+        )
+        self.ai_remix_log.setMinimumHeight(
+            190
+        )
+
+        remix_log_layout.addWidget(
+            self.ai_remix_log
+        )
+
+        ai_remix_root.addWidget(
+            remix_log_group
+        )
+        ai_remix_root.addStretch(
+            1
+        )
+
+        self.on_ai_remix_settings_changed()
 
         batch_prep_group = QGroupBox(
             "0. 학습 데이터 준비 - 여러 곡에서 보컬 일괄 추출"
@@ -3401,6 +4011,624 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
 
+    def _current_ai_remix_source(
+        self,
+    ) -> Path | None:
+        raw = str(
+            self.ai_remix_source_path
+            or self.audio_path
+            or ""
+        ).strip()
+
+        if not raw:
+            return None
+
+        path = Path(
+            raw
+        ).expanduser()
+
+        try:
+            path = path.resolve()
+        except OSError:
+            path = path.absolute()
+
+        if not path.is_file():
+            return None
+
+        return path
+
+    def _current_ai_remix_output_dir(
+        self,
+    ) -> Path | None:
+        saved = self.settings.value(
+            "ai_remix_output_dir",
+            "",
+            type=str,
+        )
+
+        if saved:
+            candidate = Path(
+                saved
+            ).expanduser()
+
+            if candidate.is_dir():
+                return candidate
+
+        source = self._current_ai_remix_source()
+
+        if source is not None:
+            return source.parent
+
+        return None
+
+    def _ai_remix_output_path(
+        self,
+    ) -> Path:
+        source = self._current_ai_remix_source()
+
+        if source is None:
+            raise ValueError(
+                "AI Remix 원곡이 없습니다."
+            )
+
+        output_dir = (
+            self._current_ai_remix_output_dir()
+            or source.parent
+        )
+
+        style_key = str(
+            self.ai_remix_style_combo.currentData()
+            or "custom"
+        )
+
+        safe_style = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            style_key,
+        ).strip(
+            "_"
+        ) or "remix"
+
+        base_name = (
+            source.stem
+            + "_AI_Remix_"
+            + safe_style
+        )
+
+        candidate = (
+            output_dir
+            / (
+                base_name
+                + ".wav"
+            )
+        )
+
+        if not candidate.exists():
+            return candidate
+
+        for number in range(
+            2,
+            1000,
+        ):
+            candidate = (
+                output_dir
+                / (
+                    base_name
+                    + f"_{number}"
+                    + ".wav"
+                )
+            )
+
+            if not candidate.exists():
+                return candidate
+
+        raise RuntimeError(
+            "AI Remix 출력 파일명을 만들 수 없습니다."
+        )
+
+    def choose_ai_remix_source(
+        self,
+    ):
+        start_dir = (
+            str(
+                self._current_ai_remix_source().parent
+            )
+            if self._current_ai_remix_source()
+            is not None
+            else self._last_open_directory()
+        )
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "AI Remix 원곡 선택",
+            start_dir,
+            (
+                "Supported media "
+                "(*.mp3 *.wav *.flac *.ogg *.m4a *.mp4 *.aac *.webm "
+                "*.mkv *.mov *.wma *.opus *.m4v);;"
+                "All files (*.*)"
+            ),
+        )
+
+        if not path:
+            return
+
+        selected = Path(
+            path
+        ).resolve()
+
+        self.ai_remix_source_path = str(
+            selected
+        )
+        self.ai_remix_source_label.setText(
+            str(
+                selected
+            )
+        )
+        self.settings.setValue(
+            "last_open_dir",
+            str(
+                selected.parent
+            ),
+        )
+        self.on_ai_remix_settings_changed()
+
+    def use_current_audio_for_remix(
+        self,
+    ):
+        if not self.audio_path:
+            QMessageBox.information(
+                self,
+                "AI Remix",
+                "먼저 분석/키 변환용 원곡을 선택하세요.",
+            )
+            return
+
+        path = Path(
+            self.audio_path
+        )
+
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "AI Remix",
+                "현재 음원 파일을 찾을 수 없습니다.",
+            )
+            return
+
+        self.ai_remix_source_path = str(
+            path.resolve()
+        )
+        self.ai_remix_source_label.setText(
+            self.ai_remix_source_path
+        )
+        self.on_ai_remix_settings_changed()
+
+    def choose_ai_remix_output_dir(
+        self,
+    ):
+        current = (
+            self._current_ai_remix_output_dir()
+            or Path(
+                self._last_open_directory()
+            )
+        )
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "AI Remix 출력 폴더 선택",
+            str(
+                current
+            ),
+        )
+
+        if not folder:
+            return
+
+        path = Path(
+            folder
+        ).resolve()
+
+        self.settings.setValue(
+            "ai_remix_output_dir",
+            str(
+                path
+            ),
+        )
+
+        self.ai_remix_output_label.setText(
+            "출력 폴더: "
+            + str(
+                path
+            )
+        )
+
+    def on_ai_remix_settings_changed(
+        self,
+        *_args,
+    ):
+        if not hasattr(
+            self,
+            "ai_remix_style_combo",
+        ):
+            return
+
+        style_key = str(
+            self.ai_remix_style_combo.currentData()
+            or "custom"
+        )
+        custom_prompt = (
+            self.ai_remix_prompt_edit.toPlainText().strip()
+        )
+
+        prompt = style_prompt(
+            style_key,
+            custom_prompt,
+        )
+
+        self.ai_remix_prompt_preview.setText(
+            prompt
+            or "사용자 지정 Prompt를 입력하세요."
+        )
+
+        self.ai_remix_seed_spin.setEnabled(
+            not self.ai_remix_random_seed_check.isChecked()
+        )
+
+        self.settings.setValue(
+            "ai_remix_style",
+            style_key,
+        )
+        self.settings.setValue(
+            "ai_remix_custom_prompt",
+            custom_prompt,
+        )
+        self.settings.setValue(
+            "ai_remix_cover_strength",
+            self.ai_remix_cover_strength_spin.value(),
+        )
+        self.settings.setValue(
+            "ai_remix_random_seed",
+            self.ai_remix_random_seed_check.isChecked(),
+        )
+        self.settings.setValue(
+            "ai_remix_seed",
+            self.ai_remix_seed_spin.value(),
+        )
+        self.settings.setValue(
+            "ai_remix_language",
+            self.ai_remix_language_combo.currentData()
+            or "ko",
+        )
+
+        source = self._current_ai_remix_source()
+
+        if source is not None:
+            self.ai_remix_source_label.setText(
+                str(
+                    source
+                )
+            )
+
+        output_dir = self._current_ai_remix_output_dir()
+
+        if output_dir is not None:
+            self.ai_remix_output_label.setText(
+                "출력 폴더: "
+                + str(
+                    output_dir
+                )
+            )
+
+        self.ai_remix_runtime_label.setText(
+            ace_step_status_text()
+        )
+
+        ready = bool(
+            source is not None
+            and prompt
+            and (
+                self.ai_remix_worker is None
+                or not self.ai_remix_worker.isRunning()
+            )
+        )
+
+        self.ai_remix_start_button.setEnabled(
+            ready
+        )
+
+    def start_ai_remix(
+        self,
+    ):
+        if (
+            self.ai_remix_worker is not None
+            and self.ai_remix_worker.isRunning()
+        ):
+            return
+
+        source = self._current_ai_remix_source()
+
+        if source is None:
+            QMessageBox.information(
+                self,
+                "AI Remix",
+                "먼저 AI Remix 원곡을 선택하세요.",
+            )
+            return
+
+        style_key = str(
+            self.ai_remix_style_combo.currentData()
+            or "custom"
+        )
+        custom_prompt = (
+            self.ai_remix_prompt_edit.toPlainText().strip()
+        )
+        prompt = style_prompt(
+            style_key,
+            custom_prompt,
+        )
+
+        if not prompt:
+            QMessageBox.information(
+                self,
+                "AI Remix",
+                "사용자 지정 스타일 Prompt를 입력하세요.",
+            )
+            return
+
+        if not ace_step_available():
+            answer = QMessageBox.question(
+                self,
+                "ACE-Step 1.5 미설치",
+                (
+                    ace_step_status_text()
+                    + "\\n\\n"
+                    "패치에 포함된 SETUP_AI_REMIX_ACESTEP.bat을 먼저 실행해야 합니다.\\n"
+                    "설치 후 다시 시도할까요?"
+                ),
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+            return
+
+        output_path = self._ai_remix_output_path()
+
+        style_label = (
+            self.ai_remix_style_combo.currentText()
+        )
+        cover_strength = (
+            self.ai_remix_cover_strength_spin.value()
+        )
+
+        answer = QMessageBox.question(
+            self,
+            "ACE-Step AI Remix 생성",
+            (
+                f"원곡:\\n{source}\\n\\n"
+                f"스타일: {style_label}\\n"
+                f"원곡 유지 강도: {cover_strength:.2f}\\n\\n"
+                "ACE-Step은 반주/리듬/악기 구성뿐 아니라 보컬 표현도 "
+                "재생성할 수 있습니다.\\n"
+                "첫 실행이면 모델 다운로드로 시간이 더 오래 걸릴 수 있습니다.\\n\\n"
+                f"출력:\\n{output_path}\\n\\n"
+                "진행할까요?"
+            ),
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.ai_remix_log.clear()
+        self.ai_remix_log.appendPlainText(
+            "AI Remix 시작"
+        )
+        self.ai_remix_progress.setValue(
+            0
+        )
+        self.ai_remix_progress_label.setText(
+            "준비 중..."
+        )
+        self.ai_remix_start_button.setEnabled(
+            False
+        )
+        self.ai_remix_stop_button.setEnabled(
+            True
+        )
+        self.ai_remix_use_result_button.setEnabled(
+            False
+        )
+
+        self.ai_remix_worker = AIRemixThread(
+            source_path=str(
+                source
+            ),
+            output_path=str(
+                output_path
+            ),
+            style_key=style_key,
+            custom_prompt=custom_prompt,
+            lyrics=self.ai_remix_lyrics_edit.toPlainText(),
+            cover_strength=cover_strength,
+            random_seed=self.ai_remix_random_seed_check.isChecked(),
+            seed=self.ai_remix_seed_spin.value(),
+            vocal_language=(
+                self.ai_remix_language_combo.currentData()
+                or "ko"
+            ),
+            parent=self,
+        )
+
+        self.ai_remix_worker.progress_changed.connect(
+            self.on_ai_remix_progress
+        )
+        self.ai_remix_worker.log_line.connect(
+            self.on_ai_remix_log
+        )
+        self.ai_remix_worker.remix_done.connect(
+            self.on_ai_remix_done
+        )
+        self.ai_remix_worker.remix_failed.connect(
+            self.on_ai_remix_failed
+        )
+
+        self.ai_remix_worker.start()
+
+    def stop_ai_remix(
+        self,
+    ):
+        if (
+            self.ai_remix_worker is None
+            or not self.ai_remix_worker.isRunning()
+        ):
+            return
+
+        self.ai_remix_worker.cancel()
+        self.ai_remix_stop_button.setEnabled(
+            False
+        )
+        self.ai_remix_progress_label.setText(
+            "중지 요청됨 - 현재 API 호출이 끝나면 대기를 중지합니다."
+        )
+
+    def on_ai_remix_progress(
+        self,
+        percent: int,
+        text: str,
+    ):
+        self.ai_remix_progress.setValue(
+            int(
+                percent
+            )
+        )
+        self.ai_remix_progress_label.setText(
+            str(
+                text
+            )
+        )
+
+    def on_ai_remix_log(
+        self,
+        text: str,
+    ):
+        self.ai_remix_log.appendPlainText(
+            str(
+                text
+            )
+        )
+
+        scrollbar = (
+            self.ai_remix_log.verticalScrollBar()
+        )
+        scrollbar.setValue(
+            scrollbar.maximum()
+        )
+
+    def on_ai_remix_done(
+        self,
+        output_path: str,
+        task_id: str,
+    ):
+        self.ai_remix_last_output = str(
+            output_path
+        )
+        self.ai_remix_progress.setValue(
+            100
+        )
+        self.ai_remix_progress_label.setText(
+            "AI Remix 완료"
+        )
+        self.ai_remix_result_label.setText(
+            (
+                f"완료: {output_path}\\n"
+                f"ACE-Step Task: {task_id}"
+            )
+        )
+        self.ai_remix_use_result_button.setEnabled(
+            True
+        )
+        self.ai_remix_stop_button.setEnabled(
+            False
+        )
+        self.ai_remix_worker = None
+        self.on_ai_remix_settings_changed()
+
+        self.statusBar().showMessage(
+            "ACE-Step AI Remix 생성 완료",
+            15000,
+        )
+
+    def on_ai_remix_failed(
+        self,
+        error_text: str,
+    ):
+        clean = str(
+            error_text
+        ).strip()
+
+        self.ai_remix_log.appendPlainText(
+            clean
+        )
+        self.ai_remix_progress_label.setText(
+            "AI Remix 실패/중지"
+        )
+        self.ai_remix_stop_button.setEnabled(
+            False
+        )
+        self.ai_remix_worker = None
+        self.on_ai_remix_settings_changed()
+
+        # Cancellation is not a program error.
+        if (
+            "중지" in clean
+            and "Traceback" not in clean
+        ):
+            self.statusBar().showMessage(
+                clean,
+                12000,
+            )
+            return
+
+        QMessageBox.critical(
+            self,
+            "AI Remix 오류",
+            clean[
+                -7000:
+            ],
+        )
+
+    def use_ai_remix_result_as_current(
+        self,
+    ):
+        if not self.ai_remix_last_output:
+            return
+
+        path = Path(
+            self.ai_remix_last_output
+        )
+
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "AI Remix",
+                "생성 결과 파일을 찾을 수 없습니다.",
+            )
+            return
+
+        if self._set_audio_path(
+            path,
+            source="dialog",
+        ):
+            self.statusBar().showMessage(
+                (
+                    "AI Remix 결과를 현재 음원으로 지정했습니다. "
+                    "이제 키 변환 탭에서 RVC를 0 semitone으로 적용하면 "
+                    "생성 보컬 음색만 기존 RVC 모델로 변환할 수 있습니다."
+                ),
+                18000,
+            )
+
     def _build_menu(self):
         file_menu = self.menuBar().addMenu(
             "파일"
@@ -3522,6 +4750,20 @@ class MainWindow(QMainWindow):
         self.audio_path = str(p)
         self.result = None
         self.pipeline_result = None
+
+        if hasattr(
+            self,
+            "ai_remix_source_label",
+        ):
+            self.ai_remix_source_path = str(
+                p
+            )
+            self.ai_remix_source_label.setText(
+                str(
+                    p
+                )
+            )
+            self.on_ai_remix_settings_changed()
 
         self.path_label.setText(
             self.audio_path
