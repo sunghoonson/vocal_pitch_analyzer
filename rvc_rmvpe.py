@@ -6,6 +6,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 import json
 import os
+import re
 import subprocess
 import tempfile
 import traceback
@@ -25,6 +26,7 @@ from vocal_separator import DEFAULT_MODEL
 from rvc_harmony_guard import blend_adaptive_vocals
 
 # V25_RVC_ARTIFACT_GUARD_PATCH
+# V26_ARTIFACT_PRIORITY_MANUAL_BYPASS_PATCH
 # V25_ADAPTIVE_GUARD_DIAGNOSTICS_HOTFIX
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
 
@@ -253,6 +255,7 @@ def _guard_start_state(
     harmony_guard_enabled: bool,
     harmony_guard_sensitivity: str,
     harmony_guard_crossfade_ms: int,
+    manual_bypass_ranges: list[tuple[float, float]] | None = None,
 ) -> dict:
     state = {
         "guard_version": "2.5",
@@ -288,6 +291,20 @@ def _guard_start_state(
         ),
         "crossfade_ms": int(
             harmony_guard_crossfade_ms
+        ),
+        "manual_bypass_ranges": [
+            [
+                float(start),
+                float(end),
+            ]
+            for start, end in (
+                manual_bypass_ranges
+                or []
+            )
+        ],
+        "manual_region_count": len(
+            manual_bypass_ranges
+            or []
         ),
         "pitch_only": None,
         "adaptive_output": None,
@@ -410,6 +427,123 @@ def _guard_report_dict(
         }
 
     return payload
+
+
+
+def _parse_time_token(
+    token: str,
+) -> float:
+    value = str(token).strip()
+    if not value:
+        raise ValueError("빈 시간 값입니다.")
+
+    parts = value.split(":")
+
+    try:
+        if len(parts) == 1:
+            seconds = float(parts[0])
+        elif len(parts) == 2:
+            seconds = (
+                float(parts[0])
+                * 60.0
+                + float(parts[1])
+            )
+        elif len(parts) == 3:
+            seconds = (
+                float(parts[0])
+                * 3600.0
+                + float(parts[1])
+                * 60.0
+                + float(parts[2])
+            )
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(
+            f"시간 형식을 읽을 수 없습니다: {value}"
+        ) from exc
+
+    if seconds < 0.0:
+        raise ValueError(
+            f"시간은 0 이상이어야 합니다: {value}"
+        )
+
+    return float(seconds)
+
+
+def parse_manual_bypass_ranges(
+    text: str,
+) -> list[tuple[float, float]]:
+    source = str(text or "").strip()
+
+    if not source:
+        return []
+
+    chunks = [
+        chunk.strip()
+        for chunk in re.split(
+            r"[\n,;]+",
+            source,
+        )
+        if chunk.strip()
+    ]
+
+    result: list[tuple[float, float]] = []
+
+    for chunk in chunks:
+        match = re.match(
+            r"^\s*(.+?)\s*(?:-|~|–|—|→)\s*(.+?)\s*$",
+            chunk,
+        )
+        if not match:
+            raise ValueError(
+                "수동 우회 구간 형식 오류: "
+                f"'{chunk}'\n"
+                "예: 00:42.300 - 00:44.100"
+            )
+
+        start = _parse_time_token(
+            match.group(1)
+        )
+        end = _parse_time_token(
+            match.group(2)
+        )
+
+        if end <= start:
+            raise ValueError(
+                "수동 우회 종료 시간은 시작 시간보다 커야 합니다: "
+                f"'{chunk}'"
+            )
+
+        result.append((start, end))
+
+    result.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+        )
+    )
+
+    merged: list[tuple[float, float]] = []
+
+    for start, end in result:
+        if (
+            merged
+            and start
+            <= merged[-1][1]
+            + 0.001
+        ):
+            merged[-1] = (
+                merged[-1][0],
+                max(
+                    merged[-1][1],
+                    end,
+                ),
+            )
+        else:
+            merged.append((start, end))
+
+    return merged
 
 
 def rvc_available() -> bool:
@@ -814,6 +948,7 @@ def _prepare_adaptive_rvc_vocal(
     harmony_guard_enabled: bool,
     harmony_guard_sensitivity: str,
     harmony_guard_crossfade_ms: int,
+    manual_bypass_ranges: list[tuple[float, float]] | None,
     progress: ProgressCallback | None,
     progress_points: tuple[int, int, int, int],
     log_callback: LogCallback | None,
@@ -843,6 +978,7 @@ def _prepare_adaptive_rvc_vocal(
         harmony_guard_enabled=harmony_guard_enabled,
         harmony_guard_sensitivity=harmony_guard_sensitivity,
         harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
+        manual_bypass_ranges=manual_bypass_ranges,
     )
 
     _guard_emit(
@@ -939,9 +1075,18 @@ def _prepare_adaptive_rvc_vocal(
         "RVC 보컬 생성 완료.",
     )
 
-    if not harmony_guard_enabled:
+    manual_ranges = list(
+        manual_bypass_ranges
+        or []
+    )
+
+    if (
+        not harmony_guard_enabled
+        and not manual_ranges
+    ):
         message = (
-            "[Adaptive Guard] 비활성화 - 기존 RVC 출력 그대로 사용"
+            "[Adaptive Guard] 자동 Guard OFF / 수동 우회 없음 - "
+            "기존 RVC 출력 그대로 사용"
         )
         _guard_emit(
             log_callback,
@@ -955,6 +1100,19 @@ def _prepare_adaptive_rvc_vocal(
             fallback_to_raw_rvc=True,
         )
         return raw_rvc
+
+    if (
+        not harmony_guard_enabled
+        and manual_ranges
+    ):
+        _guard_emit(
+            log_callback,
+            (
+                "[Manual Bypass] 자동 Guard는 OFF지만 "
+                f"수동 우회 {len(manual_ranges)}개 구간이 있어 "
+                "Pitch-only 경로를 생성합니다."
+            ),
+        )
 
     _guard_update_state(
         guard_state,
@@ -1044,7 +1202,7 @@ def _prepare_adaptive_rvc_vocal(
             fallback_percent,
             99,
         ),
-        "Harmony Guard: 안전 우회용 Pitch-only 보컬 생성 중...",
+        "Adaptive Guard: Pitch-only 우회 보컬 생성 중...",
     )
 
     try:
@@ -1154,6 +1312,10 @@ def _prepare_adaptive_rvc_vocal(
             adaptive,
             sensitivity=harmony_guard_sensitivity,
             crossfade_ms=harmony_guard_crossfade_ms,
+            auto_guard_enabled=bool(
+                harmony_guard_enabled
+            ),
+            manual_bypass_ranges=manual_ranges,
             log_callback=guard_callback,
         )
     except Exception as exc:
@@ -1195,7 +1357,7 @@ def _prepare_adaptive_rvc_vocal(
     )
 
     message = (
-        "[Adaptive Guard v2.5] 적용 완료: "
+        "[Adaptive Guard v2.6] 적용 완료: "
         f"총 위험 구간 {report.risky_region_count}개, "
         f"Artifact 구간 {report.artifact_region_count}개, "
         f"Pitch-only 우회 {report.fallback_seconds:.1f}s, "
@@ -1261,6 +1423,7 @@ def convert_vocal_rvc(
     harmony_guard_enabled: bool = True,
     harmony_guard_sensitivity: str = "medium",
     harmony_guard_crossfade_ms: int = 500,
+    manual_bypass_ranges: list[tuple[float, float]] | None = None,
     progress: ProgressCallback | None = None,
     log_callback: LogCallback | None = None,
 ) -> Path:
@@ -1309,6 +1472,10 @@ def convert_vocal_rvc(
                 harmony_guard_crossfade_ms=int(
                     harmony_guard_crossfade_ms
                 ),
+                manual_bypass_ranges=list(
+                    manual_bypass_ranges
+                    or []
+                ),
                 progress=progress,
                 progress_points=(
                     15,
@@ -1354,6 +1521,7 @@ def convert_full_mix_rvc(
     harmony_guard_enabled: bool = True,
     harmony_guard_sensitivity: str = "medium",
     harmony_guard_crossfade_ms: int = 500,
+    manual_bypass_ranges: list[tuple[float, float]] | None = None,
     separator_model: str = DEFAULT_MODEL,
     separator_cache: bool = True,
     separator_autocast: bool = True,
@@ -1439,6 +1607,10 @@ def convert_full_mix_rvc(
                 ),
                 harmony_guard_crossfade_ms=int(
                     harmony_guard_crossfade_ms
+                ),
+                manual_bypass_ranges=list(
+                    manual_bypass_ranges
+                    or []
                 ),
                 progress=progress,
                 progress_points=(

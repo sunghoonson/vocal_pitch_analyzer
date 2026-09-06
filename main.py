@@ -77,6 +77,7 @@ from rvc_rmvpe import (
     RVCRMVPEError,
     convert_full_mix_rvc,
     convert_vocal_rvc,
+    parse_manual_bypass_ranges,
     rvc_available,
     rvc_status_text,
 )
@@ -100,8 +101,9 @@ from batch_vocal_extractor import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.5 / RVC Artifact Guard"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.6 / Artifact Priority + Manual Bypass"
 
+# V26_ARTIFACT_PRIORITY_MANUAL_BYPASS_PATCH
 # V25_RVC_ARTIFACT_GUARD_PATCH
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
 # V24_SCROLLABLE_TABS_HOTFIX
@@ -475,6 +477,7 @@ class RVCTransposeThread(QThread):
         harmony_guard_enabled: bool,
         harmony_guard_sensitivity: str,
         harmony_guard_crossfade_ms: int,
+        manual_bypass_ranges: list[tuple[float, float]],
         separator_model: str,
         separator_cache: bool,
         separator_autocast: bool,
@@ -501,6 +504,10 @@ class RVCTransposeThread(QThread):
         self.harmony_guard_crossfade_ms = (
             harmony_guard_crossfade_ms
         )
+        self.manual_bypass_ranges = list(
+            manual_bypass_ranges
+            or []
+        )
         self.separator_model = (
             separator_model
         )
@@ -524,6 +531,7 @@ class RVCTransposeThread(QThread):
                 harmony_guard_enabled=self.harmony_guard_enabled,
                 harmony_guard_sensitivity=self.harmony_guard_sensitivity,
                 harmony_guard_crossfade_ms=self.harmony_guard_crossfade_ms,
+                manual_bypass_ranges=self.manual_bypass_ranges,
                 progress=lambda p, t: (
                     self.progress_changed.emit(
                         p,
@@ -1978,6 +1986,39 @@ class MainWindow(QMainWindow):
             )
         )
 
+        self.rvc_manual_bypass_check = QCheckBox(
+            "수동 우회 구간 사용 (Auto Guard OFF에서도 동작)"
+        )
+        self.rvc_manual_bypass_check.setChecked(
+            self.settings.value(
+                "rvc_manual_bypass_enabled",
+                False,
+                type=bool,
+            )
+        )
+        self.rvc_manual_bypass_check.setToolTip(
+            "지정한 시간 구간만 RVC 대신 같은 키의 Pitch-only 보컬로 강하게 우회합니다. "
+            "자동 Guard 체크를 꺼도 수동 우회는 독립적으로 동작합니다."
+        )
+
+        self.rvc_manual_bypass_edit = QPlainTextEdit()
+        self.rvc_manual_bypass_edit.setPlaceholderText(
+            "한 줄에 한 구간\n"
+            "예: 00:42.300 - 00:44.100\n"
+            "    01:23.500 - 01:26.200\n"
+            "초 단위도 가능: 92.5 - 95.0"
+        )
+        self.rvc_manual_bypass_edit.setMaximumHeight(
+            110
+        )
+        self.rvc_manual_bypass_edit.setPlainText(
+            self.settings.value(
+                "rvc_manual_bypass_text",
+                "",
+                type=str,
+            )
+        )
+
         harmony_guard_enabled = (
             self.rvc_harmony_guard_check.isChecked()
         )
@@ -1986,6 +2027,9 @@ class MainWindow(QMainWindow):
         )
         self.rvc_harmony_crossfade_spin.setEnabled(
             harmony_guard_enabled
+        )
+        self.rvc_manual_bypass_edit.setEnabled(
+            self.rvc_manual_bypass_check.isChecked()
         )
 
         self.rvc_harmony_guard_check.toggled.connect(
@@ -1997,12 +2041,18 @@ class MainWindow(QMainWindow):
         self.rvc_harmony_crossfade_spin.valueChanged.connect(
             self.on_rvc_harmony_guard_settings_changed
         )
+        self.rvc_manual_bypass_check.toggled.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+        self.rvc_manual_bypass_edit.textChanged.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
 
         self.rvc_help_label = QLabel(
-            "목표 음색으로 학습된 RVC .pth 모델을 사용합니다. "
-            "Adaptive Guard v2.5는 1차 입력 Harmony 분석 후, 같은 키의 Pitch-only 결과와 "
-            "RVC 결과를 직접 비교해 F0 불일치/잘못된 음정 점프/유성음 소실을 2차 검출합니다.\n"
-            "실제 이상이 확인된 구간은 Pitch-only 비율을 높여 삑사리/뭉개짐을 줄입니다."
+            "v2.6은 목표 가수 음색을 보존하도록 Artifact 우선 방식으로 동작합니다. "
+            "1차 Harmony 분석은 보조 힌트만 주며 단독으로는 최대 12~32%까지만 우회합니다. "
+            "실제 RVC 출력에서 Artifact가 확인된 구간만 최대 98%까지 강하게 우회합니다.\n"
+            "수동 우회는 Auto Guard와 독립적이며, 지정한 시간만 Pitch-only로 강제 우회할 수 있습니다."
         )
         self.rvc_help_label.setWordWrap(
             True
@@ -2047,6 +2097,14 @@ class MainWindow(QMainWindow):
         rvc_layout.addRow(
             "Crossfade",
             self.rvc_harmony_crossfade_spin,
+        )
+        rvc_layout.addRow(
+            "",
+            self.rvc_manual_bypass_check,
+        )
+        rvc_layout.addRow(
+            "수동 우회 시간",
+            self.rvc_manual_bypass_edit,
         )
         rvc_layout.addRow(
             "",
@@ -4755,6 +4813,13 @@ class MainWindow(QMainWindow):
             enabled
         )
 
+        manual_enabled = (
+            self.rvc_manual_bypass_check.isChecked()
+        )
+        self.rvc_manual_bypass_edit.setEnabled(
+            manual_enabled
+        )
+
         self.settings.setValue(
             "rvc_harmony_guard_enabled",
             enabled,
@@ -4767,6 +4832,14 @@ class MainWindow(QMainWindow):
         self.settings.setValue(
             "rvc_harmony_guard_crossfade_ms",
             self.rvc_harmony_crossfade_spin.value(),
+        )
+        self.settings.setValue(
+            "rvc_manual_bypass_enabled",
+            manual_enabled,
+        )
+        self.settings.setValue(
+            "rvc_manual_bypass_text",
+            self.rvc_manual_bypass_edit.toPlainText(),
         )
 
         self.update_transpose_preview()
@@ -5139,7 +5212,6 @@ class MainWindow(QMainWindow):
             "transpose_preview_label",
         ):
             return
-
         engine = (
             self._current_transpose_engine()
         )
@@ -5338,13 +5410,40 @@ class MainWindow(QMainWindow):
                     "보통",
                 )
                 preview += (
-                    "\nHarmony Guard: ON / "
+                    "\nAdaptive Guard v2.6: ON / Artifact 우선 / "
                     f"민감도 {sensitivity_label} / "
                     f"Crossfade {self.rvc_harmony_crossfade_spin.value()} ms"
                 )
             else:
                 preview += (
-                    "\nHarmony Guard: OFF"
+                    "\nAdaptive Guard v2.6: OFF"
+                )
+
+            if self.rvc_manual_bypass_check.isChecked():
+                try:
+                    manual_ranges = parse_manual_bypass_ranges(
+                        self.rvc_manual_bypass_edit.toPlainText()
+                    )
+                    manual_seconds = sum(
+                        end - start
+                        for start, end in manual_ranges
+                    )
+                    preview += (
+                        "\n수동 우회: ON / "
+                        f"{len(manual_ranges)}개 구간 / "
+                        f"총 {manual_seconds:.1f}초"
+                    )
+                except ValueError as exc:
+                    preview += (
+                        "\n수동 우회: 형식 오류 - "
+                        + str(exc).split(
+                            "\n",
+                            1,
+                        )[0]
+                    )
+            else:
+                preview += (
+                    "\n수동 우회: OFF"
                 )
 
         else:
@@ -5436,6 +5535,45 @@ class MainWindow(QMainWindow):
         semitones = (
             self.key_semitone_spin.value()
         )
+
+        engine = (
+            self._current_transpose_engine()
+        )
+        manual_bypass_ranges: list[
+            tuple[
+                float,
+                float,
+            ]
+        ] = []
+
+        if (
+            engine == "rvc"
+            and self.rvc_manual_bypass_check.isChecked()
+        ):
+            try:
+                manual_bypass_ranges = (
+                    parse_manual_bypass_ranges(
+                        self.rvc_manual_bypass_edit.toPlainText()
+                    )
+                )
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self,
+                    "수동 우회 구간 형식 오류",
+                    str(exc),
+                )
+                return
+
+            if (
+                not manual_bypass_ranges
+                and not self.rvc_harmony_guard_check.isChecked()
+            ):
+                QMessageBox.information(
+                    self,
+                    "RVC 우회 설정",
+                    "자동 Guard가 꺼져 있고 수동 우회 구간도 비어 있습니다. "
+                    "따라서 일반 RVC 변환으로 실행됩니다.",
+                )
 
         if semitones == 0:
             answer = QMessageBox.question(
@@ -5610,6 +5748,9 @@ class MainWindow(QMainWindow):
                 ),
                 harmony_guard_crossfade_ms=(
                     self.rvc_harmony_crossfade_spin.value()
+                ),
+                manual_bypass_ranges=(
+                    manual_bypass_ranges
                 ),
                 separator_model=(
                     self.separator_model_combo.currentData()

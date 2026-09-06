@@ -13,8 +13,9 @@ import soundfile as sf
 
 LogCallback = Callable[[str], None]
 
+# V26_ARTIFACT_PRIORITY_MANUAL_BYPASS_PATCH
 # V25_RVC_ARTIFACT_GUARD_PATCH
-GUARD_VERSION = "2.5"
+GUARD_VERSION = "2.6"
 
 SENSITIVITY_LABELS = {
     "low": "낮음",
@@ -48,6 +49,11 @@ class HarmonyGuardReport:
     artifact_voicing_mismatch_seconds: float = 0.0
     mean_artifact_risk: float = 0.0
     max_artifact_risk: float = 0.0
+    artifact_priority_mode: bool = True
+    harmony_hint_cap: float = 0.0
+    manual_bypass_seconds: float = 0.0
+    manual_region_count: int = 0
+    manual_regions: list[tuple[float, float]] | None = None
 
 
 def _emit(
@@ -1953,13 +1959,22 @@ def _resample_channels(
 
     transposed = data.T
 
-    resampled = librosa.resample(
-        transposed,
-        orig_sr=original_sr,
-        target_sr=target_sr,
-        axis=-1,
-        res_type="kaiser_best",
-    )
+    try:
+        resampled = librosa.resample(
+            transposed,
+            orig_sr=original_sr,
+            target_sr=target_sr,
+            axis=-1,
+            res_type="soxr_hq",
+        )
+    except Exception:
+        resampled = librosa.resample(
+            transposed,
+            orig_sr=original_sr,
+            target_sr=target_sr,
+            axis=-1,
+            res_type="polyphase",
+        )
 
     return np.asarray(
         resampled.T,
@@ -2227,6 +2242,147 @@ def _align_fallback_by_envelope(
     )
 
 
+
+def _artifact_priority_combine(
+    input_fallback: np.ndarray,
+    artifact_fallback: np.ndarray,
+    sensitivity: str,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    sensitivity = (
+        sensitivity
+        if sensitivity in SENSITIVITY_LABELS
+        else "medium"
+    )
+
+    harmony_caps = {
+        "low": 0.12,
+        "medium": 0.22,
+        "high": 0.32,
+    }
+    harmony_cap = float(harmony_caps[sensitivity])
+
+    input_fallback = np.clip(
+        np.asarray(input_fallback, dtype=np.float32),
+        0.0,
+        0.98,
+    )
+    artifact_fallback = np.clip(
+        np.asarray(artifact_fallback, dtype=np.float32),
+        0.0,
+        0.98,
+    )
+
+    harmony_hint = np.clip(
+        input_fallback / 0.92 * harmony_cap,
+        0.0,
+        harmony_cap,
+    ).astype(np.float32, copy=False)
+
+    input_norm = np.clip(
+        input_fallback / 0.92,
+        0.0,
+        1.0,
+    )
+    artifact_norm = np.clip(
+        artifact_fallback / 0.98,
+        0.0,
+        1.0,
+    )
+    agreement_boost = (
+        0.14
+        * input_norm
+        * artifact_norm
+    ).astype(np.float32, copy=False)
+
+    artifact_confirmed = np.clip(
+        artifact_fallback
+        + agreement_boost,
+        0.0,
+        0.98,
+    ).astype(np.float32, copy=False)
+
+    combined = np.maximum(
+        harmony_hint,
+        artifact_confirmed,
+    ).astype(np.float32, copy=False)
+
+    return combined, harmony_hint, harmony_cap
+
+
+def _manual_bypass_mask(
+    frame_times: np.ndarray,
+    ranges: list[tuple[float, float]] | None,
+    *,
+    crossfade_ms: int,
+) -> np.ndarray:
+    times = np.asarray(frame_times, dtype=np.float32)
+    mask = np.zeros(times.size, dtype=np.float32)
+
+    if times.size <= 0 or not ranges:
+        return mask
+
+    fade_seconds = max(
+        0.02,
+        min(
+            2.0,
+            float(crossfade_ms) / 1000.0,
+        ),
+    )
+
+    for raw_start, raw_end in ranges:
+        start = max(0.0, float(raw_start))
+        end = max(start, float(raw_end))
+
+        if end <= start:
+            continue
+
+        inside = (
+            (times >= start)
+            & (times <= end)
+        )
+        mask[inside] = 0.98
+
+        pre = (
+            (times >= start - fade_seconds)
+            & (times < start)
+        )
+        if np.any(pre):
+            x = (
+                times[pre]
+                - (start - fade_seconds)
+            ) / fade_seconds
+            mask[pre] = np.maximum(
+                mask[pre],
+                (
+                    _smoothstep(x)
+                    * 0.98
+                ).astype(np.float32, copy=False),
+            )
+
+        post = (
+            (times > end)
+            & (times <= end + fade_seconds)
+        )
+        if np.any(post):
+            x = 1.0 - (
+                times[post]
+                - end
+            ) / fade_seconds
+            mask[post] = np.maximum(
+                mask[post],
+                (
+                    _smoothstep(x)
+                    * 0.98
+                ).astype(np.float32, copy=False),
+            )
+
+    return np.clip(
+        mask,
+        0.0,
+        0.98,
+    ).astype(np.float32, copy=False)
+
+
 def blend_adaptive_vocals(
     original_vocal: str | Path,
     rvc_vocal: str | Path,
@@ -2235,44 +2391,31 @@ def blend_adaptive_vocals(
     *,
     sensitivity: str = "medium",
     crossfade_ms: int = 500,
+    auto_guard_enabled: bool = True,
+    manual_bypass_ranges: list[tuple[float, float]] | None = None,
     log_callback: LogCallback | None = None,
 ) -> HarmonyGuardReport:
-    original = Path(
-        original_vocal
-    ).resolve()
-    rvc_path = Path(
-        rvc_vocal
-    ).resolve()
-    pitch_path = Path(
-        pitch_only_vocal
-    ).resolve()
-    output = Path(
-        output_wav
-    ).resolve()
+    original = Path(original_vocal).resolve()
+    rvc_path = Path(rvc_vocal).resolve()
+    pitch_path = Path(pitch_only_vocal).resolve()
+    output = Path(output_wav).resolve()
 
-    # Pass 1: input-side harmony/polyphony/F0 stability.
-    (
-        frame_times,
-        input_fallback_ratio,
-        report,
-    ) = analyze_harmony_risk(
-        original,
-        sensitivity=sensitivity,
-        crossfade_ms=crossfade_ms,
-        log_callback=log_callback,
-    )
+    manual_ranges = [
+        (
+            max(0.0, float(start)),
+            max(0.0, float(end)),
+        )
+        for start, end in (manual_bypass_ranges or [])
+        if float(end) > float(start)
+    ]
 
     rvc_data, rvc_sr = sf.read(
-        str(
-            rvc_path
-        ),
+        str(rvc_path),
         dtype="float32",
         always_2d=True,
     )
     fallback_data, fallback_sr = sf.read(
-        str(
-            pitch_path
-        ),
+        str(pitch_path),
         dtype="float32",
         always_2d=True,
     )
@@ -2288,37 +2431,24 @@ def blend_adaptive_vocals(
 
     fallback_data = _resample_channels(
         fallback_data,
-        original_sr=int(
-            fallback_sr
-        ),
-        target_sr=int(
-            rvc_sr
-        ),
+        original_sr=int(fallback_sr),
+        target_sr=int(rvc_sr),
     )
 
     channels = max(
         rvc_data.shape[1],
         fallback_data.shape[1],
     )
-
     rvc_data = _channel_match(
         rvc_data,
         channels,
-    ).astype(
-        np.float32,
-        copy=False,
-    )
+    ).astype(np.float32, copy=False)
     fallback_data = _channel_match(
         fallback_data,
         channels,
-    ).astype(
-        np.float32,
-        copy=False,
-    )
+    ).astype(np.float32, copy=False)
 
-    target_length = (
-        rvc_data.shape[0]
-    )
+    target_length = rvc_data.shape[0]
 
     if fallback_data.shape[0] < target_length:
         fallback_data = np.pad(
@@ -2329,10 +2459,7 @@ def blend_adaptive_vocals(
                     target_length
                     - fallback_data.shape[0],
                 ),
-                (
-                    0,
-                    0,
-                ),
+                (0, 0),
             ),
         )
     elif fallback_data.shape[0] > target_length:
@@ -2346,104 +2473,198 @@ def blend_adaptive_vocals(
     ) = _align_fallback_by_envelope(
         rvc_data,
         fallback_data,
-        int(
-            rvc_sr
-        ),
+        int(rvc_sr),
     )
 
-    # Pass 2: direct RVC output validation against the same-key Pitch-only
-    # reference after temporal alignment.
-    try:
+    duration_seconds = (
+        target_length
+        / float(rvc_sr)
+    )
+
+    if auto_guard_enabled:
         (
-            artifact_times,
-            artifact_fallback,
-            _artifact_risk,
-            artifact_metrics,
-        ) = analyze_rvc_artifact_risk(
-            rvc_data,
-            fallback_data,
-            int(
-                rvc_sr
-            ),
+            frame_times,
+            input_fallback_ratio,
+            report,
+        ) = analyze_harmony_risk(
+            original,
             sensitivity=sensitivity,
             crossfade_ms=crossfade_ms,
             log_callback=log_callback,
         )
-    except Exception as exc:
+    else:
+        frame_seconds = 512.0 / 22050.0
+        frame_count = max(
+            2,
+            int(
+                np.ceil(
+                    duration_seconds
+                    / frame_seconds
+                )
+            )
+            + 1,
+        )
+        frame_times = (
+            np.arange(
+                frame_count,
+                dtype=np.float32,
+            )
+            * frame_seconds
+        )
+        input_fallback_ratio = np.zeros(
+            frame_count,
+            dtype=np.float32,
+        )
+        report = HarmonyGuardReport(
+            duration_seconds=float(duration_seconds),
+            sensitivity=(
+                sensitivity
+                if sensitivity in SENSITIVITY_LABELS
+                else "medium"
+            ),
+            crossfade_ms=int(crossfade_ms),
+            safe_seconds=float(duration_seconds),
+            blend_seconds=0.0,
+            fallback_seconds=0.0,
+            risky_region_count=0,
+            f0_jump_count=0,
+            mean_risk=0.0,
+            max_risk=0.0,
+            fallback_gain=1.0,
+            alignment_ms=0.0,
+            risky_regions=[],
+            artifact_guard_enabled=False,
+        )
         _emit(
             log_callback,
             (
-                "[Artifact Guard] 2차 출력 검증 실패 - "
-                "입력 Harmony Guard만 사용합니다: "
-                f"{type(exc).__name__}: {exc}"
+                "[Adaptive Guard v2.6] 자동 Guard OFF - "
+                "수동 우회 구간만 적용합니다."
             ),
-        )
-        artifact_times = np.zeros(
-            0,
-            dtype=np.float32,
-        )
-        artifact_fallback = np.zeros(
-            0,
-            dtype=np.float32,
-        )
-        artifact_metrics = {
-            "artifact_detected_seconds": 0.0,
-            "artifact_strong_seconds": 0.0,
-            "artifact_region_count": 0,
-            "artifact_f0_mismatch_count": 0,
-            "artifact_output_jump_count": 0,
-            "artifact_voicing_mismatch_seconds": 0.0,
-            "mean_artifact_risk": 0.0,
-            "max_artifact_risk": 0.0,
-        }
-
-    if (
-        frame_times.size > 1
-        and artifact_times.size > 1
-    ):
-        artifact_on_input_grid = np.interp(
-            frame_times.astype(
-                np.float64,
-                copy=False,
-            ),
-            artifact_times.astype(
-                np.float64,
-                copy=False,
-            ),
-            artifact_fallback.astype(
-                np.float64,
-                copy=False,
-            ),
-            left=float(
-                artifact_fallback[
-                    0
-                ]
-            ),
-            right=float(
-                artifact_fallback[
-                    -1
-                ]
-            ),
-        ).astype(
-            np.float32,
-            copy=False,
         )
 
-        # Either input analysis OR a directly observed RVC failure can
-        # trigger fallback.  Artifact Guard therefore catches cases that
-        # Harmony Guard missed completely.
-        fallback_ratio = np.maximum(
+    artifact_metrics = {
+        "artifact_detected_seconds": 0.0,
+        "artifact_strong_seconds": 0.0,
+        "artifact_region_count": 0,
+        "artifact_f0_mismatch_count": 0,
+        "artifact_output_jump_count": 0,
+        "artifact_voicing_mismatch_seconds": 0.0,
+        "mean_artifact_risk": 0.0,
+        "max_artifact_risk": 0.0,
+    }
+
+    artifact_on_input_grid = np.zeros(
+        frame_times.size,
+        dtype=np.float32,
+    )
+
+    if auto_guard_enabled:
+        try:
+            (
+                artifact_times,
+                artifact_fallback,
+                _artifact_risk,
+                artifact_metrics,
+            ) = analyze_rvc_artifact_risk(
+                rvc_data,
+                fallback_data,
+                int(rvc_sr),
+                sensitivity=sensitivity,
+                crossfade_ms=crossfade_ms,
+                log_callback=log_callback,
+            )
+
+            if (
+                frame_times.size > 1
+                and artifact_times.size > 1
+            ):
+                artifact_on_input_grid = np.interp(
+                    frame_times.astype(
+                        np.float64,
+                        copy=False,
+                    ),
+                    artifact_times.astype(
+                        np.float64,
+                        copy=False,
+                    ),
+                    artifact_fallback.astype(
+                        np.float64,
+                        copy=False,
+                    ),
+                    left=float(artifact_fallback[0]),
+                    right=float(artifact_fallback[-1]),
+                ).astype(np.float32, copy=False)
+
+        except Exception as exc:
+            _emit(
+                log_callback,
+                (
+                    "[Artifact Guard] 2차 출력 검증 실패 - "
+                    "Harmony 힌트 + 수동 우회만 사용합니다: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
+    if auto_guard_enabled:
+        (
+            auto_fallback,
+            harmony_hint,
+            harmony_cap,
+        ) = _artifact_priority_combine(
             input_fallback_ratio,
             artifact_on_input_grid,
-        ).astype(
-            np.float32,
-            copy=False,
+            sensitivity,
+        )
+
+        _emit(
+            log_callback,
+            (
+                "[Adaptive Guard v2.6] Artifact 우선 모드: "
+                f"Harmony-only 최대 우회 "
+                f"{harmony_cap * 100.0:.0f}% / "
+                "실제 Artifact 검출은 최대 98% 우회"
+            ),
         )
     else:
-        fallback_ratio = input_fallback_ratio.astype(
-            np.float32,
-            copy=True,
+        auto_fallback = np.zeros(
+            frame_times.size,
+            dtype=np.float32,
         )
+        harmony_hint = np.zeros(
+            frame_times.size,
+            dtype=np.float32,
+        )
+        harmony_cap = 0.0
+
+    manual_fallback = _manual_bypass_mask(
+        frame_times,
+        manual_ranges,
+        crossfade_ms=int(crossfade_ms),
+    )
+
+    if manual_ranges:
+        _emit(
+            log_callback,
+            (
+                "[Manual Bypass] 수동 우회 "
+                f"{len(manual_ranges)}개 구간 적용: "
+                + ", ".join(
+                    f"{start:.2f}-{end:.2f}s"
+                    for start, end in manual_ranges[:12]
+                )
+                + (
+                    f" 외 {len(manual_ranges) - 12}개"
+                    if len(manual_ranges) > 12
+                    else ""
+                )
+            ),
+        )
+
+    fallback_ratio = np.maximum(
+        auto_fallback,
+        manual_fallback,
+    ).astype(np.float32, copy=False)
 
     fallback_ratio = np.clip(
         fallback_ratio,
@@ -2475,29 +2696,19 @@ def blend_adaptive_vocals(
     )
 
     gain = 1.0
-
-    if (
-        rms_rvc > 1e-7
-        and rms_fallback > 1e-7
-    ):
+    if rms_rvc > 1e-7 and rms_fallback > 1e-7:
         gain = max(
             0.55,
             min(
                 1.80,
-                rms_rvc
-                / rms_fallback,
+                rms_rvc / rms_fallback,
             ),
         )
 
     fallback_data = (
         fallback_data
-        * float(
-            gain
-        )
-    ).astype(
-        np.float32,
-        copy=False,
-    )
+        * float(gain)
+    ).astype(np.float32, copy=False)
 
     if frame_times.size <= 1:
         sample_fallback = np.zeros(
@@ -2510,9 +2721,7 @@ def blend_adaptive_vocals(
                 target_length,
                 dtype=np.float64,
             )
-            / float(
-                rvc_sr
-            )
+            / float(rvc_sr)
         )
         sample_fallback = np.interp(
             sample_times,
@@ -2524,76 +2733,50 @@ def blend_adaptive_vocals(
                 np.float64,
                 copy=False,
             ),
-            left=float(
-                fallback_ratio[
-                    0
-                ]
-            ),
-            right=float(
-                fallback_ratio[
-                    -1
-                ]
-            ),
-        ).astype(
-            np.float32,
-            copy=False,
-        )
+            left=float(fallback_ratio[0]),
+            right=float(fallback_ratio[-1]),
+        ).astype(np.float32, copy=False)
 
-    blend = sample_fallback[
-        :,
-        None,
-    ]
-
+    blend = sample_fallback[:, None]
     adaptive = (
         rvc_data
-        * (
-            1.0
-            - blend
-        )
+        * (1.0 - blend)
         + fallback_data
         * blend
     )
 
     peak = float(
         np.max(
-            np.abs(
-                adaptive
-            )
+            np.abs(adaptive)
         )
     )
-
     if peak > 0.98:
         adaptive = (
             adaptive
-            * (
-                0.98
-                / peak
-            )
+            * (0.98 / peak)
         )
 
     output.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
-
     sf.write(
-        str(
-            output
-        ),
+        str(output),
         adaptive,
-        int(
-            rvc_sr
-        ),
+        int(rvc_sr),
         subtype="PCM_24",
     )
 
-    report.fallback_gain = float(
-        gain
+    report.guard_version = GUARD_VERSION
+    report.fallback_gain = float(gain)
+    report.alignment_ms = float(alignment_ms)
+    report.artifact_guard_enabled = bool(
+        auto_guard_enabled
     )
-    report.alignment_ms = float(
-        alignment_ms
+    report.artifact_priority_mode = True
+    report.harmony_hint_cap = float(
+        harmony_cap
     )
-    report.artifact_guard_enabled = True
     report.artifact_detected_seconds = float(
         artifact_metrics[
             "artifact_detected_seconds"
@@ -2634,30 +2817,30 @@ def blend_adaptive_vocals(
             "max_artifact_risk"
         ]
     )
+    report.manual_region_count = len(
+        manual_ranges
+    )
+    report.manual_regions = list(
+        manual_ranges
+    )
 
-    # Recompute final statistics from the COMBINED pass-1 + pass-2 mask.
-    frame_seconds = (
+    final_frame_seconds = (
         float(
-            frame_times[
-                1
-            ]
-            - frame_times[
-                0
-            ]
+            frame_times[1]
+            - frame_times[0]
         )
         if frame_times.size > 1
         else 0.0
     )
 
-    if frame_seconds > 0.0:
+    if final_frame_seconds > 0.0:
         report.safe_seconds = min(
             report.duration_seconds,
             float(
                 np.sum(
-                    fallback_ratio
-                    < 0.15
+                    fallback_ratio < 0.15
                 )
-                * frame_seconds
+                * final_frame_seconds
             ),
         )
         report.blend_seconds = min(
@@ -2665,31 +2848,37 @@ def blend_adaptive_vocals(
             float(
                 np.sum(
                     (
-                        fallback_ratio
-                        >= 0.15
+                        fallback_ratio >= 0.15
                     )
                     & (
-                        fallback_ratio
-                        < 0.65
+                        fallback_ratio < 0.65
                     )
                 )
-                * frame_seconds
+                * final_frame_seconds
             ),
         )
         report.fallback_seconds = min(
             report.duration_seconds,
             float(
                 np.sum(
-                    fallback_ratio
-                    >= 0.65
+                    fallback_ratio >= 0.65
                 )
-                * frame_seconds
+                * final_frame_seconds
+            ),
+        )
+        report.manual_bypass_seconds = min(
+            report.duration_seconds,
+            float(
+                np.sum(
+                    manual_fallback >= 0.65
+                )
+                * final_frame_seconds
             ),
         )
 
         final_regions = _regions_from_mask(
             fallback_ratio,
-            frame_seconds,
+            final_frame_seconds,
             threshold=0.35,
             min_seconds=0.08,
         )
@@ -2701,17 +2890,19 @@ def blend_adaptive_vocals(
     _emit(
         log_callback,
         (
-            "[Adaptive Guard v2.5] 최종 적용: "
-            f"Pitch-only 강한 우회 {report.fallback_seconds:.1f}s / "
+            "[Adaptive Guard v2.6] 최종 적용: "
+            f"강한 Pitch-only 우회 "
+            f"{report.fallback_seconds:.1f}s / "
             f"부분 Blend {report.blend_seconds:.1f}s / "
-            f"총 위험 구간 {report.risky_region_count}개 / "
-            f"2차 Artifact 구간 {report.artifact_region_count}개"
+            f"Artifact {report.artifact_detected_seconds:.1f}s / "
+            f"수동 우회 {report.manual_bypass_seconds:.1f}s / "
+            f"총 위험 구간 {report.risky_region_count}개"
         ),
     )
     _emit(
         log_callback,
         (
-            "[Adaptive Guard v2.5] Adaptive vocal 생성 완료: "
+            "[Adaptive Guard v2.6] Adaptive vocal 생성 완료: "
             f"fallback gain={gain:.3f}x, "
             f"alignment={alignment_ms:+.1f}ms"
         ),
@@ -2726,19 +2917,14 @@ def blend_adaptive_vocals(
             parents=True,
             exist_ok=True,
         )
-
         encoded = (
             json.dumps(
-                asdict(
-                    report
-                ),
+                asdict(report),
                 ensure_ascii=False,
                 indent=2,
             )
             + "\n"
         )
-
-        # Keep old filename for compatibility and write a clearer v2.5 name.
         for log_name in (
             "rvc_harmony_guard_last.json",
             "rvc_adaptive_guard_last.json",
@@ -2986,6 +3172,65 @@ def self_test() -> dict[str, float]:
             f"clean={clean_artifact:.3f}, bad={bad_artifact:.3f}"
         )
 
+    synthetic_harmony = np.full(
+        100,
+        0.92,
+        dtype=np.float32,
+    )
+    synthetic_no_artifact = np.zeros(
+        100,
+        dtype=np.float32,
+    )
+    synthetic_artifact = np.full(
+        100,
+        0.90,
+        dtype=np.float32,
+    )
+
+    harmony_only, _, medium_cap = (
+        _artifact_priority_combine(
+            synthetic_harmony,
+            synthetic_no_artifact,
+            "medium",
+        )
+    )
+    artifact_confirmed, _, _ = (
+        _artifact_priority_combine(
+            synthetic_harmony,
+            synthetic_artifact,
+            "medium",
+        )
+    )
+
+    if float(np.max(harmony_only)) > medium_cap + 1e-5:
+        raise RuntimeError(
+            "v2.6 Artifact-priority self-test failed: "
+            "Harmony-only fallback exceeded cap."
+        )
+
+    if float(np.mean(artifact_confirmed)) <= 0.88:
+        raise RuntimeError(
+            "v2.6 Artifact-priority self-test failed: "
+            "confirmed artifact was not strongly bypassed."
+        )
+
+    manual_times = np.arange(
+        0.0,
+        3.0,
+        0.02,
+        dtype=np.float32,
+    )
+    manual_mask = _manual_bypass_mask(
+        manual_times,
+        [(1.0, 1.5)],
+        crossfade_ms=200,
+    )
+
+    if float(np.max(manual_mask)) < 0.97:
+        raise RuntimeError(
+            "v2.6 manual bypass self-test failed."
+        )
+
     return {
         "mono_input_fallback": mono_value,
         "harmony_input_fallback": harmony_value,
@@ -2995,6 +3240,15 @@ def self_test() -> dict[str, float]:
             bad_metrics[
                 "artifact_detected_seconds"
             ]
+        ),
+        "v26_harmony_only_cap": float(
+            np.max(harmony_only)
+        ),
+        "v26_confirmed_artifact": float(
+            np.mean(artifact_confirmed)
+        ),
+        "v26_manual_peak": float(
+            np.max(manual_mask)
         ),
     }
 
