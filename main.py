@@ -81,7 +81,11 @@ from rvc_rmvpe import (
 from rvc_trainer import (
     RVCTrainingError,
     RVCTrainingPipeline,
+    TRAINING_MODE_FINETUNE_ADD,
+    TRAINING_MODE_NEW,
+    TRAINING_MODE_RESUME,
     dataset_status_text,
+    experiment_status_text,
     training_assets_status,
 )
 from batch_vocal_extractor import (
@@ -91,8 +95,9 @@ from batch_vocal_extractor import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.1 / Batch Vocal Dataset"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.2 / RVC Fine-tune"
 
+# V22_RVC_FINETUNE_PATCH
 # V21_BATCH_VOCAL_DATASET_PATCH
 # V20_RVC_TRAINING_PATCH
 # V19_RVC_RMVPE_PATCH
@@ -652,6 +657,7 @@ class RVCTrainingThread(QThread):
         workers: int,
         gpu_id: int,
         cache_gpu: bool,
+        training_mode: str,
         parent=None,
     ):
         super().__init__(parent)
@@ -671,6 +677,9 @@ class RVCTrainingThread(QThread):
         self.gpu_id = gpu_id
         self.cache_gpu = (
             cache_gpu
+        )
+        self.training_mode = (
+            training_mode
         )
 
         self.pipeline = RVCTrainingPipeline(
@@ -701,6 +710,7 @@ class RVCTrainingThread(QThread):
                 workers=self.workers,
                 gpu_id=self.gpu_id,
                 cache_gpu=self.cache_gpu,
+                training_mode=self.training_mode,
             )
 
             self.training_done.emit(
@@ -1060,12 +1070,42 @@ class MainWindow(QMainWindow):
             training_option_group
         )
 
+        self.rvc_training_mode_combo = QComboBox()
+        self.rvc_training_mode_combo.addItem(
+            "새 모델 학습",
+            TRAINING_MODE_NEW,
+        )
+        self.rvc_training_mode_combo.addItem(
+            "기존 학습 이어하기 (같은 데이터)",
+            TRAINING_MODE_RESUME,
+        )
+        self.rvc_training_mode_combo.addItem(
+            "데이터 추가 후 파인튜닝 (기존 + 신규 전체 데이터)",
+            TRAINING_MODE_FINETUNE_ADD,
+        )
+        self.rvc_training_mode_combo.currentIndexChanged.connect(
+            self.on_rvc_training_mode_changed
+        )
+
+        self.rvc_training_mode_help = QLabel()
+        self.rvc_training_mode_help.setWordWrap(
+            True
+        )
+
+        self.rvc_training_experiment_status = QLabel()
+        self.rvc_training_experiment_status.setWordWrap(
+            True
+        )
+
         self.rvc_training_name_edit = QLineEdit()
         self.rvc_training_name_edit.setText(
             "male_voice_01"
         )
         self.rvc_training_name_edit.setToolTip(
             "영문/숫자/_/- 만 사용"
+        )
+        self.rvc_training_name_edit.textChanged.connect(
+            self.refresh_rvc_training_experiment_status
         )
 
         self.rvc_training_epochs_spin = QSpinBox()
@@ -1132,11 +1172,23 @@ class MainWindow(QMainWindow):
         )
 
         training_option_layout.addRow(
+            "학습 방식",
+            self.rvc_training_mode_combo,
+        )
+        training_option_layout.addRow(
+            "",
+            self.rvc_training_mode_help,
+        )
+        training_option_layout.addRow(
+            "기존 상태",
+            self.rvc_training_experiment_status,
+        )
+        training_option_layout.addRow(
             "모델 이름",
             self.rvc_training_name_edit,
         )
         training_option_layout.addRow(
-            "Epochs",
+            "목표 Epochs",
             self.rvc_training_epochs_spin,
         )
         training_option_layout.addRow(
@@ -1178,7 +1230,7 @@ class MainWindow(QMainWindow):
         training_button_row = QHBoxLayout()
 
         self.rvc_training_start_button = QPushButton(
-            "전처리 → RMVPE → HuBERT → 학습 → Index 생성"
+            "전처리 → RMVPE → HuBERT → 새 학습 → Index 생성"
         )
         self.rvc_training_start_button.clicked.connect(
             self.start_rvc_training
@@ -1245,6 +1297,8 @@ class MainWindow(QMainWindow):
             1,
         )
 
+        self.on_rvc_training_mode_changed()
+        self.refresh_rvc_training_experiment_status()
         self.refresh_rvc_training_status()
 
         engine_group = QGroupBox(
@@ -3749,6 +3803,98 @@ class MainWindow(QMainWindow):
             running
         )
 
+    def _current_rvc_training_mode(
+        self,
+    ) -> str:
+        if not hasattr(
+            self,
+            "rvc_training_mode_combo",
+        ):
+            return TRAINING_MODE_NEW
+
+        return (
+            self.rvc_training_mode_combo.currentData()
+            or TRAINING_MODE_NEW
+        )
+
+    def refresh_rvc_training_experiment_status(
+        self,
+    ):
+        if not hasattr(
+            self,
+            "rvc_training_experiment_status",
+        ):
+            return
+
+        name = (
+            self.rvc_training_name_edit.text().strip()
+            if hasattr(
+                self,
+                "rvc_training_name_edit",
+            )
+            else ""
+        )
+
+        self.rvc_training_experiment_status.setText(
+            experiment_status_text(
+                name
+            )
+        )
+
+    def on_rvc_training_mode_changed(
+        self,
+        *_args,
+    ):
+        if not hasattr(
+            self,
+            "rvc_training_mode_help",
+        ):
+            return
+
+        mode = (
+            self._current_rvc_training_mode()
+        )
+
+        if mode == TRAINING_MODE_RESUME:
+            help_text = (
+                "기존 G/D 체크포인트와 기존 전처리/F0/HuBERT 특징을 그대로 사용합니다. "
+                "데이터가 바뀌지 않았을 때 가장 빠릅니다. "
+                "목표 Epochs는 추가량이 아니라 최종값입니다. "
+                "예: 현재 200 → 100 epoch 추가는 목표 300."
+            )
+            button_text = (
+                "기존 체크포인트 → 학습 이어하기 → Index 재생성"
+            )
+
+        elif mode == TRAINING_MODE_FINETUNE_ADD:
+            help_text = (
+                "같은 모델의 기존 G/D 체크포인트는 보존하고, "
+                "선택한 기존+신규 전체 데이터셋에서 전처리/RMVPE/HuBERT를 "
+                "깨끗하게 다시 만든 뒤 기존 체크포인트에서 이어 학습합니다. "
+                "파인튜닝 전 현재 모델/체크포인트를 별도 백업합니다. "
+                "목표 Epochs는 최종값입니다."
+            )
+            button_text = (
+                "데이터 재구축 → 기존 체크포인트 파인튜닝 → Index 생성"
+            )
+
+        else:
+            help_text = (
+                "새 실험을 처음부터 학습합니다. "
+                "같은 이름에 기존 G/D 체크포인트가 있으면 실수로 덮어쓰지 않도록 중단합니다."
+            )
+            button_text = (
+                "전처리 → RMVPE → HuBERT → 새 학습 → Index 생성"
+            )
+
+        self.rvc_training_mode_help.setText(
+            help_text
+        )
+        self.rvc_training_start_button.setText(
+            button_text
+        )
+        self.refresh_rvc_training_experiment_status()
+
     def choose_rvc_training_dataset(self):
         current = self.settings.value(
             "rvc_training_dataset_dir",
@@ -3833,16 +3979,44 @@ class MainWindow(QMainWindow):
             )
             return
 
+        training_mode = (
+            self._current_rvc_training_mode()
+        )
+
+        mode_text = {
+            TRAINING_MODE_NEW: "새 모델 학습",
+            TRAINING_MODE_RESUME: "기존 학습 이어하기",
+            TRAINING_MODE_FINETUNE_ADD: "데이터 추가 후 파인튜닝",
+        }.get(
+            training_mode,
+            training_mode,
+        )
+
+        extra_text = ""
+
+        if training_mode == TRAINING_MODE_RESUME:
+            extra_text = (
+                "\n기존 전처리/RMVPE/HuBERT 결과를 재사용합니다."
+            )
+
+        elif training_mode == TRAINING_MODE_FINETUNE_ADD:
+            extra_text = (
+                "\n기존 G/D 체크포인트는 보존하고, "
+                "현재 폴더의 기존+신규 데이터 전체에서 특징을 재구축합니다."
+            )
+
         answer = QMessageBox.question(
             self,
             "RVC 모델 학습 시작",
             (
                 "RVC 학습은 상당한 시간이 걸릴 수 있습니다.\n\n"
-                "데이터셋에는 한 사람의 남성/타깃 음성만 들어 있어야 하고, "
+                "데이터셋에는 한 사람의 타깃 음성만 들어 있어야 하고, "
                 "반주나 다른 화자가 섞이지 않는 것이 좋습니다.\n\n"
+                f"방식: {mode_text}\n"
                 f"모델: {name}\n"
-                f"Epochs: {self.rvc_training_epochs_spin.value()}\n"
-                f"Batch: {self.rvc_training_batch_spin.value()}\n\n"
+                f"목표 Epochs: {self.rvc_training_epochs_spin.value()}\n"
+                f"Batch: {self.rvc_training_batch_spin.value()}"
+                f"{extra_text}\n\n"
                 "학습을 시작할까요?"
             ),
         )
@@ -3890,6 +4064,7 @@ class MainWindow(QMainWindow):
             cache_gpu=(
                 self.rvc_training_cache_gpu_check.isChecked()
             ),
+            training_mode=training_mode,
             parent=self,
         )
 
@@ -4078,6 +4253,7 @@ class MainWindow(QMainWindow):
             False
         )
         self.refresh_rvc_training_status()
+        self.refresh_rvc_training_experiment_status()
 
     def _current_transpose_engine(self) -> str:
         if not hasattr(

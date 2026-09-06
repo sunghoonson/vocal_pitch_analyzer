@@ -99,3 +99,6 @@ rvc_models/
 # --- Prepared RVC audio datasets ---
 rvc_datasets/
 *_vocals.wav
+
+# --- RVC fine-tune safety backups ---
+rvc_finetune_backups/

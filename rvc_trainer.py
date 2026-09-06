@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime
 
 
 LogCallback = Callable[[str], None]
@@ -25,6 +26,27 @@ class RVCTrainingResult:
     model_path: Path
     index_path: Path | None
     experiment_dir: Path
+
+
+# V22_RVC_FINETUNE_PATCH
+TRAINING_MODE_NEW = "new"
+TRAINING_MODE_RESUME = "resume"
+TRAINING_MODE_FINETUNE_ADD = "finetune_add"
+TRAINING_MODES = {
+    TRAINING_MODE_NEW,
+    TRAINING_MODE_RESUME,
+    TRAINING_MODE_FINETUNE_ADD,
+}
+
+DERIVED_TRAINING_DIRS = (
+    "0_gt_wavs",
+    "1_16k_wavs",
+    "2a_f0",
+    "2b-f0nsf",
+    "3_feature768",
+)
+
+DATASET_MANIFEST_NAME = "vocal_pitch_dataset_manifest.json"
 
 
 SUPPORTED_DATASET_EXTENSIONS = {
@@ -60,6 +82,99 @@ def training_log_path() -> Path:
 
 def trained_models_root() -> Path:
     return project_root() / "rvc_models"
+
+
+def finetune_backups_root() -> Path:
+    return project_root() / "rvc_finetune_backups"
+
+
+def experiment_dir(
+    experiment_name: str,
+) -> Path:
+    return (
+        rvc_root()
+        / "logs"
+        / validate_experiment_name(
+            experiment_name
+        )
+    )
+
+
+def experiment_checkpoint_files(
+    experiment_name: str,
+) -> tuple[list[Path], list[Path]]:
+    exp_dir = experiment_dir(
+        experiment_name
+    )
+
+    generators = sorted(
+        exp_dir.glob("G_*.pth"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    discriminators = sorted(
+        exp_dir.glob("D_*.pth"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+
+    return (
+        generators,
+        discriminators,
+    )
+
+
+def experiment_status_text(
+    experiment_name: str,
+) -> str:
+    try:
+        exp_name = validate_experiment_name(
+            experiment_name
+        )
+    except RVCTrainingError:
+        return (
+            "모델 이름을 입력하면 기존 학습 상태를 확인합니다."
+        )
+
+    exp_dir = (
+        rvc_root()
+        / "logs"
+        / exp_name
+    )
+
+    generators = list(
+        exp_dir.glob("G_*.pth")
+    )
+    discriminators = list(
+        exp_dir.glob("D_*.pth")
+    )
+
+    final_model = (
+        trained_models_root()
+        / exp_name
+        / f"{exp_name}.pth"
+    )
+
+    if generators and discriminators:
+        final_text = (
+            " / 최종 모델 있음"
+            if final_model.is_file()
+            else ""
+        )
+
+        return (
+            f"기존 학습 체크포인트 발견 "
+            f"(G {len(generators)} / D {len(discriminators)})"
+            f"{final_text} - 이어학습/파인튜닝 가능"
+        )
+
+    if exp_dir.exists():
+        return (
+            "동일 이름의 실험 폴더는 있지만 완전한 G/D 체크포인트가 없습니다. "
+            "새 학습으로 재구축하거나 다른 이름을 권장합니다."
+        )
+
+    return (
+        "기존 체크포인트 없음 - 새 모델 학습용 이름입니다."
+    )
 
 
 def training_assets_status() -> tuple[bool, str]:
@@ -411,6 +526,486 @@ class RVCTrainingPipeline:
                 f"로그: {training_log_path()}"
             )
 
+    def _checkpoint_pair(
+        self,
+        exp_dir: Path,
+    ) -> tuple[Path, Path]:
+        generators = sorted(
+            exp_dir.glob("G_*.pth"),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+        discriminators = sorted(
+            exp_dir.glob("D_*.pth"),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+
+        if not generators or not discriminators:
+            raise RVCTrainingError(
+                "기존 학습을 이어갈 G/D 체크포인트를 찾지 못했습니다.\n"
+                f"실험 폴더: {exp_dir}\n\n"
+                "최종 inference용 .pth만으로는 이 기능에서 이어학습할 수 없습니다."
+            )
+
+        return (
+            generators[-1],
+            discriminators[-1],
+        )
+
+    def _checkpoint_epoch(
+        self,
+        checkpoint: Path,
+    ) -> int | None:
+        code = (
+            "import sys, torch; "
+            "d=torch.load(sys.argv[1],map_location='cpu',weights_only=False); "
+            "print(int(d.get('iteration',0)))"
+        )
+
+        try:
+            completed = subprocess.run(
+                [
+                    str(
+                        rvc_python()
+                    ),
+                    "-c",
+                    code,
+                    str(checkpoint),
+                ],
+                cwd=str(
+                    rvc_root()
+                ),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+
+            if completed.returncode != 0:
+                self._log(
+                    "[WARN] 현재 checkpoint epoch를 읽지 못했습니다: "
+                    + completed.stderr.strip()
+                )
+                return None
+
+            value = int(
+                completed.stdout.strip().splitlines()[-1]
+            )
+
+            return max(
+                0,
+                value,
+            )
+
+        except Exception as exc:
+            self._log(
+                "[WARN] checkpoint epoch 확인 실패: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _dataset_manifest_path(
+        self,
+        exp_dir: Path,
+    ) -> Path:
+        return (
+            exp_dir
+            / DATASET_MANIFEST_NAME
+        )
+
+    def _dataset_manifest(
+        self,
+        dataset: Path,
+        files: list[Path],
+    ) -> dict:
+        entries = []
+
+        for path in files:
+            stat = path.stat()
+            entries.append(
+                {
+                    "name": path.name,
+                    "path": str(
+                        path.resolve()
+                    ),
+                    "size": int(
+                        stat.st_size
+                    ),
+                    "mtime_ns": int(
+                        stat.st_mtime_ns
+                    ),
+                }
+            )
+
+        return {
+            "version": 1,
+            "dataset_dir": str(
+                dataset.resolve()
+            ),
+            "files": entries,
+        }
+
+    def _load_dataset_manifest(
+        self,
+        exp_dir: Path,
+    ) -> dict | None:
+        path = self._dataset_manifest_path(
+            exp_dir
+        )
+
+        if not path.is_file():
+            return None
+
+        try:
+            data = json.loads(
+                path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            if not isinstance(
+                data,
+                dict,
+            ):
+                return None
+
+            if not isinstance(
+                data.get("files"),
+                list,
+            ):
+                return None
+
+            return data
+
+        except Exception:
+            return None
+
+    def _save_dataset_manifest(
+        self,
+        exp_dir: Path,
+        dataset: Path,
+        files: list[Path],
+    ) -> None:
+        path = self._dataset_manifest_path(
+            exp_dir
+        )
+
+        path.write_text(
+            json.dumps(
+                self._dataset_manifest(
+                    dataset,
+                    files,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self._log(
+            f"[OK] 데이터셋 기록 저장: {path.name} / {len(files)} files"
+        )
+
+    def _infer_old_source_count(
+        self,
+        exp_dir: Path,
+    ) -> int:
+        manifest = self._load_dataset_manifest(
+            exp_dir
+        )
+
+        if manifest is not None:
+            return len(
+                manifest.get(
+                    "files",
+                    [],
+                )
+            )
+
+        gt_dir = (
+            exp_dir
+            / "0_gt_wavs"
+        )
+
+        if not gt_dir.is_dir():
+            return 0
+
+        prefixes: set[str] = set()
+
+        for path in gt_dir.glob(
+            "*.wav"
+        ):
+            match = re.match(
+                r"^(\d+)_\d+\.wav$",
+                path.name,
+            )
+
+            if match:
+                prefixes.add(
+                    match.group(1)
+                )
+
+        return len(
+            prefixes
+        )
+
+    def _validate_resume_dataset(
+        self,
+        exp_dir: Path,
+        files: list[Path],
+    ) -> None:
+        previous = self._load_dataset_manifest(
+            exp_dir
+        )
+
+        if previous is not None:
+            old_names = {
+                str(item.get("name", ""))
+                for item in previous.get(
+                    "files",
+                    [],
+                )
+                if item.get("name")
+            }
+            current_names = {
+                path.name
+                for path in files
+            }
+
+            if current_names != old_names:
+                raise RVCTrainingError(
+                    "'기존 학습 이어하기'는 데이터셋이 바뀌지 않았을 때만 사용합니다.\n\n"
+                    f"이전 파일 수: {len(old_names)}\n"
+                    f"현재 파일 수: {len(current_names)}\n\n"
+                    "파일을 추가/삭제/이름 변경했다면 "
+                    "'데이터 추가 후 파인튜닝'을 선택하세요."
+                )
+
+            return
+
+        old_count = self._infer_old_source_count(
+            exp_dir
+        )
+
+        if (
+            old_count > 0
+            and len(files) != old_count
+        ):
+            raise RVCTrainingError(
+                "'기존 학습 이어하기'에서 데이터 파일 수 변경을 감지했습니다.\n\n"
+                f"기존 추정 원본 수: {old_count}\n"
+                f"현재 데이터 수: {len(files)}\n\n"
+                "데이터를 추가했다면 '데이터 추가 후 파인튜닝'을 사용하세요."
+            )
+
+    def _validate_finetune_dataset(
+        self,
+        exp_dir: Path,
+        files: list[Path],
+    ) -> None:
+        previous = self._load_dataset_manifest(
+            exp_dir
+        )
+
+        if previous is not None:
+            old_names = {
+                str(item.get("name", ""))
+                for item in previous.get(
+                    "files",
+                    [],
+                )
+                if item.get("name")
+            }
+            current_names = {
+                path.name
+                for path in files
+            }
+
+            missing = sorted(
+                old_names
+                - current_names
+            )
+
+            if missing:
+                preview = ", ".join(
+                    missing[:5]
+                )
+
+                if len(missing) > 5:
+                    preview += (
+                        f" 외 {len(missing) - 5}개"
+                    )
+
+                raise RVCTrainingError(
+                    "데이터 추가 파인튜닝에서는 기존 데이터 + 신규 데이터가 "
+                    "모두 같은 데이터셋 폴더에 있어야 합니다.\n\n"
+                    f"이전 데이터 중 현재 폴더에서 찾지 못한 파일: {preview}"
+                )
+
+            added = (
+                current_names
+                - old_names
+            )
+
+            self._log(
+                "[FINETUNE] 이전 데이터 "
+                f"{len(old_names)}개 / 현재 {len(current_names)}개 / "
+                f"추가 감지 {len(added)}개"
+            )
+            return
+
+        old_count = self._infer_old_source_count(
+            exp_dir
+        )
+
+        if (
+            old_count > 0
+            and len(files) < old_count
+        ):
+            raise RVCTrainingError(
+                "기존 학습 데이터보다 현재 선택한 데이터 파일 수가 적습니다.\n\n"
+                f"기존 추정 원본 수: {old_count}\n"
+                f"현재 데이터 수: {len(files)}\n\n"
+                "데이터 추가 파인튜닝은 기존 데이터 + 신규 데이터를 모두 넣은 "
+                "폴더를 선택하세요."
+            )
+
+        if old_count > 0:
+            self._log(
+                "[FINETUNE] 이전 manifest가 없어 전처리 파일에서 "
+                f"기존 원본 수를 약 {old_count}개로 추정했습니다."
+            )
+
+    def _backup_training_state(
+        self,
+        exp_name: str,
+        exp_dir: Path,
+    ) -> Path:
+        stamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        backup_dir = (
+            finetune_backups_root()
+            / exp_name
+            / stamp
+        )
+        backup_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        g_path, d_path = (
+            self._checkpoint_pair(
+                exp_dir
+            )
+        )
+
+        for source in (
+            g_path,
+            d_path,
+        ):
+            shutil.copy2(
+                source,
+                backup_dir
+                / source.name,
+            )
+
+        for name in (
+            "config.json",
+            "filelist.txt",
+            DATASET_MANIFEST_NAME,
+        ):
+            source = (
+                exp_dir
+                / name
+            )
+
+            if source.is_file():
+                shutil.copy2(
+                    source,
+                    backup_dir
+                    / source.name,
+                )
+
+        permanent = (
+            trained_models_root()
+            / exp_name
+        )
+
+        if permanent.is_dir():
+            target = (
+                backup_dir
+                / "rvc_models"
+            )
+            shutil.copytree(
+                permanent,
+                target,
+                dirs_exist_ok=True,
+            )
+
+        weights_dir = (
+            rvc_root()
+            / "assets"
+            / "weights"
+        )
+        final_weight = (
+            weights_dir
+            / f"{exp_name}.pth"
+        )
+
+        if final_weight.is_file():
+            shutil.copy2(
+                final_weight,
+                backup_dir
+                / final_weight.name,
+            )
+
+        self._log(
+            f"[BACKUP] 파인튜닝 전 학습 상태 백업: {backup_dir}"
+        )
+
+        return backup_dir
+
+    def _clear_derived_training_data(
+        self,
+        exp_dir: Path,
+    ) -> None:
+        self._log(
+            "[FINETUNE] 기존 전처리/F0/HuBERT 결과를 정리합니다. "
+            "G/D 체크포인트는 보존합니다."
+        )
+
+        for name in DERIVED_TRAINING_DIRS:
+            path = (
+                exp_dir
+                / name
+            )
+
+            if path.exists():
+                shutil.rmtree(
+                    path
+                )
+
+            path.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+        for name in (
+            "filelist.txt",
+            "config.json",
+        ):
+            path = (
+                exp_dir
+                / name
+            )
+
+            if path.is_file():
+                path.unlink()
+
     def _validate_preprocess(
         self,
         exp_dir: Path,
@@ -723,6 +1318,7 @@ class RVCTrainingPipeline:
         workers: int = 8,
         gpu_id: int = 0,
         cache_gpu: bool = False,
+        training_mode: str = TRAINING_MODE_NEW,
     ) -> RVCTrainingResult:
         ready, status = (
             training_assets_status()
@@ -731,6 +1327,11 @@ class RVCTrainingPipeline:
         if not ready:
             raise RVCTrainingError(
                 status
+            )
+
+        if training_mode not in TRAINING_MODES:
+            raise RVCTrainingError(
+                f"알 수 없는 학습 방식입니다: {training_mode}"
             )
 
         dataset = Path(
@@ -798,8 +1399,34 @@ class RVCTrainingPipeline:
             exist_ok=True,
         )
 
+        (
+            root
+            / "assets"
+            / "weights"
+        ).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        (
+            root
+            / "assets"
+            / "indices"
+        ).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        mode_labels = {
+            TRAINING_MODE_NEW: "새 모델 학습",
+            TRAINING_MODE_RESUME: "기존 학습 이어하기",
+            TRAINING_MODE_FINETUNE_ADD: "데이터 추가 후 파인튜닝",
+        }
+
         self._log(
             "RVC one-click single-speaker training"
+        )
+        self._log(
+            f"Mode: {mode_labels[training_mode]}"
         )
         self._log(
             f"Dataset: {dataset}"
@@ -811,7 +1438,7 @@ class RVCTrainingPipeline:
             f"Experiment: {exp_name}"
         )
         self._log(
-            f"Epochs: {epochs}"
+            f"Target total epochs: {epochs}"
         )
         self._log(
             f"Batch: {batch_size}"
@@ -820,85 +1447,204 @@ class RVCTrainingPipeline:
             f"GPU: {gpu_id}"
         )
 
-        # 1. preprocess
-        self._progress(
-            3,
-            "1/6 데이터 전처리 중...",
-        )
-        self._run(
-            [
-                str(py),
-                "-m",
-                "train.preprocess",
-                str(dataset),
-                "40000",
-                str(workers),
-                str(exp_dir),
-                "False",
-                "3.7",
-            ],
-            cwd=root,
-            stage="1/6 데이터 전처리",
-        )
-        self._validate_preprocess(
-            exp_dir
+        if training_mode == TRAINING_MODE_NEW:
+            generators = list(
+                exp_dir.glob(
+                    "G_*.pth"
+                )
+            )
+            discriminators = list(
+                exp_dir.glob(
+                    "D_*.pth"
+                )
+            )
+
+            if generators or discriminators:
+                raise RVCTrainingError(
+                    "같은 모델 이름에 기존 학습 체크포인트가 있습니다.\n\n"
+                    f"모델: {exp_name}\n"
+                    "새 모델을 만들려면 다른 이름을 사용하거나, "
+                    "'기존 학습 이어하기' 또는 '데이터 추가 후 파인튜닝'을 선택하세요."
+                )
+
+            self._clear_derived_training_data(
+                exp_dir
+            )
+
+        else:
+            checkpoint_g, checkpoint_d = (
+                self._checkpoint_pair(
+                    exp_dir
+                )
+            )
+            current_epoch = self._checkpoint_epoch(
+                checkpoint_g
+            )
+
+            self._log(
+                f"[RESUME] Generator checkpoint: {checkpoint_g.name}"
+            )
+            self._log(
+                f"[RESUME] Discriminator checkpoint: {checkpoint_d.name}"
+            )
+
+            if current_epoch is not None:
+                self._log(
+                    f"[RESUME] 현재 체크포인트 epoch: {current_epoch}"
+                )
+
+                if epochs <= current_epoch:
+                    raise RVCTrainingError(
+                        "목표 Epochs는 현재 체크포인트보다 커야 합니다.\n\n"
+                        f"현재 epoch: {current_epoch}\n"
+                        f"입력한 목표 epoch: {epochs}\n\n"
+                        "예: 현재 200 epoch에서 100 epoch를 더 학습하려면 "
+                        "목표 Epochs를 300으로 설정하세요."
+                    )
+
+        if training_mode == TRAINING_MODE_RESUME:
+            self._validate_resume_dataset(
+                exp_dir,
+                files,
+            )
+
+        rebuild_features = (
+            training_mode
+            in {
+                TRAINING_MODE_NEW,
+                TRAINING_MODE_FINETUNE_ADD,
+            }
         )
 
-        # 2. RMVPE F0
-        self._progress(
-            18,
-            "2/6 RMVPE F0 추출 중...",
-        )
-        self._run(
-            [
-                str(py),
-                "-m",
-                "train.dataset.extract_f0",
-                "cuda",
-                "1",
-                "0",
-                str(gpu_id),
-                str(exp_dir),
-                "true",
-            ],
-            cwd=root,
-            stage="2/6 RMVPE F0 추출",
-        )
+        if (
+            training_mode
+            == TRAINING_MODE_FINETUNE_ADD
+        ):
+            self._validate_finetune_dataset(
+                exp_dir,
+                files,
+            )
+            self._backup_training_state(
+                exp_name,
+                exp_dir,
+            )
+            self._clear_derived_training_data(
+                exp_dir
+            )
 
-        # 3. HuBERT
-        self._progress(
-            32,
-            "3/6 HuBERT 특징 추출 중...",
-        )
-        self._run(
-            [
-                str(py),
-                "-m",
-                "train.dataset.extract_hubert_feature",
-                f"cuda:{gpu_id}",
-                "1",
-                "0",
-                str(gpu_id),
-                str(exp_dir),
-                "v2",
-                "true",
-            ],
-            cwd=root,
-            stage="3/6 HuBERT 특징 추출",
-        )
-        self._validate_features(
-            exp_dir
-        )
+        if rebuild_features:
+            self._progress(
+                3,
+                "1/6 데이터 전처리 중...",
+            )
+            self._run(
+                [
+                    str(py),
+                    "-m",
+                    "train.preprocess",
+                    str(dataset),
+                    "40000",
+                    str(workers),
+                    str(exp_dir),
+                    "False",
+                    "3.7",
+                ],
+                cwd=root,
+                stage="1/6 데이터 전처리",
+            )
+            self._validate_preprocess(
+                exp_dir
+            )
 
-        # 4. config / filelist
-        self._progress(
-            45,
-            "4/6 학습 설정 생성 중...",
-        )
-        self._prepare_config_and_filelist(
-            exp_name,
-            exp_dir,
-        )
+            self._progress(
+                18,
+                "2/6 RMVPE F0 추출 중...",
+            )
+            self._run(
+                [
+                    str(py),
+                    "-m",
+                    "train.dataset.extract_f0",
+                    "cuda",
+                    "1",
+                    "0",
+                    str(gpu_id),
+                    str(exp_dir),
+                    "true",
+                ],
+                cwd=root,
+                stage="2/6 RMVPE F0 추출",
+            )
+
+            self._progress(
+                32,
+                "3/6 HuBERT 특징 추출 중...",
+            )
+            self._run(
+                [
+                    str(py),
+                    "-m",
+                    "train.dataset.extract_hubert_feature",
+                    f"cuda:{gpu_id}",
+                    "1",
+                    "0",
+                    str(gpu_id),
+                    str(exp_dir),
+                    "v2",
+                    "true",
+                ],
+                cwd=root,
+                stage="3/6 HuBERT 특징 추출",
+            )
+            self._validate_features(
+                exp_dir
+            )
+
+            self._progress(
+                45,
+                "4/6 학습 설정 생성 중...",
+            )
+            self._prepare_config_and_filelist(
+                exp_name,
+                exp_dir,
+            )
+            self._save_dataset_manifest(
+                exp_dir,
+                dataset,
+                files,
+            )
+
+        else:
+            self._progress(
+                45,
+                "기존 전처리/F0/HuBERT 데이터 검증 중...",
+            )
+            self._validate_preprocess(
+                exp_dir
+            )
+            self._validate_features(
+                exp_dir
+            )
+
+            if (
+                not (
+                    exp_dir
+                    / "filelist.txt"
+                ).is_file()
+                or not (
+                    exp_dir
+                    / "config.json"
+                ).is_file()
+            ):
+                self._prepare_config_and_filelist(
+                    exp_name,
+                    exp_dir,
+                )
+
+            self._log(
+                "[RESUME] 전처리/RMVPE/HuBERT를 재실행하지 않고 "
+                "기존 특징 데이터를 사용합니다."
+            )
 
         pretrained_g = (
             root
@@ -913,7 +1659,6 @@ class RVCTrainingPipeline:
             / "f0D40k.pth"
         )
 
-        # 5. train
         self._progress(
             50,
             (
@@ -932,6 +1677,12 @@ class RVCTrainingPipeline:
             "PYTHONIOENCODING",
             "utf-8",
         )
+
+        if training_mode != TRAINING_MODE_NEW:
+            self._log(
+                "[RESUME] RVC train.py가 같은 실험 폴더의 최신 G/D "
+                "체크포인트를 자동 로드하여 이어서 학습합니다."
+            )
 
         self._run(
             [
@@ -972,7 +1723,6 @@ class RVCTrainingPipeline:
             env=env,
         )
 
-        # 6. index
         self._progress(
             94,
             "6/6 Feature Index 생성 중...",
@@ -1009,3 +1759,4 @@ class RVCTrainingPipeline:
         )
 
         return result
+

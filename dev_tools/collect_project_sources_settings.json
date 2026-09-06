@@ -44,7 +44,8 @@
     ".venv_rvc",
     "rvc",
     "rvc_models",
-    "rvc_datasets"
+    "rvc_datasets",
+    "rvc_finetune_backups"
   ],
   "exclude_dir_globs": [
     "backup_before_*",
