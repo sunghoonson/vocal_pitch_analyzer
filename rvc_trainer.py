@@ -28,6 +28,29 @@ class RVCTrainingResult:
     experiment_dir: Path
 
 
+@dataclass(slots=True)
+class RVCExperimentInfo:
+    name: str
+    experiment_dir: Path
+    dataset_dir: Path | None
+    dataset_file_count: int | None
+    dataset_path_exists: bool
+    generator_checkpoints: int
+    discriminator_checkpoints: int
+    estimated_epoch: int | None
+    final_model_path: Path | None
+    index_path: Path | None
+    modified_timestamp: float
+
+    @property
+    def has_checkpoint_pair(self) -> bool:
+        return (
+            self.generator_checkpoints > 0
+            and self.discriminator_checkpoints > 0
+        )
+
+
+# V23_RVC_EXPERIMENT_BROWSER_PATCH
 # V22_RVC_FINETUNE_PATCH
 TRAINING_MODE_NEW = "new"
 TRAINING_MODE_RESUME = "resume"
@@ -174,6 +197,530 @@ def experiment_status_text(
 
     return (
         "기존 체크포인트 없음 - 새 모델 학습용 이름입니다."
+    )
+
+
+def _safe_path_exists(
+    path: Path | None,
+) -> bool:
+    if path is None:
+        return False
+
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _read_experiment_manifest(
+    exp_dir: Path,
+) -> tuple[Path | None, int | None]:
+    path = (
+        exp_dir
+        / DATASET_MANIFEST_NAME
+    )
+
+    if not path.is_file():
+        return (
+            None,
+            None,
+        )
+
+    try:
+        data = json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        raw_dataset = str(
+            data.get(
+                "dataset_dir",
+                "",
+            )
+        ).strip()
+
+        dataset = (
+            Path(
+                raw_dataset
+            ).expanduser()
+            if raw_dataset
+            else None
+        )
+
+        files = data.get(
+            "files",
+            [],
+        )
+
+        count = (
+            len(files)
+            if isinstance(
+                files,
+                list,
+            )
+            else None
+        )
+
+        return (
+            dataset,
+            count,
+        )
+
+    except Exception:
+        return (
+            None,
+            None,
+        )
+
+
+def _infer_pre_v22_dataset_count(
+    exp_dir: Path,
+) -> int | None:
+    gt_dir = (
+        exp_dir
+        / "0_gt_wavs"
+    )
+
+    if not gt_dir.is_dir():
+        return None
+
+    prefixes: set[str] = set()
+
+    try:
+        for path in gt_dir.glob(
+            "*.wav"
+        ):
+            match = re.match(
+                r"^(\d+)_\d+\.wav$",
+                path.name,
+            )
+
+            if match:
+                prefixes.add(
+                    match.group(1)
+                )
+    except OSError:
+        return None
+
+    return (
+        len(prefixes)
+        if prefixes
+        else None
+    )
+
+
+def _estimated_experiment_epoch(
+    experiment_name: str,
+) -> int | None:
+    weights_dir = (
+        rvc_root()
+        / "assets"
+        / "weights"
+    )
+
+    if not weights_dir.is_dir():
+        return None
+
+    values: list[int] = []
+
+    try:
+        for path in weights_dir.glob(
+            f"{experiment_name}*.pth"
+        ):
+            match = re.search(
+                r"(?:^|_)e(\d+)(?:_|\.|$)",
+                path.name,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                values.append(
+                    int(
+                        match.group(1)
+                    )
+                )
+    except OSError:
+        return None
+
+    return (
+        max(values)
+        if values
+        else None
+    )
+
+
+def _find_experiment_final_model(
+    experiment_name: str,
+) -> Path | None:
+    folder = (
+        trained_models_root()
+        / experiment_name
+    )
+
+    preferred = (
+        folder
+        / f"{experiment_name}.pth"
+    )
+
+    if preferred.is_file():
+        return preferred
+
+    if not folder.is_dir():
+        return None
+
+    try:
+        candidates = sorted(
+            folder.glob(
+                "*.pth"
+            ),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    return (
+        candidates[0]
+        if candidates
+        else None
+    )
+
+
+def _find_experiment_index(
+    experiment_name: str,
+) -> Path | None:
+    permanent = (
+        trained_models_root()
+        / experiment_name
+    )
+
+    if permanent.is_dir():
+        try:
+            candidates = sorted(
+                permanent.glob(
+                    "*.index"
+                ),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+        except OSError:
+            candidates = []
+
+        if candidates:
+            return candidates[0]
+
+    shared = (
+        rvc_root()
+        / "assets"
+        / "indices"
+    )
+
+    if not shared.is_dir():
+        return None
+
+    try:
+        candidates = sorted(
+            shared.glob(
+                f"*{experiment_name}*.index"
+            ),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    return (
+        candidates[0]
+        if candidates
+        else None
+    )
+
+
+def _experiment_modified_timestamp(
+    paths: list[Path | None],
+) -> float:
+    values: list[float] = []
+
+    for path in paths:
+        if path is None:
+            continue
+
+        try:
+            values.append(
+                path.stat().st_mtime
+            )
+        except OSError:
+            continue
+
+    return (
+        max(values)
+        if values
+        else 0.0
+    )
+
+
+def scan_training_experiments() -> list[RVCExperimentInfo]:
+    logs_root = (
+        rvc_root()
+        / "logs"
+    )
+
+    if not logs_root.is_dir():
+        return []
+
+    results: list[RVCExperimentInfo] = []
+
+    try:
+        children = sorted(
+            (
+                path
+                for path in logs_root.iterdir()
+                if path.is_dir()
+            ),
+            key=lambda path: path.name.lower(),
+        )
+    except OSError:
+        return []
+
+    for exp_dir in children:
+        name = exp_dir.name
+
+        if (
+            name.lower() == "mute"
+            or name.startswith(".")
+        ):
+            continue
+
+        try:
+            generators = list(
+                exp_dir.glob(
+                    "G_*.pth"
+                )
+            )
+            discriminators = list(
+                exp_dir.glob(
+                    "D_*.pth"
+                )
+            )
+        except OSError:
+            generators = []
+            discriminators = []
+
+        dataset_dir, dataset_count = (
+            _read_experiment_manifest(
+                exp_dir
+            )
+        )
+
+        if dataset_count is None:
+            dataset_count = (
+                _infer_pre_v22_dataset_count(
+                    exp_dir
+                )
+            )
+
+        final_model = (
+            _find_experiment_final_model(
+                name
+            )
+        )
+        index_path = (
+            _find_experiment_index(
+                name
+            )
+        )
+
+        # Ignore unrelated/empty RVC log folders.
+        has_relevant_data = bool(
+            generators
+            or discriminators
+            or dataset_dir is not None
+            or dataset_count is not None
+            or final_model is not None
+            or index_path is not None
+            or (
+                exp_dir
+                / "config.json"
+            ).is_file()
+            or (
+                exp_dir
+                / "filelist.txt"
+            ).is_file()
+        )
+
+        if not has_relevant_data:
+            continue
+
+        results.append(
+            RVCExperimentInfo(
+                name=name,
+                experiment_dir=exp_dir,
+                dataset_dir=dataset_dir,
+                dataset_file_count=dataset_count,
+                dataset_path_exists=(
+                    _safe_path_exists(
+                        dataset_dir
+                    )
+                ),
+                generator_checkpoints=len(
+                    generators
+                ),
+                discriminator_checkpoints=len(
+                    discriminators
+                ),
+                estimated_epoch=(
+                    _estimated_experiment_epoch(
+                        name
+                    )
+                ),
+                final_model_path=final_model,
+                index_path=index_path,
+                modified_timestamp=(
+                    _experiment_modified_timestamp(
+                        [
+                            exp_dir,
+                            final_model,
+                            index_path,
+                            *generators,
+                            *discriminators,
+                        ]
+                    )
+                ),
+            )
+        )
+
+    results.sort(
+        key=lambda item: (
+            -item.modified_timestamp,
+            item.name.lower(),
+        )
+    )
+
+    return results
+
+
+def get_training_experiment(
+    experiment_name: str,
+) -> RVCExperimentInfo | None:
+    name = str(
+        experiment_name
+    ).strip()
+
+    if not name:
+        return None
+
+    for info in scan_training_experiments():
+        if info.name == name:
+            return info
+
+    return None
+
+
+def experiment_list_label(
+    info: RVCExperimentInfo,
+) -> str:
+    epoch_text = (
+        f"{info.estimated_epoch}ep"
+        if info.estimated_epoch is not None
+        else "?ep"
+    )
+
+    data_text = (
+        str(
+            info.dataset_file_count
+        )
+        if info.dataset_file_count is not None
+        else "?"
+    )
+
+    checkpoint_text = (
+        "CKPT✓"
+        if info.has_checkpoint_pair
+        else "CKPT-"
+    )
+    model_text = (
+        "MODEL✓"
+        if info.final_model_path is not None
+        else "MODEL-"
+    )
+    index_text = (
+        "INDEX✓"
+        if info.index_path is not None
+        else "INDEX-"
+    )
+
+    return (
+        f"{info.name} | {epoch_text} | data {data_text} | "
+        f"{checkpoint_text} {model_text} {index_text}"
+    )
+
+
+def experiment_detail_text(
+    info: RVCExperimentInfo,
+) -> str:
+    checkpoint_text = (
+        f"G {info.generator_checkpoints} / D {info.discriminator_checkpoints}"
+        if (
+            info.generator_checkpoints
+            or info.discriminator_checkpoints
+        )
+        else "없음"
+    )
+
+    epoch_text = (
+        str(
+            info.estimated_epoch
+        )
+        if info.estimated_epoch is not None
+        else "중간 weight 이름에서 확인 불가"
+    )
+
+    if info.dataset_dir is None:
+        dataset_text = (
+            "경로 기록 없음"
+        )
+    else:
+        exists_text = (
+            "경로 정상"
+            if info.dataset_path_exists
+            else "현재 경로를 찾을 수 없음"
+        )
+        dataset_text = (
+            f"{info.dataset_dir} "
+            f"({exists_text})"
+        )
+
+    count_text = (
+        str(
+            info.dataset_file_count
+        )
+        if info.dataset_file_count is not None
+        else "알 수 없음"
+    )
+
+    model_text = (
+        str(
+            info.final_model_path
+        )
+        if info.final_model_path is not None
+        else "없음"
+    )
+
+    index_text = (
+        str(
+            info.index_path
+        )
+        if info.index_path is not None
+        else "없음"
+    )
+
+    return (
+        f"실험: {info.name}\n"
+        f"체크포인트: {checkpoint_text} / 추정 저장 epoch: {epoch_text}\n"
+        f"학습 데이터: {dataset_text} / 기록 파일 수: {count_text}\n"
+        f"변환 모델: {model_text}\n"
+        f"Feature Index: {index_text}"
     )
 
 

@@ -85,7 +85,10 @@ from rvc_trainer import (
     TRAINING_MODE_NEW,
     TRAINING_MODE_RESUME,
     dataset_status_text,
+    experiment_detail_text,
+    experiment_list_label,
     experiment_status_text,
+    scan_training_experiments,
     training_assets_status,
 )
 from batch_vocal_extractor import (
@@ -95,8 +98,9 @@ from batch_vocal_extractor import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.2 / RVC Fine-tune"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.3 / RVC Experiment Browser"
 
+# V23_RVC_EXPERIMENT_BROWSER_PATCH
 # V22_RVC_FINETUNE_PATCH
 # V21_BATCH_VOCAL_DATASET_PATCH
 # V20_RVC_TRAINING_PATCH
@@ -1070,6 +1074,51 @@ class MainWindow(QMainWindow):
             training_option_group
         )
 
+        self.rvc_training_experiment_combo = QComboBox()
+        self.rvc_training_experiment_combo.setMinimumContentsLength(
+            36
+        )
+        self.rvc_training_experiment_combo.currentIndexChanged.connect(
+            self.on_rvc_training_experiment_selected
+        )
+
+        self.rvc_training_experiment_refresh_button = QPushButton(
+            "새로고침"
+        )
+        self.rvc_training_experiment_refresh_button.clicked.connect(
+            self.refresh_rvc_training_experiment_list
+        )
+
+        experiment_picker_widget = QWidget()
+        experiment_picker_layout = QHBoxLayout(
+            experiment_picker_widget
+        )
+        experiment_picker_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+        experiment_picker_layout.addWidget(
+            self.rvc_training_experiment_combo,
+            1,
+        )
+        experiment_picker_layout.addWidget(
+            self.rvc_training_experiment_refresh_button
+        )
+
+        self.rvc_training_experiment_detail_label = QLabel(
+            "기존 실험을 자동 검색합니다."
+        )
+        self.rvc_training_experiment_detail_label.setWordWrap(
+            True
+        )
+        self.rvc_training_experiment_detail_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self.rvc_training_experiment_cache = {}
+
         self.rvc_training_mode_combo = QComboBox()
         self.rvc_training_mode_combo.addItem(
             "새 모델 학습",
@@ -1171,6 +1220,14 @@ class MainWindow(QMainWindow):
             True
         )
 
+        training_option_layout.addRow(
+            "기존 실험",
+            experiment_picker_widget,
+        )
+        training_option_layout.addRow(
+            "",
+            self.rvc_training_experiment_detail_label,
+        )
         training_option_layout.addRow(
             "학습 방식",
             self.rvc_training_mode_combo,
@@ -1297,6 +1354,7 @@ class MainWindow(QMainWindow):
             1,
         )
 
+        self.refresh_rvc_training_experiment_list()
         self.on_rvc_training_mode_changed()
         self.refresh_rvc_training_experiment_status()
         self.refresh_rvc_training_status()
@@ -3803,6 +3861,210 @@ class MainWindow(QMainWindow):
             running
         )
 
+    def refresh_rvc_training_experiment_list(
+        self,
+        *_args,
+        select_name: str | None = None,
+    ):
+        if not hasattr(
+            self,
+            "rvc_training_experiment_combo",
+        ):
+            return
+
+        current_name = (
+            select_name
+            or self.settings.value(
+                "rvc_training_selected_experiment",
+                "",
+                type=str,
+            )
+            or (
+                self.rvc_training_name_edit.text().strip()
+                if hasattr(
+                    self,
+                    "rvc_training_name_edit",
+                )
+                else ""
+            )
+        )
+
+        try:
+            experiments = (
+                scan_training_experiments()
+            )
+        except Exception as exc:
+            experiments = []
+            self.rvc_training_experiment_detail_label.setText(
+                "기존 실험 검색 실패: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        self.rvc_training_experiment_cache = {
+            info.name: info
+            for info in experiments
+        }
+
+        combo = (
+            self.rvc_training_experiment_combo
+        )
+        combo.blockSignals(
+            True
+        )
+        combo.clear()
+        combo.addItem(
+            "＋ 새 모델 / 모델 이름 직접 입력",
+            "",
+        )
+
+        selected_index = 0
+
+        for info in experiments:
+            combo.addItem(
+                experiment_list_label(
+                    info
+                ),
+                info.name,
+            )
+
+            if info.name == current_name:
+                selected_index = (
+                    combo.count()
+                    - 1
+                )
+
+        combo.setCurrentIndex(
+            selected_index
+        )
+        combo.blockSignals(
+            False
+        )
+
+        if selected_index > 0:
+            self.on_rvc_training_experiment_selected()
+        else:
+            self.rvc_training_experiment_detail_label.setText(
+                (
+                    f"검색된 기존 실험: {len(experiments)}개. "
+                    "기존 실험을 선택하면 모델 이름과 기록된 데이터셋 경로를 자동으로 불러옵니다."
+                )
+            )
+
+    def on_rvc_training_experiment_selected(
+        self,
+        *_args,
+    ):
+        if not hasattr(
+            self,
+            "rvc_training_experiment_combo",
+        ):
+            return
+
+        name = str(
+            self.rvc_training_experiment_combo.currentData()
+            or ""
+        ).strip()
+
+        if not name:
+            self.settings.setValue(
+                "rvc_training_selected_experiment",
+                "",
+            )
+
+            if (
+                self._current_rvc_training_mode()
+                != TRAINING_MODE_NEW
+            ):
+                new_index = (
+                    self.rvc_training_mode_combo.findData(
+                        TRAINING_MODE_NEW
+                    )
+                )
+
+                if new_index >= 0:
+                    self.rvc_training_mode_combo.setCurrentIndex(
+                        new_index
+                    )
+
+            self.rvc_training_experiment_detail_label.setText(
+                "새 모델 이름을 직접 입력하세요. 기존 실험 체크포인트와 연결되지 않습니다."
+            )
+            return
+
+        info = (
+            self.rvc_training_experiment_cache.get(
+                name
+            )
+        )
+
+        if info is None:
+            self.rvc_training_experiment_detail_label.setText(
+                f"실험 정보를 다시 찾을 수 없습니다: {name}"
+            )
+            return
+
+        self.settings.setValue(
+            "rvc_training_selected_experiment",
+            name,
+        )
+
+        self.rvc_training_name_edit.setText(
+            name
+        )
+
+        # Existing experiment selected while still in "new" mode:
+        # switch to safe resume mode automatically.
+        if (
+            self._current_rvc_training_mode()
+            == TRAINING_MODE_NEW
+            and info.has_checkpoint_pair
+        ):
+            resume_index = (
+                self.rvc_training_mode_combo.findData(
+                    TRAINING_MODE_RESUME
+                )
+            )
+
+            if resume_index >= 0:
+                self.rvc_training_mode_combo.setCurrentIndex(
+                    resume_index
+                )
+
+        if info.dataset_dir is not None:
+            dataset_text = str(
+                info.dataset_dir
+            )
+
+            self.settings.setValue(
+                "rvc_training_dataset_dir",
+                dataset_text,
+            )
+            self.rvc_training_dataset_label.setText(
+                dataset_text
+            )
+
+            if info.dataset_path_exists:
+                self.rvc_training_dataset_status.setText(
+                    dataset_status_text(
+                        info.dataset_dir
+                    )
+                )
+            else:
+                self.rvc_training_dataset_status.setText(
+                    (
+                        "이 실험에 기록된 데이터셋 경로를 현재 찾을 수 없습니다. "
+                        "드라이브 연결/경로를 확인하거나 아래 '폴더 선택'으로 새 위치를 지정하세요."
+                    )
+                )
+
+        self.rvc_training_experiment_detail_label.setText(
+            experiment_detail_text(
+                info
+            )
+        )
+
+        self.refresh_rvc_training_experiment_status()
+
     def _current_rvc_training_mode(
         self,
     ) -> str:
@@ -4254,6 +4516,13 @@ class MainWindow(QMainWindow):
         )
         self.refresh_rvc_training_status()
         self.refresh_rvc_training_experiment_status()
+
+        current_name = (
+            self.rvc_training_name_edit.text().strip()
+        )
+        self.refresh_rvc_training_experiment_list(
+            select_name=current_name,
+        )
 
     def _current_transpose_engine(self) -> str:
         if not hasattr(
