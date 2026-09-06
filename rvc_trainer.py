@@ -50,6 +50,7 @@ class RVCExperimentInfo:
         )
 
 
+# V29_FINETUNE_LEAD_LINEAGE_HOTFIX
 # V23_RVC_EXPERIMENT_BROWSER_PATCH
 # V23_RVC_FINETUNE_INDEX_REFRESH_HOTFIX
 # V22_RVC_FINETUNE_PATCH
@@ -71,6 +72,7 @@ DERIVED_TRAINING_DIRS = (
 )
 
 DATASET_MANIFEST_NAME = "vocal_pitch_dataset_manifest.json"
+LEAD_CLEAN_MANIFEST_NAME = ".rvc_lead_clean_manifest.json"
 
 
 SUPPORTED_DATASET_EXTENSIONS = {
@@ -1348,6 +1350,172 @@ class RVCTrainingPipeline:
                 "데이터를 추가했다면 '데이터 추가 후 파인튜닝'을 사용하세요."
             )
 
+    def _lead_clean_lineage_names_from_dir(
+        self,
+        dataset_dir: Path,
+    ) -> set[str]:
+        """
+        Return original source names recorded by the v2.8
+        Training Lead Dataset Cleaner.
+
+        A cleaned file such as:
+            song_vocals_lead.wav
+
+        can therefore be matched to the original:
+            song_vocals.wav
+        """
+        try:
+            dataset = Path(
+                dataset_dir
+            ).expanduser().resolve()
+        except Exception:
+            return set()
+
+        manifest_path = (
+            dataset
+            / LEAD_CLEAN_MANIFEST_NAME
+        )
+
+        if not manifest_path.is_file():
+            return set()
+
+        try:
+            data = json.loads(
+                manifest_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+        except Exception as exc:
+            self._log(
+                "[WARN][LEAD LINEAGE] Lead Cleaner manifest 읽기 실패: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return set()
+
+        records = data.get(
+            "files",
+            [],
+        )
+
+        if not isinstance(
+            records,
+            list,
+        ):
+            return set()
+
+        names: set[str] = set()
+
+        for record in records:
+            if not isinstance(
+                record,
+                dict,
+            ):
+                continue
+
+            raw_name = str(
+                record.get(
+                    "source_name",
+                    "",
+                )
+            ).strip()
+
+            if not raw_name:
+                raw_path = str(
+                    record.get(
+                        "source_path",
+                        "",
+                    )
+                ).strip()
+
+                if raw_path:
+                    try:
+                        raw_name = Path(
+                            raw_path
+                        ).name
+                    except Exception:
+                        raw_name = ""
+
+            if raw_name:
+                names.add(
+                    raw_name
+                )
+
+        if names:
+            self._log(
+                "[LEAD LINEAGE] Cleaner manifest 원본 계보 "
+                f"{len(names)}개 확인"
+            )
+
+        return names
+
+    def _previous_finetune_lineage_names(
+        self,
+        previous: dict,
+    ) -> set[str]:
+        raw_dataset = str(
+            previous.get(
+                "dataset_dir",
+                "",
+            )
+        ).strip()
+
+        if raw_dataset:
+            lineage = (
+                self._lead_clean_lineage_names_from_dir(
+                    Path(
+                        raw_dataset
+                    )
+                )
+            )
+
+            if lineage:
+                return lineage
+
+        return {
+            str(
+                item.get(
+                    "name",
+                    "",
+                )
+            )
+            for item in previous.get(
+                "files",
+                [],
+            )
+            if (
+                isinstance(
+                    item,
+                    dict,
+                )
+                and item.get(
+                    "name"
+                )
+            )
+        }
+
+    def _current_finetune_lineage_names(
+        self,
+        files: list[Path],
+    ) -> set[str]:
+        if not files:
+            return set()
+
+        lineage = (
+            self._lead_clean_lineage_names_from_dir(
+                files[
+                    0
+                ].parent
+            )
+        )
+
+        if lineage:
+            return lineage
+
+        return {
+            path.name
+            for path in files
+        }
+
     def _validate_finetune_dataset(
         self,
         exp_dir: Path,
@@ -1358,50 +1526,91 @@ class RVCTrainingPipeline:
         )
 
         if previous is not None:
-            old_names = {
-                str(item.get("name", ""))
-                for item in previous.get(
-                    "files",
-                    [],
+            previous_names = (
+                self._previous_finetune_lineage_names(
+                    previous
                 )
-                if item.get("name")
-            }
-            current_names = {
-                path.name
-                for path in files
-            }
+            )
+            current_names = (
+                self._current_finetune_lineage_names(
+                    files
+                )
+            )
 
             missing = sorted(
-                old_names
+                previous_names
                 - current_names
             )
 
             if missing:
                 preview = ", ".join(
-                    missing[:5]
+                    missing[
+                        :5
+                    ]
                 )
 
-                if len(missing) > 5:
+                if len(
+                    missing
+                ) > 5:
                     preview += (
                         f" 외 {len(missing) - 5}개"
                     )
 
                 raise RVCTrainingError(
                     "데이터 추가 파인튜닝에서는 기존 데이터 + 신규 데이터가 "
-                    "모두 같은 데이터셋 폴더에 있어야 합니다.\n\n"
-                    f"이전 데이터 중 현재 폴더에서 찾지 못한 파일: {preview}"
+                    "모두 같은 데이터셋 계보에 있어야 합니다.\n\n"
+                    "Lead Cleaner 정제본은 _lead.wav 파일명 자체가 아니라 "
+                    "Cleaner manifest의 source_name/source_path를 기준으로 비교합니다.\n\n"
+                    f"이전 데이터 중 현재 계보에서 찾지 못한 파일: {preview}"
                 )
 
             added = (
                 current_names
-                - old_names
+                - previous_names
             )
 
+            current_file_names = {
+                path.name
+                for path in files
+            }
+
+            if (
+                current_names
+                != current_file_names
+            ):
+                self._log(
+                    "[FINETUNE][LEAD LINEAGE] Lead Cleaner 정제본 감지 - "
+                    "정제 파일명이 아니라 원본 source lineage로 검증했습니다."
+                )
+
             self._log(
-                "[FINETUNE] 이전 데이터 "
-                f"{len(old_names)}개 / 현재 {len(current_names)}개 / "
+                "[FINETUNE] 이전 데이터 계보 "
+                f"{len(previous_names)}개 / "
+                f"현재 계보 {len(current_names)}개 / "
                 f"추가 감지 {len(added)}개"
             )
+
+            if added:
+                added_preview = ", ".join(
+                    sorted(
+                        added
+                    )[
+                        :5
+                    ]
+                )
+
+                if len(
+                    added
+                ) > 5:
+                    added_preview += (
+                        f" 외 {len(added) - 5}개"
+                    )
+
+                self._log(
+                    "[FINETUNE] 신규 데이터 계보: "
+                    + added_preview
+                )
+
             return
 
         old_count = self._infer_old_source_count(
