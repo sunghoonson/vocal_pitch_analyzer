@@ -13,6 +13,9 @@ import soundfile as sf
 
 LogCallback = Callable[[str], None]
 
+# V25_RVC_ARTIFACT_GUARD_PATCH
+GUARD_VERSION = "2.5"
+
 SENSITIVITY_LABELS = {
     "low": "낮음",
     "medium": "보통",
@@ -35,6 +38,16 @@ class HarmonyGuardReport:
     fallback_gain: float
     alignment_ms: float
     risky_regions: list[tuple[float, float]]
+    guard_version: str = GUARD_VERSION
+    artifact_guard_enabled: bool = True
+    artifact_detected_seconds: float = 0.0
+    artifact_strong_seconds: float = 0.0
+    artifact_region_count: int = 0
+    artifact_f0_mismatch_count: int = 0
+    artifact_output_jump_count: int = 0
+    artifact_voicing_mismatch_seconds: float = 0.0
+    mean_artifact_risk: float = 0.0
+    max_artifact_risk: float = 0.0
 
 
 def _emit(
@@ -540,6 +553,959 @@ def _regions_from_mask(
             )
 
     return regions
+
+
+
+def _mono_audio(
+    data: np.ndarray,
+) -> np.ndarray:
+    array = np.asarray(
+        data,
+        dtype=np.float32,
+    )
+
+    if array.ndim == 1:
+        return array
+
+    if array.ndim != 2:
+        return np.reshape(
+            array,
+            (-1,),
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+    return np.mean(
+        array,
+        axis=1,
+        dtype=np.float32,
+    )
+
+
+def _analysis_resample(
+    mono: np.ndarray,
+    original_sr: int,
+    analysis_sr: int,
+) -> np.ndarray:
+    if int(
+        original_sr
+    ) == int(
+        analysis_sr
+    ):
+        return mono.astype(
+            np.float32,
+            copy=False,
+        )
+
+    return librosa.resample(
+        mono.astype(
+            np.float32,
+            copy=False,
+        ),
+        orig_sr=int(
+            original_sr
+        ),
+        target_sr=int(
+            analysis_sr
+        ),
+        res_type="soxr_hq",
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _safe_peak_normalize(
+    values: np.ndarray,
+) -> np.ndarray:
+    peak = float(
+        np.max(
+            np.abs(
+                values
+            )
+        )
+    ) if values.size else 0.0
+
+    if peak <= 1e-8:
+        return values.astype(
+            np.float32,
+            copy=True,
+        )
+
+    return (
+        values
+        / peak
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _midi_from_f0(
+    f0: np.ndarray,
+) -> np.ndarray:
+    result = np.full(
+        f0.size,
+        np.nan,
+        dtype=np.float32,
+    )
+
+    valid = np.isfinite(
+        f0
+    ) & (
+        f0 > 0.0
+    )
+
+    result[
+        valid
+    ] = (
+        69.0
+        + 12.0
+        * np.log2(
+            f0[
+                valid
+            ]
+            / 440.0
+        )
+    )
+
+    return result
+
+
+def _differential_output_jump_risk(
+    reference_f0: np.ndarray,
+    rvc_f0: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    count = min(
+        reference_f0.size,
+        rvc_f0.size,
+    )
+    risk = np.zeros(
+        count,
+        dtype=np.float32,
+    )
+
+    ref_midi = _midi_from_f0(
+        reference_f0[
+            :count
+        ]
+    )
+    out_midi = _midi_from_f0(
+        rvc_f0[
+            :count
+        ]
+    )
+
+    jump_count = 0
+
+    for index in range(
+        1,
+        max(
+            1,
+            count - 1,
+        ),
+    ):
+        if (
+            index + 1 >= count
+            or not np.isfinite(
+                ref_midi[
+                    index - 1:
+                    index + 2
+                ]
+            ).all()
+            or not np.isfinite(
+                out_midi[
+                    index - 1:
+                    index + 2
+                ]
+            ).all()
+        ):
+            continue
+
+        ref_before = float(
+            ref_midi[
+                index - 1
+            ]
+        )
+        ref_current = float(
+            ref_midi[
+                index
+            ]
+        )
+        ref_after = float(
+            ref_midi[
+                index + 1
+            ]
+        )
+
+        out_before = float(
+            out_midi[
+                index - 1
+            ]
+        )
+        out_current = float(
+            out_midi[
+                index
+            ]
+        )
+        out_after = float(
+            out_midi[
+                index + 1
+            ]
+        )
+
+        reference_change = max(
+            abs(
+                ref_current
+                - ref_before
+            ),
+            abs(
+                ref_after
+                - ref_current
+            ),
+        )
+
+        output_jump = abs(
+            out_current
+            - out_before
+        )
+        output_returns = abs(
+            out_after
+            - out_before
+        )
+
+        # Directly target "RVC alone jumped to a wrong note and returned".
+        if (
+            output_jump >= 4.0
+            and reference_change <= 2.5
+            and output_returns <= 2.5
+        ):
+            severity = np.clip(
+                (
+                    output_jump
+                    - 3.0
+                )
+                / 8.0,
+                0.0,
+                1.0,
+            )
+
+            risk[
+                index
+            ] = max(
+                risk[
+                    index
+                ],
+                float(
+                    0.80
+                    + 0.20
+                    * severity
+                ),
+            )
+            jump_count += 1
+
+    return (
+        risk,
+        jump_count,
+    )
+
+
+def _chroma_similarity(
+    reference_power: np.ndarray,
+    rvc_power: np.ndarray,
+    sr: int,
+    *,
+    n_fft: int,
+) -> np.ndarray:
+    reference_chroma = (
+        librosa.feature.chroma_stft(
+            S=reference_power,
+            sr=int(
+                sr
+            ),
+            n_fft=int(
+                n_fft
+            ),
+        )
+    )
+    rvc_chroma = (
+        librosa.feature.chroma_stft(
+            S=rvc_power,
+            sr=int(
+                sr
+            ),
+            n_fft=int(
+                n_fft
+            ),
+        )
+    )
+
+    count = min(
+        reference_chroma.shape[1],
+        rvc_chroma.shape[1],
+    )
+
+    if count <= 0:
+        return np.zeros(
+            0,
+            dtype=np.float32,
+        )
+
+    reference_chroma = reference_chroma[
+        :,
+        :count,
+    ].astype(
+        np.float32,
+        copy=False,
+    )
+    rvc_chroma = rvc_chroma[
+        :,
+        :count,
+    ].astype(
+        np.float32,
+        copy=False,
+    )
+
+    reference_norm = np.linalg.norm(
+        reference_chroma,
+        axis=0,
+    )
+    rvc_norm = np.linalg.norm(
+        rvc_chroma,
+        axis=0,
+    )
+
+    denominator = np.maximum(
+        reference_norm
+        * rvc_norm,
+        1e-8,
+    )
+
+    similarity = np.sum(
+        reference_chroma
+        * rvc_chroma,
+        axis=0,
+    ) / denominator
+
+    return np.clip(
+        similarity,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _artifact_risk_to_fallback(
+    risk: np.ndarray,
+    sensitivity: str,
+) -> np.ndarray:
+    sensitivity = (
+        sensitivity
+        if sensitivity in SENSITIVITY_LABELS
+        else "medium"
+    )
+
+    # Artifact Guard intentionally reacts earlier than the input-only
+    # Harmony Guard because it compares the already-generated RVC output
+    # against a same-key reference.
+    thresholds = {
+        "low": (
+            0.58,
+            0.88,
+        ),
+        "medium": (
+            0.36,
+            0.72,
+        ),
+        "high": (
+            0.24,
+            0.58,
+        ),
+    }
+
+    start, full = (
+        thresholds[
+            sensitivity
+        ]
+    )
+
+    scaled = (
+        risk
+        - start
+    ) / max(
+        1e-6,
+        full - start,
+    )
+
+    return (
+        _smoothstep(
+            scaled
+        )
+        * 0.98
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def analyze_rvc_artifact_risk(
+    rvc_data: np.ndarray,
+    reference_data: np.ndarray,
+    sample_rate: int,
+    *,
+    sensitivity: str = "medium",
+    crossfade_ms: int = 500,
+    analysis_sr: int = 22050,
+    log_callback: LogCallback | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict,
+]:
+    sensitivity = (
+        sensitivity
+        if sensitivity in SENSITIVITY_LABELS
+        else "medium"
+    )
+
+    _emit(
+        log_callback,
+        (
+            "[Artifact Guard] 2차 RVC 출력 검증 시작 "
+            f"(민감도={SENSITIVITY_LABELS[sensitivity]})"
+        ),
+    )
+
+    rvc_mono = _analysis_resample(
+        _mono_audio(
+            rvc_data
+        ),
+        int(
+            sample_rate
+        ),
+        int(
+            analysis_sr
+        ),
+    )
+    reference_mono = _analysis_resample(
+        _mono_audio(
+            reference_data
+        ),
+        int(
+            sample_rate
+        ),
+        int(
+            analysis_sr
+        ),
+    )
+
+    target_length = min(
+        rvc_mono.size,
+        reference_mono.size,
+    )
+
+    rvc_mono = rvc_mono[
+        :target_length
+    ]
+    reference_mono = reference_mono[
+        :target_length
+    ]
+
+    rvc_mono = _safe_peak_normalize(
+        rvc_mono
+    )
+    reference_mono = _safe_peak_normalize(
+        reference_mono
+    )
+
+    frame_length = 2048
+    hop_length = 512
+    n_fft = 2048
+
+    reference_f0, _, reference_probability = (
+        librosa.pyin(
+            reference_mono,
+            fmin=65.0,
+            fmax=1600.0,
+            sr=int(
+                analysis_sr
+            ),
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+    )
+    rvc_f0, _, rvc_probability = (
+        librosa.pyin(
+            rvc_mono,
+            fmin=65.0,
+            fmax=1600.0,
+            sr=int(
+                analysis_sr
+            ),
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
+    )
+
+    reference_magnitude = np.abs(
+        librosa.stft(
+            reference_mono,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            center=True,
+        )
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+    rvc_magnitude = np.abs(
+        librosa.stft(
+            rvc_mono,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=n_fft,
+            center=True,
+        )
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    reference_power = (
+        reference_magnitude
+        * reference_magnitude
+    )
+    rvc_power = (
+        rvc_magnitude
+        * rvc_magnitude
+    )
+
+    reference_rms = librosa.feature.rms(
+        y=reference_mono,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        center=True,
+    )[
+        0
+    ]
+
+    chroma_similarity = _chroma_similarity(
+        reference_power,
+        rvc_power,
+        int(
+            analysis_sr
+        ),
+        n_fft=n_fft,
+    )
+
+    count = min(
+        reference_f0.size,
+        rvc_f0.size,
+        reference_probability.size,
+        rvc_probability.size,
+        reference_power.shape[1],
+        rvc_power.shape[1],
+        reference_rms.size,
+        chroma_similarity.size,
+    )
+
+    reference_f0 = reference_f0[
+        :count
+    ]
+    rvc_f0 = rvc_f0[
+        :count
+    ]
+    reference_probability = np.nan_to_num(
+        reference_probability[
+            :count
+        ],
+        nan=0.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+    rvc_probability = np.nan_to_num(
+        rvc_probability[
+            :count
+        ],
+        nan=0.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+    reference_power = reference_power[
+        :,
+        :count,
+    ]
+    rvc_power = rvc_power[
+        :,
+        :count,
+    ]
+    reference_rms = reference_rms[
+        :count
+    ].astype(
+        np.float32,
+        copy=False,
+    )
+    chroma_similarity = chroma_similarity[
+        :count
+    ]
+
+    reference_rms_db = (
+        20.0
+        * np.log10(
+            np.maximum(
+                reference_rms,
+                1e-8,
+            )
+        )
+    )
+    reference_db = float(
+        np.percentile(
+            reference_rms_db,
+            95,
+        )
+    )
+    active = (
+        reference_rms_db
+        >= (
+            reference_db
+            - 42.0
+        )
+    )
+
+    reference_midi = _midi_from_f0(
+        reference_f0
+    )
+    rvc_midi = _midi_from_f0(
+        rvc_f0
+    )
+
+    both_valid = (
+        np.isfinite(
+            reference_midi
+        )
+        & np.isfinite(
+            rvc_midi
+        )
+        & active
+    )
+
+    midi_error = np.zeros(
+        count,
+        dtype=np.float32,
+    )
+    midi_error[
+        both_valid
+    ] = np.abs(
+        rvc_midi[
+            both_valid
+        ]
+        - reference_midi[
+            both_valid
+        ]
+    )
+
+    pitch_risk = np.clip(
+        (
+            midi_error
+            - 0.65
+        )
+        / 4.35,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    # A same-key Pitch-only reference is confidently voiced while RVC has
+    # lost the voice or pyIN confidence collapsed.
+    reference_confident = (
+        reference_probability
+        >= 0.62
+    ) & active
+
+    rvc_missing = (
+        ~np.isfinite(
+            rvc_f0
+        )
+    ) | (
+        rvc_probability
+        < 0.20
+    )
+
+    voicing_mismatch = (
+        reference_confident
+        & rvc_missing
+    )
+
+    confidence_drop_risk = np.clip(
+        (
+            reference_probability
+            - rvc_probability
+            - 0.12
+        )
+        / 0.50,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    frequencies = librosa.fft_frequencies(
+        sr=int(
+            analysis_sr
+        ),
+        n_fft=n_fft,
+    )
+    rvc_coverage = _harmonic_coverage(
+        rvc_power,
+        frequencies,
+        rvc_f0,
+    )
+    coverage_risk = np.clip(
+        (
+            0.80
+            - rvc_coverage
+        )
+        / 0.48,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    chroma_risk = np.clip(
+        (
+            0.82
+            - chroma_similarity
+        )
+        / 0.42,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    jump_risk, output_jump_count = (
+        _differential_output_jump_risk(
+            reference_f0,
+            rvc_f0,
+        )
+    )
+
+    artifact_risk = (
+        pitch_risk
+        * 0.54
+        + confidence_drop_risk
+        * 0.16
+        + coverage_risk
+        * 0.14
+        + chroma_risk
+        * 0.16
+    )
+
+    artifact_risk = np.maximum(
+        artifact_risk,
+        jump_risk,
+    )
+
+    artifact_risk[
+        voicing_mismatch
+    ] = np.maximum(
+        artifact_risk[
+            voicing_mismatch
+        ],
+        0.94,
+    )
+
+    artifact_risk[
+        ~active
+    ] = 0.0
+
+    frame_seconds = (
+        hop_length
+        / float(
+            analysis_sr
+        )
+    )
+
+    # Expand around an actually-detected output failure, then smooth the
+    # transition.  This keeps short "삑사리" events from being averaged away.
+    dilation_radius = max(
+        1,
+        int(
+            round(
+                min(
+                    0.18,
+                    max(
+                        0.06,
+                        crossfade_ms
+                        / 1000.0
+                        * 0.30,
+                    ),
+                )
+                / frame_seconds
+            )
+        ),
+    )
+    artifact_risk = _moving_max(
+        artifact_risk,
+        dilation_radius,
+    )
+
+    fallback = _artifact_risk_to_fallback(
+        artifact_risk,
+        sensitivity,
+    )
+
+    transition_radius = max(
+        1,
+        int(
+            round(
+                min(
+                    0.20,
+                    max(
+                        0.04,
+                        crossfade_ms
+                        / 1000.0
+                        * 0.22,
+                    ),
+                )
+                / frame_seconds
+            )
+        ),
+    )
+    fallback = _moving_max(
+        fallback,
+        max(
+            1,
+            transition_radius // 2,
+        ),
+    )
+    fallback = _moving_average(
+        fallback,
+        transition_radius,
+    )
+    fallback = np.clip(
+        fallback,
+        0.0,
+        0.98,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    times = (
+        np.arange(
+            count,
+            dtype=np.float32,
+        )
+        * frame_seconds
+    )
+
+    mismatch_mask = (
+        midi_error
+        >= 1.5
+    ) & both_valid
+
+    mismatch_count = int(
+        np.sum(
+            mismatch_mask
+        )
+    )
+
+    voicing_mismatch_seconds = float(
+        np.sum(
+            voicing_mismatch
+        )
+        * frame_seconds
+    )
+
+    detected_seconds = float(
+        np.sum(
+            fallback
+            >= 0.15
+        )
+        * frame_seconds
+    )
+    strong_seconds = float(
+        np.sum(
+            fallback
+            >= 0.65
+        )
+        * frame_seconds
+    )
+
+    regions = _regions_from_mask(
+        fallback,
+        frame_seconds,
+        threshold=0.35,
+        min_seconds=0.08,
+    )
+
+    metrics = {
+        "artifact_detected_seconds": detected_seconds,
+        "artifact_strong_seconds": strong_seconds,
+        "artifact_region_count": len(
+            regions
+        ),
+        "artifact_f0_mismatch_count": mismatch_count,
+        "artifact_output_jump_count": int(
+            output_jump_count
+        ),
+        "artifact_voicing_mismatch_seconds": voicing_mismatch_seconds,
+        "mean_artifact_risk": float(
+            np.mean(
+                artifact_risk
+            )
+        ) if artifact_risk.size else 0.0,
+        "max_artifact_risk": float(
+            np.max(
+                artifact_risk
+            )
+        ) if artifact_risk.size else 0.0,
+    }
+
+    _emit(
+        log_callback,
+        (
+            "[Artifact Guard] 출력 검증 완료: "
+            f"감지 {detected_seconds:.1f}s / "
+            f"강한 우회 {strong_seconds:.1f}s / "
+            f"구간 {len(regions)}개 / "
+            f"F0 불일치 frame {mismatch_count} / "
+            f"RVC 단독 급변 {output_jump_count}건 / "
+            f"유성 소실 {voicing_mismatch_seconds:.1f}s"
+        ),
+    )
+
+    for start, end in regions[
+        :12
+    ]:
+        _emit(
+            log_callback,
+            (
+                "[Artifact Guard] RVC 이상 후보 "
+                f"{start:.2f}s ~ {end:.2f}s"
+            ),
+        )
+
+    return (
+        times,
+        fallback,
+        artifact_risk,
+        metrics,
+    )
 
 
 def analyze_harmony_risk(
@@ -1284,9 +2250,10 @@ def blend_adaptive_vocals(
         output_wav
     ).resolve()
 
+    # Pass 1: input-side harmony/polyphony/F0 stability.
     (
         frame_times,
-        fallback_ratio,
+        input_fallback_ratio,
         report,
     ) = analyze_harmony_risk(
         original,
@@ -1312,12 +2279,11 @@ def blend_adaptive_vocals(
 
     if rvc_data.size <= 0:
         raise RuntimeError(
-            "Harmony Guard용 RVC 출력이 비어 있습니다."
+            "Adaptive Guard용 RVC 출력이 비어 있습니다."
         )
-
     if fallback_data.size <= 0:
         raise RuntimeError(
-            "Harmony Guard용 Pitch-only 출력이 비어 있습니다."
+            "Adaptive Guard용 Pitch-only 출력이 비어 있습니다."
         )
 
     fallback_data = _resample_channels(
@@ -1383,6 +2349,106 @@ def blend_adaptive_vocals(
         int(
             rvc_sr
         ),
+    )
+
+    # Pass 2: direct RVC output validation against the same-key Pitch-only
+    # reference after temporal alignment.
+    try:
+        (
+            artifact_times,
+            artifact_fallback,
+            _artifact_risk,
+            artifact_metrics,
+        ) = analyze_rvc_artifact_risk(
+            rvc_data,
+            fallback_data,
+            int(
+                rvc_sr
+            ),
+            sensitivity=sensitivity,
+            crossfade_ms=crossfade_ms,
+            log_callback=log_callback,
+        )
+    except Exception as exc:
+        _emit(
+            log_callback,
+            (
+                "[Artifact Guard] 2차 출력 검증 실패 - "
+                "입력 Harmony Guard만 사용합니다: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+        artifact_times = np.zeros(
+            0,
+            dtype=np.float32,
+        )
+        artifact_fallback = np.zeros(
+            0,
+            dtype=np.float32,
+        )
+        artifact_metrics = {
+            "artifact_detected_seconds": 0.0,
+            "artifact_strong_seconds": 0.0,
+            "artifact_region_count": 0,
+            "artifact_f0_mismatch_count": 0,
+            "artifact_output_jump_count": 0,
+            "artifact_voicing_mismatch_seconds": 0.0,
+            "mean_artifact_risk": 0.0,
+            "max_artifact_risk": 0.0,
+        }
+
+    if (
+        frame_times.size > 1
+        and artifact_times.size > 1
+    ):
+        artifact_on_input_grid = np.interp(
+            frame_times.astype(
+                np.float64,
+                copy=False,
+            ),
+            artifact_times.astype(
+                np.float64,
+                copy=False,
+            ),
+            artifact_fallback.astype(
+                np.float64,
+                copy=False,
+            ),
+            left=float(
+                artifact_fallback[
+                    0
+                ]
+            ),
+            right=float(
+                artifact_fallback[
+                    -1
+                ]
+            ),
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+
+        # Either input analysis OR a directly observed RVC failure can
+        # trigger fallback.  Artifact Guard therefore catches cases that
+        # Harmony Guard missed completely.
+        fallback_ratio = np.maximum(
+            input_fallback_ratio,
+            artifact_on_input_grid,
+        ).astype(
+            np.float32,
+            copy=False,
+        )
+    else:
+        fallback_ratio = input_fallback_ratio.astype(
+            np.float32,
+            copy=True,
+        )
+
+    fallback_ratio = np.clip(
+        fallback_ratio,
+        0.0,
+        0.98,
     )
 
     rms_rvc = float(
@@ -1527,27 +2593,141 @@ def blend_adaptive_vocals(
     report.alignment_ms = float(
         alignment_ms
     )
+    report.artifact_guard_enabled = True
+    report.artifact_detected_seconds = float(
+        artifact_metrics[
+            "artifact_detected_seconds"
+        ]
+    )
+    report.artifact_strong_seconds = float(
+        artifact_metrics[
+            "artifact_strong_seconds"
+        ]
+    )
+    report.artifact_region_count = int(
+        artifact_metrics[
+            "artifact_region_count"
+        ]
+    )
+    report.artifact_f0_mismatch_count = int(
+        artifact_metrics[
+            "artifact_f0_mismatch_count"
+        ]
+    )
+    report.artifact_output_jump_count = int(
+        artifact_metrics[
+            "artifact_output_jump_count"
+        ]
+    )
+    report.artifact_voicing_mismatch_seconds = float(
+        artifact_metrics[
+            "artifact_voicing_mismatch_seconds"
+        ]
+    )
+    report.mean_artifact_risk = float(
+        artifact_metrics[
+            "mean_artifact_risk"
+        ]
+    )
+    report.max_artifact_risk = float(
+        artifact_metrics[
+            "max_artifact_risk"
+        ]
+    )
+
+    # Recompute final statistics from the COMBINED pass-1 + pass-2 mask.
+    frame_seconds = (
+        float(
+            frame_times[
+                1
+            ]
+            - frame_times[
+                0
+            ]
+        )
+        if frame_times.size > 1
+        else 0.0
+    )
+
+    if frame_seconds > 0.0:
+        report.safe_seconds = min(
+            report.duration_seconds,
+            float(
+                np.sum(
+                    fallback_ratio
+                    < 0.15
+                )
+                * frame_seconds
+            ),
+        )
+        report.blend_seconds = min(
+            report.duration_seconds,
+            float(
+                np.sum(
+                    (
+                        fallback_ratio
+                        >= 0.15
+                    )
+                    & (
+                        fallback_ratio
+                        < 0.65
+                    )
+                )
+                * frame_seconds
+            ),
+        )
+        report.fallback_seconds = min(
+            report.duration_seconds,
+            float(
+                np.sum(
+                    fallback_ratio
+                    >= 0.65
+                )
+                * frame_seconds
+            ),
+        )
+
+        final_regions = _regions_from_mask(
+            fallback_ratio,
+            frame_seconds,
+            threshold=0.35,
+            min_seconds=0.08,
+        )
+        report.risky_regions = final_regions
+        report.risky_region_count = len(
+            final_regions
+        )
 
     _emit(
         log_callback,
         (
-            "[Harmony Guard] Adaptive vocal 생성 완료: "
+            "[Adaptive Guard v2.5] 최종 적용: "
+            f"Pitch-only 강한 우회 {report.fallback_seconds:.1f}s / "
+            f"부분 Blend {report.blend_seconds:.1f}s / "
+            f"총 위험 구간 {report.risky_region_count}개 / "
+            f"2차 Artifact 구간 {report.artifact_region_count}개"
+        ),
+    )
+    _emit(
+        log_callback,
+        (
+            "[Adaptive Guard v2.5] Adaptive vocal 생성 완료: "
             f"fallback gain={gain:.3f}x, "
             f"alignment={alignment_ms:+.1f}ms"
         ),
     )
 
     try:
-        log_path = (
+        logs_dir = (
             Path(__file__).resolve().parent
             / "logs"
-            / "rvc_harmony_guard_last.json"
         )
-        log_path.parent.mkdir(
+        logs_dir.mkdir(
             parents=True,
             exist_ok=True,
         )
-        log_path.write_text(
+
+        encoded = (
             json.dumps(
                 asdict(
                     report
@@ -1555,18 +2735,29 @@ def blend_adaptive_vocals(
                 ensure_ascii=False,
                 indent=2,
             )
-            + "\n",
-            encoding="utf-8",
+            + "\n"
         )
+
+        # Keep old filename for compatibility and write a clearer v2.5 name.
+        for log_name in (
+            "rvc_harmony_guard_last.json",
+            "rvc_adaptive_guard_last.json",
+        ):
+            (
+                logs_dir
+                / log_name
+            ).write_text(
+                encoded,
+                encoding="utf-8",
+            )
     except OSError:
         pass
 
     return report
 
-
 def self_test() -> dict[str, float]:
     sr = 22050
-    seconds = 2.0
+    seconds = 3.0
     time = (
         np.arange(
             int(
@@ -1645,10 +2836,34 @@ def self_test() -> dict[str, float]:
         1e-8,
     )
 
+    # Same-key clean reference / RVC-good should yield almost no artifact
+    # fallback.  RVC-bad contains a deliberate wrong-octave segment.
+    reference = mono.copy()
+    rvc_good = mono.copy()
+    rvc_bad = mono.copy()
+
+    bad_start = int(
+        sr
+        * 1.10
+    )
+    bad_end = int(
+        sr
+        * 1.55
+    )
+
+    wrong_note = harmonic_voice(
+        329.63
+    )
+    rvc_bad[
+        bad_start:bad_end
+    ] = wrong_note[
+        bad_start:bad_end
+    ]
+
     import tempfile
 
     with tempfile.TemporaryDirectory(
-        prefix="harmony_guard_selftest_"
+        prefix="adaptive_guard_selftest_"
     ) as temp_name:
         temp = Path(
             temp_name
@@ -1661,6 +2876,7 @@ def self_test() -> dict[str, float]:
             temp
             / "harmony.wav"
         )
+
         sf.write(
             str(
                 mono_path
@@ -1691,6 +2907,37 @@ def self_test() -> dict[str, float]:
             )
         )
 
+    _, clean_artifact_mask, _, clean_metrics = (
+        analyze_rvc_artifact_risk(
+            rvc_good[
+                :,
+                None,
+            ],
+            reference[
+                :,
+                None,
+            ],
+            sr,
+            sensitivity="medium",
+            crossfade_ms=300,
+        )
+    )
+    _, bad_artifact_mask, _, bad_metrics = (
+        analyze_rvc_artifact_risk(
+            rvc_bad[
+                :,
+                None,
+            ],
+            reference[
+                :,
+                None,
+            ],
+            sr,
+            sensitivity="medium",
+            crossfade_ms=300,
+        )
+    )
+
     mono_value = float(
         np.mean(
             mono_mask
@@ -1699,6 +2946,16 @@ def self_test() -> dict[str, float]:
     harmony_value = float(
         np.mean(
             harmony_mask
+        )
+    )
+    clean_artifact = float(
+        np.mean(
+            clean_artifact_mask
+        )
+    )
+    bad_artifact = float(
+        np.mean(
+            bad_artifact_mask
         )
     )
 
@@ -1712,7 +2969,32 @@ def self_test() -> dict[str, float]:
             f"mono={mono_value:.3f}, harmony={harmony_value:.3f}"
         )
 
+    if not (
+        bad_artifact
+        > clean_artifact
+        + 0.12
+        and bad_metrics[
+            "artifact_detected_seconds"
+        ]
+        > clean_metrics[
+            "artifact_detected_seconds"
+        ]
+        + 0.15
+    ):
+        raise RuntimeError(
+            "Artifact Guard self-test failed: "
+            f"clean={clean_artifact:.3f}, bad={bad_artifact:.3f}"
+        )
+
     return {
-        "mono_fallback": mono_value,
-        "harmony_fallback": harmony_value,
+        "mono_input_fallback": mono_value,
+        "harmony_input_fallback": harmony_value,
+        "clean_output_fallback": clean_artifact,
+        "bad_output_fallback": bad_artifact,
+        "bad_output_detected_seconds": float(
+            bad_metrics[
+                "artifact_detected_seconds"
+            ]
+        ),
     }
+

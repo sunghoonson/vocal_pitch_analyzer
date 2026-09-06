@@ -100,8 +100,9 @@ from batch_vocal_extractor import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.4 / Adaptive RVC Harmony Guard"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.5 / RVC Artifact Guard"
 
+# V25_RVC_ARTIFACT_GUARD_PATCH
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
 # V24_SCROLLABLE_TABS_HOTFIX
 # V23_RVC_EXPERIMENT_BROWSER_PATCH
@@ -1914,7 +1915,7 @@ class MainWindow(QMainWindow):
         )
 
         self.rvc_harmony_guard_check = QCheckBox(
-            "Adaptive RVC / Harmony Guard 사용"
+            "Adaptive RVC / Harmony + Artifact Guard 사용"
         )
         self.rvc_harmony_guard_check.setChecked(
             self.settings.value(
@@ -1924,8 +1925,9 @@ class MainWindow(QMainWindow):
             )
         )
         self.rvc_harmony_guard_check.setToolTip(
-            "화음/코러스/F0 불안정 구간을 자동 감지해 "
-            "RVC 출력 대신 같은 키의 Pitch-only 보컬을 부분적으로 섞습니다."
+            "1차로 화음/코러스/F0 불안정 구간을 찾고, "
+            "2차로 RVC 출력 자체의 F0 불일치/삑사리/유성 소실을 직접 검사해 "
+            "같은 키의 Pitch-only 보컬을 부분적으로 섞습니다."
         )
 
         self.rvc_harmony_sensitivity_combo = QComboBox()
@@ -1998,9 +2000,9 @@ class MainWindow(QMainWindow):
 
         self.rvc_help_label = QLabel(
             "목표 음색으로 학습된 RVC .pth 모델을 사용합니다. "
-            "Harmony Guard는 화음/코러스처럼 단일 F0 추적이 불안정한 구간을 "
-            "자동 감지해 Pitch-only 보컬로 부분 우회하고 Crossfade로 연결합니다.\n"
-            "우회 구간은 원본 음색이 일부 남을 수 있지만 삑사리/뭉개짐을 줄이는 것이 목적입니다."
+            "Adaptive Guard v2.5는 1차 입력 Harmony 분석 후, 같은 키의 Pitch-only 결과와 "
+            "RVC 결과를 직접 비교해 F0 불일치/잘못된 음정 점프/유성음 소실을 2차 검출합니다.\n"
+            "실제 이상이 확인된 구간은 Pitch-only 비율을 높여 삑사리/뭉개짐을 줄입니다."
         )
         self.rvc_help_label.setWordWrap(
             True

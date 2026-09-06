@@ -20,6 +20,7 @@ from seed_vc_svc import (
 from vocal_separator import DEFAULT_MODEL
 from rvc_harmony_guard import blend_adaptive_vocals
 
+# V25_RVC_ARTIFACT_GUARD_PATCH
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
 
 
@@ -605,7 +606,7 @@ def _prepare_adaptive_rvc_vocal(
             blend_percent,
             99,
         ),
-        "Harmony Guard: 화음/코러스 위험도 분석 + Adaptive Blend 중...",
+        "Adaptive Guard v2.5: 입력 Harmony + RVC 출력 Artifact 2차 검증 중...",
     )
 
     try:
@@ -632,8 +633,9 @@ def _prepare_adaptive_rvc_vocal(
     _emit(
         log_callback,
         (
-            "[Harmony Guard] 적용 완료: "
-            f"위험 구간 {report.risky_region_count}개, "
+            "[Adaptive Guard v2.5] 적용 완료: "
+            f"총 위험 구간 {report.risky_region_count}개, "
+            f"Artifact 구간 {report.artifact_region_count}개, "
             f"Pitch-only 우회 {report.fallback_seconds:.1f}s, "
             f"부분 Blend {report.blend_seconds:.1f}s"
         ),
