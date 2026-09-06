@@ -12,6 +12,7 @@ import numpy as np
 import soundfile as sf
 
 
+# V29_LEAD_MELODY_ANALYSIS_PATCH
 # V27_LEAD_VOCAL_SELECTOR_PATCH
 
 LogCallback = Callable[[str], None]
@@ -19,6 +20,21 @@ LogCallback = Callable[[str], None]
 
 class LeadVocalSelectorError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class LeadFrameAnalysis:
+    times: np.ndarray
+    gate: np.ndarray
+    confidence: np.ndarray
+    active_mask: np.ndarray
+    duration_seconds: float
+    strength: str
+    active_seconds: float
+    selected_seconds: float
+    selected_ratio: float
+    mean_lead_confidence: float
+    threshold: float
 
 
 @dataclass(slots=True)
@@ -579,6 +595,504 @@ def _write_report(
         )
     except OSError:
         pass
+
+
+def analyze_lead_frames(
+    input_vocal: str | Path,
+    *,
+    strength: str = "balanced",
+    log_callback: LogCallback | None = None,
+) -> LeadFrameAnalysis:
+    """
+    Analyze a separated vocal stem and return a soft Lead-vocal
+    time gate. This does NOT alter the audio.
+
+    The first-tab Pitch Analyzer can therefore run pYIN on the
+    original separated vocal signal while using this gate only
+    to decide which frames are allowed to become melody notes.
+    """
+    source = Path(
+        input_vocal
+    ).resolve()
+
+    if not source.is_file():
+        raise FileNotFoundError(
+            source
+        )
+
+    strength = (
+        strength
+        if strength
+        in {
+            "gentle",
+            "balanced",
+            "strict",
+        }
+        else "balanced"
+    )
+
+    config = _strength_config(
+        strength
+    )
+
+    audio, sr = sf.read(
+        str(
+            source
+        ),
+        dtype="float32",
+        always_2d=True,
+    )
+
+    if audio.size <= 0:
+        raise LeadVocalSelectorError(
+            "Lead Melody Gate 입력 보컬 stem이 비어 있습니다."
+        )
+
+    duration = (
+        audio.shape[
+            0
+        ]
+        / float(
+            sr
+        )
+    )
+
+    mono = np.mean(
+        audio,
+        axis=1,
+        dtype=np.float32,
+    )
+
+    analysis_sr = 22050
+    analysis = _resample(
+        mono,
+        int(
+            sr
+        ),
+        analysis_sr,
+    )
+
+    frame_length = 2048
+    hop_length = 512
+    frame_seconds = (
+        hop_length
+        / float(
+            analysis_sr
+        )
+    )
+
+    f0, _, voiced_probability = librosa.pyin(
+        analysis,
+        fmin=65.0,
+        fmax=1400.0,
+        sr=analysis_sr,
+        frame_length=frame_length,
+        hop_length=hop_length,
+    )
+
+    voiced_probability = np.nan_to_num(
+        voiced_probability,
+        nan=0.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    magnitude = np.abs(
+        librosa.stft(
+            analysis,
+            n_fft=frame_length,
+            hop_length=hop_length,
+            win_length=frame_length,
+            center=True,
+        )
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    power = (
+        magnitude
+        * magnitude
+    )
+
+    rms = librosa.feature.rms(
+        y=analysis,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        center=True,
+    )[
+        0
+    ].astype(
+        np.float32,
+        copy=False,
+    )
+
+    flatness = librosa.feature.spectral_flatness(
+        S=np.maximum(
+            power,
+            1e-12,
+        ),
+    )[
+        0
+    ].astype(
+        np.float32,
+        copy=False,
+    )
+
+    frequencies = librosa.fft_frequencies(
+        sr=analysis_sr,
+        n_fft=frame_length,
+    )
+
+    coverage = _harmonic_coverage(
+        power,
+        frequencies,
+        f0,
+    )
+
+    count = min(
+        f0.size,
+        voiced_probability.size,
+        rms.size,
+        flatness.size,
+        coverage.size,
+    )
+
+    f0 = f0[
+        :count
+    ]
+    voiced_probability = voiced_probability[
+        :count
+    ]
+    rms = rms[
+        :count
+    ]
+    flatness = flatness[
+        :count
+    ]
+    coverage = coverage[
+        :count
+    ]
+
+    center_score = _frame_center_score(
+        audio,
+        int(
+            sr
+        ),
+        analysis_sr,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        target_frames=count,
+    )
+
+    rms_db = (
+        20.0
+        * np.log10(
+            np.maximum(
+                rms,
+                1e-8,
+            )
+        )
+    )
+
+    reference_db = float(
+        np.percentile(
+            rms_db,
+            95,
+        )
+    ) if rms_db.size else -60.0
+
+    active = (
+        rms_db
+        >= (
+            reference_db
+            - 42.0
+        )
+    )
+
+    center_pref = np.clip(
+        (
+            center_score
+            - float(
+                config[
+                    "center_floor"
+                ]
+            )
+        )
+        / 0.40,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    tonality = np.clip(
+        (
+            0.30
+            - flatness
+        )
+        / 0.27,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    level_score = np.clip(
+        (
+            rms_db
+            - (
+                reference_db
+                - 32.0
+            )
+        )
+        / 24.0,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    lead_confidence = (
+        voiced_probability
+        * 0.36
+        + coverage
+        * 0.30
+        + center_pref
+        * 0.14
+        + tonality
+        * 0.12
+        + level_score
+        * 0.08
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    valid_f0 = (
+        np.isfinite(
+            f0
+        )
+        & (
+            f0
+            > 0.0
+        )
+    )
+
+    lead_confidence[
+        ~active
+    ] = 0.0
+
+    lead_confidence[
+        active
+        & ~valid_f0
+    ] *= 0.28
+
+    threshold = float(
+        config[
+            "threshold"
+        ]
+    )
+
+    confident = (
+        active
+        & valid_f0
+        & (
+            voiced_probability
+            >= 0.34
+        )
+        & (
+            coverage
+            >= 0.32
+        )
+        & (
+            lead_confidence
+            >= threshold
+        )
+    )
+
+    soft_gate = np.clip(
+        (
+            lead_confidence
+            - (
+                threshold
+                - 0.13
+            )
+        )
+        / 0.28,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    soft_gate[
+        ~active
+    ] = 0.0
+
+    core = confident.astype(
+        np.float32
+    )
+
+    near_radius = max(
+        1,
+        int(
+            round(
+                0.16
+                / frame_seconds
+            )
+        ),
+    )
+
+    near = _moving_max(
+        core,
+        near_radius,
+    )
+
+    time_gate = np.maximum(
+        soft_gate,
+        (
+            near
+            * 0.74
+            * active.astype(
+                np.float32
+            )
+        ),
+    )
+
+    smooth_radius = max(
+        1,
+        int(
+            round(
+                0.055
+                / frame_seconds
+            )
+        ),
+    )
+
+    time_gate = _moving_average(
+        time_gate,
+        smooth_radius,
+    )
+
+    time_gate = np.clip(
+        time_gate,
+        0.0,
+        1.0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    times = (
+        np.arange(
+            count,
+            dtype=np.float32,
+        )
+        * frame_seconds
+    )
+
+    # Pitch analysis uses a slightly softer threshold than the
+    # spectral stem selector. Weak/airy lead notes should not be
+    # discarded as aggressively as backing removal for RVC.
+    melody_thresholds = {
+        "gentle": 0.24,
+        "balanced": 0.30,
+        "strict": 0.38,
+    }
+
+    melody_threshold = float(
+        melody_thresholds[
+            strength
+        ]
+    )
+
+    selected = (
+        time_gate
+        >= melody_threshold
+    )
+
+    active_seconds = min(
+        float(
+            duration
+        ),
+        float(
+            np.count_nonzero(
+                active
+            )
+            * frame_seconds
+        ),
+    )
+
+    selected_seconds = min(
+        float(
+            duration
+        ),
+        float(
+            np.count_nonzero(
+                selected
+            )
+            * frame_seconds
+        ),
+    )
+
+    mean_confidence = (
+        float(
+            np.mean(
+                lead_confidence[
+                    active
+                ]
+            )
+        )
+        if np.any(
+            active
+        )
+        else 0.0
+    )
+
+    _emit(
+        log_callback,
+        (
+            "[Lead Melody] 프레임 분석 완료: "
+            f"활성 {active_seconds:.1f}s / "
+            f"Lead 채택 {selected_seconds:.1f}s "
+            f"({selected_seconds / max(duration, 1e-6) * 100.0:.1f}%) / "
+            f"mean conf {mean_confidence:.3f} / "
+            f"threshold {melody_threshold:.2f}"
+        ),
+    )
+
+    return LeadFrameAnalysis(
+        times=times,
+        gate=time_gate,
+        confidence=lead_confidence,
+        active_mask=active.astype(
+            bool,
+            copy=False,
+        ),
+        duration_seconds=float(
+            duration
+        ),
+        strength=strength,
+        active_seconds=active_seconds,
+        selected_seconds=selected_seconds,
+        selected_ratio=(
+            selected_seconds
+            / max(
+                float(
+                    duration
+                ),
+                1e-6,
+            )
+        ),
+        mean_lead_confidence=mean_confidence,
+        threshold=melody_threshold,
+    )
 
 
 def select_lead_vocal(

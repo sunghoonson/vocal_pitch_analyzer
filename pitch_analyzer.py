@@ -9,6 +9,8 @@ import numpy as np
 
 from media_input import prepare_audio_for_analysis
 
+# V29_LEAD_MELODY_ANALYSIS_PATCH
+
 
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 KOREAN_NOTE_NAMES = ("도", "도♯", "레", "레♯", "미", "파", "파♯", "솔", "솔♯", "라", "라♯", "시")
@@ -48,6 +50,16 @@ class AnalysisResult:
     energy_reference_dbfs: float
     energy_threshold_dbfs: float
     energy_active_seconds: float
+
+    # Lead Melody Gate information
+    lead_gate_mask: np.ndarray
+    lead_gate_values: np.ndarray
+    lead_gate_enabled: bool
+    lead_gate_strength: str
+    lead_gate_threshold: float
+    lead_active_seconds: float
+    lead_selected_seconds: float
+    lead_mean_confidence: float
 
     # Frame-level processed pitch
     accepted_mask: np.ndarray
@@ -589,6 +601,14 @@ def analyze_audio(
     range_min_note_ms: float = 100.0,
     range_min_confidence: float = 0.35,
 
+    # v2.9 Lead Melody Gate.
+    # Times/values come from rvc_lead_selector.analyze_lead_frames().
+    lead_gate_times: np.ndarray | None = None,
+    lead_gate_values: np.ndarray | None = None,
+    lead_gate_threshold: float = 0.30,
+    lead_gate_strength: str = "balanced",
+    lead_mean_confidence: float = 0.0,
+
     progress: ProgressCallback | None = None,
 ) -> AnalysisResult:
     original_path = Path(file_path)
@@ -703,14 +723,141 @@ def analyze_audio(
             )
             energy_threshold_dbfs = float("-inf")
 
-        report(
-            72,
-            (
-                "보컬 활동 게이트 적용 중..."
-                if use_energy_gate
-                else "에너지 게이트 비활성 상태..."
-            ),
+        lead_gate_enabled = bool(
+            lead_gate_times is not None
+            and lead_gate_values is not None
+            and len(
+                np.asarray(
+                    lead_gate_times
+                )
+            ) > 1
+            and len(
+                np.asarray(
+                    lead_gate_values
+                )
+            ) > 1
         )
+
+        if lead_gate_enabled:
+            source_gate_times = np.asarray(
+                lead_gate_times,
+                dtype=float,
+            ).reshape(
+                -1
+            )
+            source_gate_values = np.asarray(
+                lead_gate_values,
+                dtype=float,
+            ).reshape(
+                -1
+            )
+
+            gate_count = min(
+                source_gate_times.size,
+                source_gate_values.size,
+            )
+
+            source_gate_times = source_gate_times[
+                :gate_count
+            ]
+            source_gate_values = source_gate_values[
+                :gate_count
+            ]
+
+            finite_gate = (
+                np.isfinite(
+                    source_gate_times
+                )
+                & np.isfinite(
+                    source_gate_values
+                )
+            )
+
+            source_gate_times = source_gate_times[
+                finite_gate
+            ]
+            source_gate_values = source_gate_values[
+                finite_gate
+            ]
+
+            if source_gate_times.size > 1:
+                order = np.argsort(
+                    source_gate_times
+                )
+                source_gate_times = source_gate_times[
+                    order
+                ]
+                source_gate_values = source_gate_values[
+                    order
+                ]
+
+                aligned_lead_values = np.interp(
+                    times.astype(
+                        float,
+                        copy=False,
+                    ),
+                    source_gate_times,
+                    source_gate_values,
+                    left=0.0,
+                    right=0.0,
+                )
+
+                aligned_lead_values = np.clip(
+                    aligned_lead_values,
+                    0.0,
+                    1.0,
+                )
+
+                lead_gate_mask = (
+                    aligned_lead_values
+                    >= float(
+                        lead_gate_threshold
+                    )
+                )
+            else:
+                lead_gate_enabled = False
+                aligned_lead_values = np.ones(
+                    len(
+                        raw_f0
+                    ),
+                    dtype=float,
+                )
+                lead_gate_mask = np.ones(
+                    len(
+                        raw_f0
+                    ),
+                    dtype=bool,
+                )
+        else:
+            aligned_lead_values = np.ones(
+                len(
+                    raw_f0
+                ),
+                dtype=float,
+            )
+            lead_gate_mask = np.ones(
+                len(
+                    raw_f0
+                ),
+                dtype=bool,
+            )
+
+        if lead_gate_enabled:
+            report(
+                72,
+                (
+                    "보컬 활동 + Lead Melody Gate 적용 중..."
+                ),
+            )
+        else:
+            report(
+                72,
+                (
+                    "보컬 활동 게이트 적용 중..."
+                    if use_energy_gate
+                    else "에너지 게이트 비활성 상태..."
+                ),
+            )
 
         accepted_mask = (
             voiced_flag
@@ -718,6 +865,7 @@ def analyze_audio(
             & np.isfinite(voiced_prob)
             & (voiced_prob >= voiced_threshold)
             & energy_gate
+            & lead_gate_mask
         )
 
         working_midi = np.full_like(
@@ -825,6 +973,22 @@ def analyze_audio(
             np.count_nonzero(energy_gate)
             * hop_seconds
         )
+        lead_active_seconds = float(
+            np.count_nonzero(
+                lead_gate_mask
+            )
+            * hop_seconds
+        ) if lead_gate_enabled else float(
+            duration
+        )
+        lead_selected_seconds = float(
+            np.count_nonzero(
+                accepted_mask
+            )
+            * hop_seconds
+        ) if lead_gate_enabled else float(
+            accepted_seconds
+        )
 
         coverage = (
             processed_seconds / duration * 100.0
@@ -854,6 +1018,27 @@ def analyze_audio(
                 energy_threshold_dbfs
             ),
             energy_active_seconds=energy_active_seconds,
+
+            lead_gate_mask=lead_gate_mask,
+            lead_gate_values=aligned_lead_values,
+            lead_gate_enabled=bool(
+                lead_gate_enabled
+            ),
+            lead_gate_strength=str(
+                lead_gate_strength
+            ),
+            lead_gate_threshold=float(
+                lead_gate_threshold
+            ),
+            lead_active_seconds=float(
+                lead_active_seconds
+            ),
+            lead_selected_seconds=float(
+                lead_selected_seconds
+            ),
+            lead_mean_confidence=float(
+                lead_mean_confidence
+            ),
 
             accepted_mask=accepted_mask,
             processed_f0_hz=processed_f0,

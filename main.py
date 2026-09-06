@@ -73,6 +73,10 @@ from seed_vc_svc import (
     seed_vc_available,
     seed_vc_status_text,
 )
+from rvc_lead_selector import (
+    LeadFrameAnalysis,
+    analyze_lead_frames,
+)
 from rvc_rmvpe import (
     RVCRMVPEError,
     convert_full_mix_rvc,
@@ -107,8 +111,9 @@ from rvc_training_dataset_cleaner import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.8 / Training Lead Dataset Cleaner"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.9 / Lead Melody Analysis"
 
+# V29_LEAD_MELODY_ANALYSIS_PATCH
 # V28_TRAINING_LEAD_DATASET_CLEANER_PATCH
 # V27_LEAD_VOCAL_SELECTOR_PATCH
 # V26_ARTIFACT_PRIORITY_MANUAL_BYPASS_PATCH
@@ -149,6 +154,8 @@ class PipelineResult:
     analysis_source_path: str
     used_vocal_separation: bool
     vocal_resource: SeparatedVocal | None
+    used_lead_melody_gate: bool
+    lead_frame_analysis: LeadFrameAnalysis | None
 
 
 class NoteAxis(pg.AxisItem):
@@ -178,6 +185,8 @@ class AnalysisThread(QThread):
         separator_model: str,
         separator_cache: bool,
         separator_autocast: bool,
+        use_lead_melody_gate: bool,
+        lead_melody_strength: str,
         fmin: float,
         fmax: float,
         threshold: float,
@@ -202,6 +211,19 @@ class AnalysisThread(QThread):
         self.separator_model = separator_model
         self.separator_cache = separator_cache
         self.separator_autocast = separator_autocast
+        self.use_lead_melody_gate = bool(
+            use_lead_melody_gate
+        )
+        self.lead_melody_strength = (
+            lead_melody_strength
+            if lead_melody_strength
+            in {
+                "gentle",
+                "balanced",
+                "strict",
+            }
+            else "balanced"
+        )
 
         self.fmin = fmin
         self.fmax = fmax
@@ -222,6 +244,7 @@ class AnalysisThread(QThread):
 
     def run(self):
         vocal_resource: SeparatedVocal | None = None
+        lead_frame_analysis: LeadFrameAnalysis | None = None
 
         try:
             analysis_path = self.path
@@ -244,21 +267,54 @@ class AnalysisThread(QThread):
                     vocal_resource.vocal_path
                 )
 
-                self.progress_changed.emit(
-                    28,
-                    (
-                        "보컬 캐시를 불러왔습니다. Pitch 분석을 시작합니다."
-                        if vocal_resource.cache_hit
-                        else "보컬 분리 완료. Pitch 분석을 시작합니다."
-                    ),
-                )
+                if self.use_lead_melody_gate:
+                    self.progress_changed.emit(
+                        28,
+                        (
+                            "보컬 분리 완료. Lead Melody Gate를 분석하는 중..."
+                        ),
+                    )
+
+                    lead_frame_analysis = analyze_lead_frames(
+                        analysis_path,
+                        strength=self.lead_melody_strength,
+                        log_callback=lambda text: (
+                            self.separator_log.emit(
+                                text
+                            )
+                        ),
+                    )
+
+                    self.progress_changed.emit(
+                        40,
+                        (
+                            "Lead Melody Gate 완료: "
+                            f"Lead {lead_frame_analysis.selected_ratio * 100.0:.1f}% / "
+                            "Pitch 분석을 시작합니다."
+                        ),
+                    )
+
+                    pitch_base = 40
+                    pitch_scale = 0.60
+
+                else:
+                    self.progress_changed.emit(
+                        28,
+                        (
+                            "보컬 캐시를 불러왔습니다. Pitch 분석을 시작합니다."
+                            if vocal_resource.cache_hit
+                            else "보컬 분리 완료. Pitch 분석을 시작합니다."
+                        ),
+                    )
+                    pitch_base = 28
+                    pitch_scale = 0.72
 
                 def pitch_progress(
                     percent: int,
                     text: str,
                 ) -> None:
-                    mapped = 28 + int(
-                        percent * 0.72
+                    mapped = pitch_base + int(
+                        percent * pitch_scale
                     )
                     self.progress_changed.emit(
                         min(mapped, 100),
@@ -293,6 +349,37 @@ class AnalysisThread(QThread):
                 range_min_note_ms=self.range_min_note_ms,
                 range_min_confidence=self.range_min_confidence,
 
+                lead_gate_times=(
+                    lead_frame_analysis.times
+                    if lead_frame_analysis
+                    is not None
+                    else None
+                ),
+                lead_gate_values=(
+                    lead_frame_analysis.gate
+                    if lead_frame_analysis
+                    is not None
+                    else None
+                ),
+                lead_gate_threshold=(
+                    lead_frame_analysis.threshold
+                    if lead_frame_analysis
+                    is not None
+                    else 0.30
+                ),
+                lead_gate_strength=(
+                    lead_frame_analysis.strength
+                    if lead_frame_analysis
+                    is not None
+                    else self.lead_melody_strength
+                ),
+                lead_mean_confidence=(
+                    lead_frame_analysis.mean_lead_confidence
+                    if lead_frame_analysis
+                    is not None
+                    else 0.0
+                ),
+
                 progress=pitch_progress,
             )
 
@@ -303,6 +390,11 @@ class AnalysisThread(QThread):
                     analysis_source_path=analysis_path,
                     used_vocal_separation=self.use_vocal_separation,
                     vocal_resource=vocal_resource,
+                    used_lead_melody_gate=bool(
+                        lead_frame_analysis
+                        is not None
+                    ),
+                    lead_frame_analysis=lead_frame_analysis,
                 )
             )
 
@@ -2621,6 +2713,62 @@ class MainWindow(QMainWindow):
             True
         )
 
+        self.analysis_lead_melody_check = QCheckBox(
+            "Lead Vocal 기준으로 음계 분석 (화음/백킹 음계 제외)"
+        )
+        self.analysis_lead_melody_check.setChecked(
+            self.settings.value(
+                "analysis_lead_melody_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.analysis_lead_melody_check.setToolTip(
+            "보컬 분리 후 시간별 Lead confidence를 계산하고, "
+            "Lead로 판단된 프레임만 음표/최저음/최고음/CSV/자막에 사용합니다. "
+            "pYIN 자체는 원래 분리 보컬에서 실행하므로 약한 Lead 음정 손실을 줄입니다."
+        )
+
+        self.analysis_lead_strength_combo = QComboBox()
+        self.analysis_lead_strength_combo.addItem(
+            "약함 - 약한 Lead/가성 보존 우선",
+            "gentle",
+        )
+        self.analysis_lead_strength_combo.addItem(
+            "보통 - 권장",
+            "balanced",
+        )
+        self.analysis_lead_strength_combo.addItem(
+            "강함 - 화음/백킹 제외 우선",
+            "strict",
+        )
+
+        saved_analysis_lead_strength = self.settings.value(
+            "analysis_lead_melody_strength",
+            "balanced",
+            type=str,
+        )
+        saved_analysis_lead_index = (
+            self.analysis_lead_strength_combo.findData(
+                saved_analysis_lead_strength
+            )
+        )
+        self.analysis_lead_strength_combo.setCurrentIndex(
+            (
+                saved_analysis_lead_index
+                if saved_analysis_lead_index
+                >= 0
+                else 1
+            )
+        )
+
+        self.analysis_lead_info_label = QLabel(
+            "Lead Melody Gate: 보컬 분리 모드에서 사용 가능"
+        )
+        self.analysis_lead_info_label.setWordWrap(
+            True
+        )
+
         self.separator_log_label = QLabel(
             "분리 로그: -"
         )
@@ -2645,11 +2793,34 @@ class MainWindow(QMainWindow):
             self.separator_autocast_check,
         )
         separator_layout.addRow(
+            "",
+            self.analysis_lead_melody_check,
+        )
+        separator_layout.addRow(
+            "Lead 분석 강도",
+            self.analysis_lead_strength_combo,
+        )
+        separator_layout.addRow(
+            "Lead Gate",
+            self.analysis_lead_info_label,
+        )
+        separator_layout.addRow(
             "상태",
             self.separator_log_label,
         )
 
         analysis_root.addWidget(separator_group)
+
+        self.analysis_mode_combo.currentIndexChanged.connect(
+            self.on_analysis_lead_melody_settings_changed
+        )
+        self.analysis_lead_melody_check.toggled.connect(
+            self.on_analysis_lead_melody_settings_changed
+        )
+        self.analysis_lead_strength_combo.currentIndexChanged.connect(
+            self.on_analysis_lead_melody_settings_changed
+        )
+        self.on_analysis_lead_melody_settings_changed()
 
         gate_group = QGroupBox(
             "보컬 활동 게이트 - Engine v3"
@@ -3390,6 +3561,66 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress_text.setText("준비")
 
+    def on_analysis_lead_melody_settings_changed(
+        self,
+        *_args,
+    ):
+        if not hasattr(
+            self,
+            "analysis_lead_melody_check",
+        ):
+            return
+
+        vocal_mode = (
+            self.analysis_mode_combo.currentData()
+            == "vocal"
+        )
+        enabled = (
+            self.analysis_lead_melody_check.isChecked()
+        )
+
+        self.analysis_lead_melody_check.setEnabled(
+            vocal_mode
+        )
+        self.analysis_lead_strength_combo.setEnabled(
+            vocal_mode
+            and enabled
+        )
+
+        self.settings.setValue(
+            "analysis_lead_melody_enabled",
+            enabled,
+        )
+        self.settings.setValue(
+            "analysis_lead_melody_strength",
+            self.analysis_lead_strength_combo.currentData()
+            or "balanced",
+        )
+
+        if not vocal_mode:
+            self.analysis_lead_info_label.setText(
+                "원본 전체 믹스 모드에서는 Lead Gate를 적용하지 않습니다."
+            )
+        elif enabled:
+            label = {
+                "gentle": "약함",
+                "balanced": "보통",
+                "strict": "강함",
+            }.get(
+                self.analysis_lead_strength_combo.currentData(),
+                "보통",
+            )
+            self.analysis_lead_info_label.setText(
+                (
+                    "ON / "
+                    f"{label} / pYIN 결과에 Lead frame mask 추가"
+                )
+            )
+        else:
+            self.analysis_lead_info_label.setText(
+                "OFF / 분리 vocals의 모든 유성 프레임을 기존 방식으로 분석"
+            )
+
     def start_analysis(self):
         if not self.audio_path:
             return
@@ -3422,6 +3653,14 @@ class MainWindow(QMainWindow):
             separator_model=model_filename,
             separator_cache=self.separator_cache_check.isChecked(),
             separator_autocast=self.separator_autocast_check.isChecked(),
+            use_lead_melody_gate=bool(
+                use_vocal
+                and self.analysis_lead_melody_check.isChecked()
+            ),
+            lead_melody_strength=(
+                self.analysis_lead_strength_combo.currentData()
+                or "balanced"
+            ),
 
             fmin=self.fmin_spin.value(),
             fmax=self.fmax_spin.value(),
@@ -3504,7 +3743,11 @@ class MainWindow(QMainWindow):
             )
 
         self.statusBar().showMessage(
-            "완료 - Activity Gate Engine v3",
+            (
+                "완료 - Lead Melody + Activity Gate"
+                if pipeline.used_lead_melody_gate
+                else "완료 - Activity Gate Engine v3"
+            ),
             12000,
         )
 
@@ -3544,9 +3787,29 @@ class MainWindow(QMainWindow):
         ):
             source_text += "(캐시)"
 
+        if pipeline.used_lead_melody_gate:
+            source_text += " + Lead Melody Gate"
+
         self.source_label.setText(
             f"소스: {source_text}"
         )
+
+        if (
+            pipeline.used_lead_melody_gate
+            and pipeline.lead_frame_analysis
+            is not None
+        ):
+            lead_info = (
+                pipeline.lead_frame_analysis
+            )
+            self.analysis_lead_info_label.setText(
+                (
+                    f"Lead 채택 {lead_info.selected_seconds:.1f}s "
+                    f"({lead_info.selected_ratio * 100.0:.1f}%) / "
+                    f"mean conf {lead_info.mean_lead_confidence:.3f} / "
+                    f"threshold {lead_info.threshold:.2f}"
+                )
+            )
         self.duration_label.setText(
             f"길이: {result.duration:.1f}초"
         )
