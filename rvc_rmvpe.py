@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
+import json
 import os
 import subprocess
 import tempfile
+import traceback
 
 from audio_transposer import (
     AudioTransposeError,
@@ -21,6 +25,7 @@ from vocal_separator import DEFAULT_MODEL
 from rvc_harmony_guard import blend_adaptive_vocals
 
 # V25_RVC_ARTIFACT_GUARD_PATCH
+# V25_ADAPTIVE_GUARD_DIAGNOSTICS_HOTFIX
 # V24_ADAPTIVE_RVC_HARMONY_GUARD_PATCH
 
 
@@ -98,6 +103,313 @@ def rvc_log_path() -> Path:
         / "logs"
         / "rvc_rmvpe_last.log"
     )
+
+
+
+def adaptive_guard_log_path() -> Path:
+    return (
+        project_root()
+        / "logs"
+        / "rvc_adaptive_guard_last.log"
+    )
+
+
+def adaptive_guard_json_path() -> Path:
+    return (
+        project_root()
+        / "logs"
+        / "rvc_adaptive_guard_last.json"
+    )
+
+
+def _guard_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+
+
+def _guard_safe_path(
+    value: str | Path | None,
+) -> str | None:
+    if value is None:
+        return None
+
+    try:
+        return str(
+            Path(
+                value
+            ).resolve()
+        )
+    except Exception:
+        return str(
+            value
+        )
+
+
+def _guard_write_json(
+    state: dict,
+) -> None:
+    path = adaptive_guard_json_path()
+
+    try:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        state[
+            "updated_at"
+        ] = _guard_timestamp()
+
+        temp_path = path.with_suffix(
+            path.suffix
+            + ".tmp"
+        )
+
+        temp_path.write_text(
+            json.dumps(
+                state,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        temp_path.replace(
+            path
+        )
+    except Exception:
+        # Diagnostic output must never break RVC conversion.
+        pass
+
+
+def _guard_append_log(
+    message: str,
+) -> None:
+    clean = str(
+        message
+    ).strip()
+
+    if not clean:
+        return
+
+    path = adaptive_guard_log_path()
+
+    try:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with path.open(
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(
+                f"[{_guard_timestamp()}] {clean}\n"
+            )
+    except OSError:
+        pass
+
+
+def _guard_reset_log() -> None:
+    path = adaptive_guard_log_path()
+
+    try:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        path.write_text(
+            "",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _guard_emit(
+    callback: LogCallback | None,
+    message: str,
+) -> None:
+    _guard_append_log(
+        message
+    )
+    _emit(
+        callback,
+        message,
+    )
+
+
+def _guard_start_state(
+    *,
+    source_vocal: Path,
+    raw_rvc: Path,
+    model_path: str | Path,
+    index_path: str | Path | None,
+    semitones: int,
+    harmony_guard_enabled: bool,
+    harmony_guard_sensitivity: str,
+    harmony_guard_crossfade_ms: int,
+) -> dict:
+    state = {
+        "guard_version": "2.5",
+        "diagnostics_hotfix": True,
+        "status": "started",
+        "stage": "prepare",
+        "started_at": _guard_timestamp(),
+        "updated_at": _guard_timestamp(),
+        "message": (
+            "Adaptive Guard diagnostic session started."
+        ),
+        "fallback_to_raw_rvc": False,
+        "source_vocal": _guard_safe_path(
+            source_vocal
+        ),
+        "raw_rvc": _guard_safe_path(
+            raw_rvc
+        ),
+        "model_path": _guard_safe_path(
+            model_path
+        ),
+        "index_path": _guard_safe_path(
+            index_path
+        ),
+        "semitones": int(
+            semitones
+        ),
+        "enabled": bool(
+            harmony_guard_enabled
+        ),
+        "sensitivity": str(
+            harmony_guard_sensitivity
+        ),
+        "crossfade_ms": int(
+            harmony_guard_crossfade_ms
+        ),
+        "pitch_only": None,
+        "adaptive_output": None,
+        "rubberband_available": None,
+        "rubberband_status": None,
+        "exception_type": None,
+        "exception_message": None,
+        "traceback": None,
+    }
+
+    _guard_write_json(
+        state
+    )
+
+    return state
+
+
+def _guard_update_state(
+    state: dict,
+    *,
+    status: str | None = None,
+    stage: str | None = None,
+    message: str | None = None,
+    fallback_to_raw_rvc: bool | None = None,
+    exception: BaseException | None = None,
+    extra: dict | None = None,
+) -> None:
+    if status is not None:
+        state[
+            "status"
+        ] = str(
+            status
+        )
+
+    if stage is not None:
+        state[
+            "stage"
+        ] = str(
+            stage
+        )
+
+    if message is not None:
+        state[
+            "message"
+        ] = str(
+            message
+        )
+
+    if fallback_to_raw_rvc is not None:
+        state[
+            "fallback_to_raw_rvc"
+        ] = bool(
+            fallback_to_raw_rvc
+        )
+
+    if exception is not None:
+        state[
+            "exception_type"
+        ] = type(
+            exception
+        ).__name__
+        state[
+            "exception_message"
+        ] = str(
+            exception
+        )
+        state[
+            "traceback"
+        ] = "".join(
+            traceback.format_exception(
+                type(
+                    exception
+                ),
+                exception,
+                exception.__traceback__,
+            )
+        )
+
+    if extra:
+        state.update(
+            extra
+        )
+
+    _guard_write_json(
+        state
+    )
+
+
+def _guard_report_dict(
+    report,
+) -> dict:
+    try:
+        if is_dataclass(
+            report
+        ):
+            payload = asdict(
+                report
+            )
+        elif hasattr(
+            report,
+            "__dict__",
+        ):
+            payload = dict(
+                report.__dict__
+            )
+        else:
+            payload = {
+                "report": str(
+                    report
+                )
+            }
+    except Exception as exc:
+        payload = {
+            "report_serialization_error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "report": str(
+                report
+            ),
+        }
+
+    return payload
 
 
 def rvc_available() -> bool:
@@ -506,13 +818,55 @@ def _prepare_adaptive_rvc_vocal(
     progress_points: tuple[int, int, int, int],
     log_callback: LogCallback | None,
 ) -> Path:
-    start_percent, rvc_percent, fallback_percent, blend_percent = (
-        progress_points
-    )
+    (
+        start_percent,
+        rvc_percent,
+        fallback_percent,
+        blend_percent,
+    ) = progress_points
 
     raw_rvc = (
         temp_dir
         / "rvc_vocal_raw.wav"
+    )
+
+    # Start diagnostics BEFORE RVC inference so a file is guaranteed
+    # even if the Guard is never reached.
+    _guard_reset_log()
+
+    guard_state = _guard_start_state(
+        source_vocal=source_vocal,
+        raw_rvc=raw_rvc,
+        model_path=model_path,
+        index_path=index_path,
+        semitones=semitones,
+        harmony_guard_enabled=harmony_guard_enabled,
+        harmony_guard_sensitivity=harmony_guard_sensitivity,
+        harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
+    )
+
+    _guard_emit(
+        log_callback,
+        (
+            "[Adaptive Guard Diagnostics] 시작 "
+            f"(enabled={bool(harmony_guard_enabled)}, "
+            f"sensitivity={harmony_guard_sensitivity}, "
+            f"crossfade={int(harmony_guard_crossfade_ms)}ms)"
+        ),
+    )
+    _guard_emit(
+        log_callback,
+        (
+            "[Adaptive Guard Diagnostics] LOG: "
+            f"{adaptive_guard_log_path()}"
+        ),
+    )
+    _guard_emit(
+        log_callback,
+        (
+            "[Adaptive Guard Diagnostics] JSON: "
+            f"{adaptive_guard_json_path()}"
+        ),
     )
 
     _progress(
@@ -521,17 +875,62 @@ def _prepare_adaptive_rvc_vocal(
         "RMVPE F0 추출 + RVC 음색 변환 중...",
     )
 
-    run_rvc_vocal(
-        source_vocal,
-        raw_rvc,
-        model_path=model_path,
-        index_path=index_path,
-        semitones=semitones,
-        index_rate=index_rate,
-        protect=protect,
-        rms_mix_rate=rms_mix_rate,
-        speaker_id=speaker_id,
-        log_callback=log_callback,
+    _guard_update_state(
+        guard_state,
+        status="running",
+        stage="rvc_inference",
+        message="RVC + RMVPE inference is running.",
+    )
+
+    try:
+        run_rvc_vocal(
+            source_vocal,
+            raw_rvc,
+            model_path=model_path,
+            index_path=index_path,
+            semitones=semitones,
+            index_rate=index_rate,
+            protect=protect,
+            rms_mix_rate=rms_mix_rate,
+            speaker_id=speaker_id,
+            log_callback=log_callback,
+        )
+    except Exception as exc:
+        message = (
+            "[Adaptive Guard Diagnostics] RVC 추론 단계에서 실패했습니다: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _guard_emit(
+            log_callback,
+            message,
+        )
+        _guard_update_state(
+            guard_state,
+            status="failed",
+            stage="rvc_inference",
+            message=message,
+            fallback_to_raw_rvc=False,
+            exception=exc,
+        )
+        raise
+
+    _guard_update_state(
+        guard_state,
+        status="running",
+        stage="rvc_complete",
+        message="Raw RVC vocal was created successfully.",
+        extra={
+            "raw_rvc_exists": bool(
+                raw_rvc.is_file()
+            ),
+            "raw_rvc_size": (
+                int(
+                    raw_rvc.stat().st_size
+                )
+                if raw_rvc.is_file()
+                else 0
+            ),
+        },
     )
 
     _progress(
@@ -541,30 +940,102 @@ def _prepare_adaptive_rvc_vocal(
     )
 
     if not harmony_guard_enabled:
-        _emit(
+        message = (
+            "[Adaptive Guard] 비활성화 - 기존 RVC 출력 그대로 사용"
+        )
+        _guard_emit(
             log_callback,
-            "[Harmony Guard] 비활성화 - 기존 RVC 출력 그대로 사용",
+            message,
+        )
+        _guard_update_state(
+            guard_state,
+            status="disabled",
+            stage="settings",
+            message=message,
+            fallback_to_raw_rvc=True,
         )
         return raw_rvc
 
-    rb_ok, rb_status = (
-        rubberband_filter_available()
+    _guard_update_state(
+        guard_state,
+        status="running",
+        stage="rubberband_check",
+        message="Checking RubberBand for Pitch-only fallback.",
+    )
+
+    try:
+        rb_ok, rb_status = (
+            rubberband_filter_available()
+        )
+    except Exception as exc:
+        message = (
+            "[Adaptive Guard] RubberBand 확인 중 예외 - "
+            "기존 RVC 출력으로 계속합니다: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _guard_emit(
+            log_callback,
+            message,
+        )
+        _guard_update_state(
+            guard_state,
+            status="failed",
+            stage="rubberband_check",
+            message=message,
+            fallback_to_raw_rvc=True,
+            exception=exc,
+        )
+        return raw_rvc
+
+    _guard_update_state(
+        guard_state,
+        extra={
+            "rubberband_available": bool(
+                rb_ok
+            ),
+            "rubberband_status": str(
+                rb_status
+            ),
+        },
     )
 
     if not rb_ok:
-        _emit(
+        message = (
+            "[Adaptive Guard] Pitch-only 우회용 RubberBand를 사용할 수 없어 "
+            "Guard를 건너뜁니다: "
+            + str(
+                rb_status
+            )
+        )
+        _guard_emit(
             log_callback,
-            (
-                "[Harmony Guard] Pitch-only 우회용 RubberBand를 사용할 수 없어 "
-                "Harmony Guard를 건너뜁니다: "
-                + rb_status
-            ),
+            message,
+        )
+        _guard_update_state(
+            guard_state,
+            status="skipped",
+            stage="rubberband_check",
+            message=message,
+            fallback_to_raw_rvc=True,
         )
         return raw_rvc
 
     pitch_only = (
         temp_dir
         / "pitch_only_vocal.wav"
+    )
+
+    guard_state[
+        "pitch_only"
+    ] = _guard_safe_path(
+        pitch_only
+    )
+
+    _guard_update_state(
+        guard_state,
+        status="running",
+        stage="pitch_only_generation",
+        message="Generating same-key Pitch-only fallback vocal.",
     )
 
     _progress(
@@ -584,20 +1055,75 @@ def _prepare_adaptive_rvc_vocal(
             preserve_formant=True,
             quality="quality",
         )
-    except AudioTransposeError as exc:
-        _emit(
+    except Exception as exc:
+        message = (
+            "[Adaptive Guard] Pitch-only 보컬 생성 실패 - "
+            "기존 RVC 출력으로 계속합니다: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _guard_emit(
             log_callback,
-            (
-                "[Harmony Guard] Pitch-only 보컬 생성 실패 - "
-                "기존 RVC 출력으로 계속합니다: "
-                f"{exc}"
-            ),
+            message,
+        )
+        _guard_update_state(
+            guard_state,
+            status="failed",
+            stage="pitch_only_generation",
+            message=message,
+            fallback_to_raw_rvc=True,
+            exception=exc,
+            extra={
+                "pitch_only_exists": bool(
+                    pitch_only.is_file()
+                ),
+                "pitch_only_size": (
+                    int(
+                        pitch_only.stat().st_size
+                    )
+                    if pitch_only.is_file()
+                    else 0
+                ),
+            },
         )
         return raw_rvc
+
+    _guard_update_state(
+        guard_state,
+        status="running",
+        stage="pitch_only_complete",
+        message="Pitch-only fallback vocal created.",
+        extra={
+            "pitch_only_exists": bool(
+                pitch_only.is_file()
+            ),
+            "pitch_only_size": (
+                int(
+                    pitch_only.stat().st_size
+                )
+                if pitch_only.is_file()
+                else 0
+            ),
+        },
+    )
 
     adaptive = (
         temp_dir
         / "rvc_vocal_harmony_guard.wav"
+    )
+
+    guard_state[
+        "adaptive_output"
+    ] = _guard_safe_path(
+        adaptive
+    )
+
+    _guard_update_state(
+        guard_state,
+        status="running",
+        stage="harmony_artifact_analysis",
+        message=(
+            "Running input Harmony analysis and RVC Artifact analysis."
+        ),
     )
 
     _progress(
@@ -606,8 +1132,19 @@ def _prepare_adaptive_rvc_vocal(
             blend_percent,
             99,
         ),
-        "Adaptive Guard v2.5: 입력 Harmony + RVC 출력 Artifact 2차 검증 중...",
+        (
+            "Adaptive Guard v2.5: 입력 Harmony + "
+            "RVC 출력 Artifact 2차 검증 중..."
+        ),
     )
+
+    def guard_callback(
+        message: str,
+    ) -> None:
+        _guard_emit(
+            log_callback,
+            message,
+        )
 
     try:
         report = blend_adaptive_vocals(
@@ -617,32 +1154,98 @@ def _prepare_adaptive_rvc_vocal(
             adaptive,
             sensitivity=harmony_guard_sensitivity,
             crossfade_ms=harmony_guard_crossfade_ms,
-            log_callback=log_callback,
+            log_callback=guard_callback,
         )
     except Exception as exc:
-        _emit(
+        message = (
+            "[Adaptive Guard] 분석/Blend 실패 - "
+            "기존 RVC 출력으로 계속합니다: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _guard_emit(
             log_callback,
-            (
-                "[Harmony Guard] 분석/Blend 실패 - "
-                "기존 RVC 출력으로 계속합니다: "
-                f"{type(exc).__name__}: {exc}"
-            ),
+            message,
+        )
+        _guard_update_state(
+            guard_state,
+            status="failed",
+            stage="harmony_artifact_analysis",
+            message=message,
+            fallback_to_raw_rvc=True,
+            exception=exc,
+            extra={
+                "adaptive_output_exists": bool(
+                    adaptive.is_file()
+                ),
+                "adaptive_output_size": (
+                    int(
+                        adaptive.stat().st_size
+                    )
+                    if adaptive.is_file()
+                    else 0
+                ),
+            },
         )
         return raw_rvc
 
-    _emit(
+    report_dict = (
+        _guard_report_dict(
+            report
+        )
+    )
+
+    message = (
+        "[Adaptive Guard v2.5] 적용 완료: "
+        f"총 위험 구간 {report.risky_region_count}개, "
+        f"Artifact 구간 {report.artifact_region_count}개, "
+        f"Pitch-only 우회 {report.fallback_seconds:.1f}s, "
+        f"부분 Blend {report.blend_seconds:.1f}s"
+    )
+
+    _guard_emit(
+        log_callback,
+        message,
+    )
+
+    # Keep report fields at top-level for compatibility with the
+    # previous rvc_adaptive_guard_last.json format.
+    success_extra = dict(
+        report_dict
+    )
+    success_extra.update(
+        {
+            "adaptive_output_exists": bool(
+                adaptive.is_file()
+            ),
+            "adaptive_output_size": (
+                int(
+                    adaptive.stat().st_size
+                )
+                if adaptive.is_file()
+                else 0
+            ),
+            "report": report_dict,
+        }
+    )
+
+    _guard_update_state(
+        guard_state,
+        status="success",
+        stage="complete",
+        message=message,
+        fallback_to_raw_rvc=False,
+        extra=success_extra,
+    )
+
+    _guard_emit(
         log_callback,
         (
-            "[Adaptive Guard v2.5] 적용 완료: "
-            f"총 위험 구간 {report.risky_region_count}개, "
-            f"Artifact 구간 {report.artifact_region_count}개, "
-            f"Pitch-only 우회 {report.fallback_seconds:.1f}s, "
-            f"부분 Blend {report.blend_seconds:.1f}s"
+            "[Adaptive Guard Diagnostics] 완료. "
+            f"JSON={adaptive_guard_json_path()}"
         ),
     )
 
     return adaptive
-
 
 def convert_vocal_rvc(
     vocal_path: str | Path,
