@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QSettings, QThread, Signal
+from PySide6.QtCore import QSettings, QThread, Signal, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
