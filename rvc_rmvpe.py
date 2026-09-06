@@ -203,6 +203,27 @@ def _rvc_env() -> dict[str, str]:
                 + current_path
             )
 
+    rvc_root = str(
+        rvc_repo_dir().resolve()
+    )
+    existing_pythonpath = env.get(
+        "PYTHONPATH",
+        "",
+    )
+
+    pythonpath_entries = [
+        rvc_root,
+    ]
+
+    if existing_pythonpath:
+        pythonpath_entries.append(
+            existing_pythonpath
+        )
+
+    env["PYTHONPATH"] = os.pathsep.join(
+        pythonpath_entries
+    )
+
     return env
 
 
@@ -321,13 +342,14 @@ def run_rvc_vocal(
         ),
     )
 
+    # RVC_INFERENCE_MODULE_LAUNCH_HOTFIX
+    # Run the CLI as a module so `infer` resolves as the package.
     command = [
         str(
             rvc_python()
         ),
-        str(
-            rvc_cli_path()
-        ),
+        "-m",
+        "infer.cli",
         "--model",
         str(model),
         "--input",
