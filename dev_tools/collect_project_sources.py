@@ -32,8 +32,10 @@ DEFAULT_SETTINGS = {
         ".venv_separator",
         ".venv_svc",
         ".venv_rvc",
+        ".venv_remix",
         "seed-vc",
         "rvc",
+        "ACE-Step-1.5",
         "rvc_models",
         "__pycache__",
         ".pytest_cache",
@@ -48,6 +50,8 @@ DEFAULT_SETTINGS = {
         "_project_snapshots"
     ],
     "exclude_dir_globs": [
+        ".venv*",
+        "*.egg-info",
         "backup_before_*",
         "backup_*"
     ],
@@ -138,26 +142,100 @@ def should_include_file(path: Path, settings: dict) -> bool:
 def collect_files(root: Path, settings: dict) -> list[Path]:
     result: list[Path] = []
 
-    for current, dirs, files in os.walk(root):
+    dir_count = 0
+    seen_file_count = 0
+    skipped_dir_count = 0
+
+    progress_every_dirs = max(
+        1,
+        int(settings.get("progress_every_dirs", 100)),
+    )
+    progress_every_files = max(
+        1,
+        int(settings.get("progress_every_files", 250)),
+    )
+
+    print("[SCAN] Project source scan started", flush=True)
+    print(f"[SCAN] Root: {root}", flush=True)
+
+    for current, dirs, files in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        dir_count += 1
         current_path = Path(current)
 
-        dirs[:] = [
-            d for d in dirs
-            if not should_skip_dir(d, settings)
-        ]
+        kept_dirs: list[str] = []
+
+        for dirname in dirs:
+            child = current_path / dirname
+
+            # Avoid accidental traversal through symlinks / junction-like
+            # directories. Source snapshots should contain real project files,
+            # not external trees reachable through reparse points.
+            is_link = False
+            try:
+                is_link = child.is_symlink()
+            except OSError:
+                is_link = True
+
+            if is_link or should_skip_dir(dirname, settings):
+                skipped_dir_count += 1
+                continue
+
+            kept_dirs.append(dirname)
+
+        dirs[:] = kept_dirs
 
         for filename in files:
+            seen_file_count += 1
             path = current_path / filename
 
             if should_include_file(path, settings):
                 result.append(path)
 
-    return sorted(
+            if seen_file_count % progress_every_files == 0:
+                print(
+                    "[SCAN] "
+                    f"dirs={dir_count:,} "
+                    f"files_seen={seen_file_count:,} "
+                    f"included={len(result):,} "
+                    f"skipped_dirs={skipped_dir_count:,}",
+                    flush=True,
+                )
+
+        if dir_count % progress_every_dirs == 0:
+            try:
+                rel = current_path.relative_to(root)
+            except ValueError:
+                rel = current_path
+
+            print(
+                "[SCAN] "
+                f"directory={rel} "
+                f"dirs={dir_count:,} "
+                f"included={len(result):,}",
+                flush=True,
+            )
+
+    result = sorted(
         result,
         key=lambda p: str(
             p.relative_to(root)
         ).lower(),
     )
+
+    print(
+        "[SCAN] Completed | "
+        f"dirs={dir_count:,} "
+        f"files_seen={seen_file_count:,} "
+        f"included={len(result):,} "
+        f"skipped_dirs={skipped_dir_count:,}",
+        flush=True,
+    )
+
+    return result
 
 
 def resolve_output_dir(root: Path, settings: dict) -> Path:
@@ -275,17 +353,33 @@ def write_snapshot(
     log_path = output_dir / f"{stem}.log.txt"
     tree_path = output_dir / f"{stem}_tree.md"
 
+    print(f"[ZIP] Creating: {zip_path}", flush=True)
+
+    progress_every = max(
+        1,
+        int(settings.get("progress_every_files", 250)),
+    )
+
     with zipfile.ZipFile(
         zip_path,
         "w",
         compression=zipfile.ZIP_DEFLATED,
         compresslevel=6,
     ) as zf:
-        for path in files:
+        for index, path in enumerate(files, start=1):
             zf.write(
                 path,
                 path.relative_to(root),
             )
+
+            if (
+                index % progress_every == 0
+                or index == len(files)
+            ):
+                print(
+                    f"[ZIP] {index:,}/{len(files):,}",
+                    flush=True,
+                )
 
     max_mb = float(
         settings.get("max_text_file_mb", 4)
@@ -303,7 +397,12 @@ def write_snapshot(
             f"Files       : {len(files)}\n\n"
         )
 
-        for path in files:
+        print(
+            f"[LOG] Creating concatenated source log: {log_path}",
+            flush=True,
+        )
+
+        for index, path in enumerate(files, start=1):
             rel = path.relative_to(root)
             fp.write(
                 "\n"
@@ -327,6 +426,16 @@ def write_snapshot(
                 if text and not text.endswith("\n"):
                     fp.write("\n")
 
+            if (
+                index % progress_every == 0
+                or index == len(files)
+            ):
+                print(
+                    f"[LOG] {index:,}/{len(files):,}",
+                    flush=True,
+                )
+
+    print(f"[TREE] Creating: {tree_path}", flush=True)
     tree = build_tree(files, root)
 
     tree_path.write_text(
@@ -373,6 +482,19 @@ def main() -> int:
     settings = load_settings(
         settings_path
     )
+
+    print("[INFO] Snapshot Collector v2", flush=True)
+    print(
+        "[INFO] Excluded directories: "
+        + ", ".join(settings.get("exclude_dirs", [])),
+        flush=True,
+    )
+    print(
+        "[INFO] Excluded directory globs: "
+        + ", ".join(settings.get("exclude_dir_globs", [])),
+        flush=True,
+    )
+    print(flush=True)
 
     files = collect_files(
         root,

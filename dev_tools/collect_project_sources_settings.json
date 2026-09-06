@@ -45,11 +45,16 @@
     "rvc",
     "rvc_models",
     "rvc_datasets",
-    "rvc_finetune_backups"
+    "rvc_finetune_backups",
+    ".venv_remix",
+    "ACE-Step-1.5",
+    ".cache"
   ],
   "exclude_dir_globs": [
     "backup_before_*",
-    "backup_*"
+    "backup_*",
+    ".venv*",
+    "*.egg-info"
   ],
   "exclude_file_globs": [
     "*.pyc",
@@ -87,5 +92,7 @@
     "*.index",
     "*_vocals.wav"
   ],
-  "max_text_file_mb": 4
+  "max_text_file_mb": 4,
+  "progress_every_files": 250,
+  "progress_every_dirs": 100
 }

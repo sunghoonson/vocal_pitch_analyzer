@@ -34,6 +34,7 @@ from rvc_lead_selector import (
     select_lead_vocal,
 )
 
+# V32_RVC_F0_STABILITY_GUARD_PATCH
 # V30_INSTRUMENT_SMART_SHIFT_PATCH
 # V25_RVC_ARTIFACT_GUARD_PATCH
 # V27_LEAD_VOCAL_SELECTOR_PATCH
@@ -115,6 +116,29 @@ def rvc_log_path() -> Path:
         project_root()
         / "logs"
         / "rvc_rmvpe_last.log"
+    )
+
+
+def rvc_stable_cli_path() -> Path:
+    return (
+        project_root()
+        / "rvc_stable_cli.py"
+    )
+
+
+def rvc_f0_stability_csv_path() -> Path:
+    return (
+        project_root()
+        / "logs"
+        / "rvc_f0_stability_last.csv"
+    )
+
+
+def rvc_f0_stability_json_path() -> Path:
+    return (
+        project_root()
+        / "logs"
+        / "rvc_f0_stability_last.json"
     )
 
 
@@ -743,6 +767,8 @@ def run_rvc_vocal(
     protect: float = 0.33,
     rms_mix_rate: float = 1.0,
     speaker_id: int = 0,
+    f0_stability_enabled: bool = True,
+    f0_stability_strength: str = "balanced",
     log_callback: LogCallback | None = None,
 ) -> Path:
     if not rvc_available():
@@ -803,14 +829,53 @@ def run_rvc_vocal(
         ),
     )
 
-    # RVC_INFERENCE_MODULE_LAUNCH_HOTFIX
-    # Run the CLI as a module so `infer` resolves as the package.
+    f0_stability_strength = (
+        str(
+            f0_stability_strength
+            or "balanced"
+        )
+        .strip()
+        .lower()
+    )
+
+    if f0_stability_strength not in {
+        "conservative",
+        "balanced",
+        "strong",
+    }:
+        f0_stability_strength = "balanced"
+
+    stable_wrapper = (
+        bool(
+            f0_stability_enabled
+        )
+        and rvc_stable_cli_path().is_file()
+    )
+
+    # V32 RVC F0 Stability Guard:
+    # use a project-local wrapper instead of modifying tools/rvc.
     command = [
         str(
             rvc_python()
         ),
-        "-m",
-        "infer.cli",
+    ]
+
+    if stable_wrapper:
+        command.append(
+            str(
+                rvc_stable_cli_path()
+            )
+        )
+    else:
+        command.extend(
+            [
+                "-m",
+                "infer.cli",
+            ]
+        )
+
+    command.extend(
+        [
         "--model",
         str(model),
         "--input",
@@ -837,7 +902,8 @@ def run_rvc_vocal(
         "--format",
         "wav",
         "--overwrite",
-    ]
+        ]
+    )
 
     if index is not None:
         command.extend(
@@ -857,6 +923,43 @@ def run_rvc_vocal(
             f"speaker_id={int(speaker_id)}"
         ),
     )
+
+    if stable_wrapper:
+        _emit(
+            log_callback,
+            (
+                "[F0 Stability Guard] ON / "
+                f"mode={f0_stability_strength} / "
+                "RMVPE + pYIN subharmonic correction"
+            ),
+        )
+        _emit(
+            log_callback,
+            (
+                "[F0 Stability Guard] CSV: "
+                f"{rvc_f0_stability_csv_path()}"
+            ),
+        )
+        _emit(
+            log_callback,
+            (
+                "[F0 Stability Guard] JSON: "
+                f"{rvc_f0_stability_json_path()}"
+            ),
+        )
+    elif f0_stability_enabled:
+        _emit(
+            log_callback,
+            (
+                "[F0 Stability Guard] wrapper 파일이 없어 OFF fallback: "
+                f"{rvc_stable_cli_path()}"
+            ),
+        )
+    else:
+        _emit(
+            log_callback,
+            "[F0 Stability Guard] OFF - upstream RMVPE 그대로 사용",
+        )
     _emit(
         log_callback,
         f"RVC 모델: {model}",
@@ -873,12 +976,43 @@ def run_rvc_vocal(
             "RVC index: 미사용",
         )
 
+    process_env = _rvc_env()
+
+    if stable_wrapper:
+        process_env[
+            "VPA_F0_STABILITY"
+        ] = "1"
+        process_env[
+            "VPA_F0_STABILITY_MODE"
+        ] = f0_stability_strength
+        process_env[
+            "VPA_F0_DIAG_CSV"
+        ] = str(
+            rvc_f0_stability_csv_path()
+        )
+        process_env[
+            "VPA_F0_DIAG_JSON"
+        ] = str(
+            rvc_f0_stability_json_path()
+        )
+
+        for diagnostic_path in (
+            rvc_f0_stability_csv_path(),
+            rvc_f0_stability_json_path(),
+        ):
+            try:
+                diagnostic_path.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
+
     process = subprocess.Popen(
         command,
         cwd=str(
             rvc_repo_dir()
         ),
-        env=_rvc_env(),
+        env=process_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -937,6 +1071,36 @@ def run_rvc_vocal(
             )[-8000:]
         )
 
+    if (
+        stable_wrapper
+        and rvc_f0_stability_json_path().is_file()
+    ):
+        try:
+            diagnostic = json.loads(
+                rvc_f0_stability_json_path().read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            _emit(
+                log_callback,
+                (
+                    "[F0 Stability Guard] 진단: "
+                    f"보정 {float(diagnostic.get('corrected_seconds', 0.0)):.2f}s / "
+                    f"구간 {int(diagnostic.get('region_count', 0))}개 / "
+                    "최대 downward mismatch "
+                    f"{float(diagnostic.get('max_downward_mismatch_semitones', 0.0)):.1f} st"
+                ),
+            )
+        except Exception as exc:
+            _emit(
+                log_callback,
+                (
+                    "[F0 Stability Guard] 진단 JSON 읽기 실패: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+
     _emit(
         log_callback,
         f"RVC 보컬 생성 완료: {output_wav}",
@@ -956,6 +1120,8 @@ def _prepare_adaptive_rvc_vocal(
     protect: float,
     rms_mix_rate: float,
     speaker_id: int,
+    f0_stability_enabled: bool,
+    f0_stability_strength: str,
     harmony_guard_enabled: bool,
     harmony_guard_sensitivity: str,
     harmony_guard_crossfade_ms: int,
@@ -1040,6 +1206,12 @@ def _prepare_adaptive_rvc_vocal(
             protect=protect,
             rms_mix_rate=rms_mix_rate,
             speaker_id=speaker_id,
+            f0_stability_enabled=bool(
+                f0_stability_enabled
+            ),
+            f0_stability_strength=str(
+                f0_stability_strength
+            ),
             log_callback=log_callback,
         )
     except Exception as exc:
@@ -1431,6 +1603,8 @@ def _prepare_rvc_vocal_pipeline(
     protect: float,
     rms_mix_rate: float,
     speaker_id: int,
+    f0_stability_enabled: bool,
+    f0_stability_strength: str,
     lead_selector_enabled: bool,
     lead_selector_strength: str,
     harmony_guard_enabled: bool,
@@ -1467,6 +1641,12 @@ def _prepare_rvc_vocal_pipeline(
             protect=protect,
             rms_mix_rate=rms_mix_rate,
             speaker_id=speaker_id,
+            f0_stability_enabled=bool(
+                f0_stability_enabled
+            ),
+            f0_stability_strength=str(
+                f0_stability_strength
+            ),
             harmony_guard_enabled=harmony_guard_enabled,
             harmony_guard_sensitivity=harmony_guard_sensitivity,
             harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
@@ -1520,6 +1700,12 @@ def _prepare_rvc_vocal_pipeline(
             protect=protect,
             rms_mix_rate=rms_mix_rate,
             speaker_id=speaker_id,
+            f0_stability_enabled=bool(
+                f0_stability_enabled
+            ),
+            f0_stability_strength=str(
+                f0_stability_strength
+            ),
             harmony_guard_enabled=harmony_guard_enabled,
             harmony_guard_sensitivity=harmony_guard_sensitivity,
             harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
@@ -1561,6 +1747,12 @@ def _prepare_rvc_vocal_pipeline(
             protect=protect,
             rms_mix_rate=rms_mix_rate,
             speaker_id=speaker_id,
+            f0_stability_enabled=bool(
+                f0_stability_enabled
+            ),
+            f0_stability_strength=str(
+                f0_stability_strength
+            ),
             harmony_guard_enabled=harmony_guard_enabled,
             harmony_guard_sensitivity=harmony_guard_sensitivity,
             harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
@@ -1675,6 +1867,8 @@ def convert_vocal_rvc(
     protect: float = 0.33,
     rms_mix_rate: float = 1.0,
     speaker_id: int = 0,
+    f0_stability_enabled: bool = True,
+    f0_stability_strength: str = "balanced",
     lead_selector_enabled: bool = True,
     lead_selector_strength: str = "balanced",
     harmony_guard_enabled: bool = True,
@@ -1720,6 +1914,12 @@ def convert_vocal_rvc(
                 protect=protect,
                 rms_mix_rate=rms_mix_rate,
                 speaker_id=speaker_id,
+                f0_stability_enabled=bool(
+                    f0_stability_enabled
+                ),
+                f0_stability_strength=str(
+                    f0_stability_strength
+                ),
                 lead_selector_enabled=bool(
                     lead_selector_enabled
                 ),
@@ -1786,6 +1986,8 @@ def convert_full_mix_rvc(
     protect: float = 0.33,
     rms_mix_rate: float = 1.0,
     speaker_id: int = 0,
+    f0_stability_enabled: bool = True,
+    f0_stability_strength: str = "balanced",
     lead_selector_enabled: bool = True,
     lead_selector_strength: str = "balanced",
     harmony_guard_enabled: bool = True,
@@ -1872,6 +2074,12 @@ def convert_full_mix_rvc(
                 protect=protect,
                 rms_mix_rate=rms_mix_rate,
                 speaker_id=speaker_id,
+                f0_stability_enabled=bool(
+                    f0_stability_enabled
+                ),
+                f0_stability_strength=str(
+                    f0_stability_strength
+                ),
                 lead_selector_enabled=bool(
                     lead_selector_enabled
                 ),

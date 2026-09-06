@@ -23,7 +23,7 @@ set "SCRIPT_PATH=%ROOT_DIR%\dev_tools\collect_project_sources.py"
 set "SETTINGS_PATH=%ROOT_DIR%\dev_tools\collect_project_sources_settings.json"
 
 echo ============================================================
-echo Vocal Pitch Analyzer - Source Snapshot
+echo Vocal Pitch Analyzer - Source Snapshot Collector v2
 echo ============================================================
 echo [INFO] Root:
 echo        %ROOT_DIR%
@@ -67,7 +67,7 @@ echo [INFO] Python:
 echo        %PYTHON_CMD%
 echo.
 
-%PYTHON_CMD% "%SCRIPT_PATH%" ^
+%PYTHON_CMD% -u "%SCRIPT_PATH%" ^
   --root "%ROOT_DIR%" ^
   --settings "%SETTINGS_PATH%"
 

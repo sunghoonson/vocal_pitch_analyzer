@@ -121,8 +121,9 @@ from rvc_training_dataset_cleaner import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.1 / AI Remix"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.2 / RVC F0 Stability"
 
+# V32_RVC_F0_STABILITY_GUARD_PATCH
 # V31_AI_REMIX_ACESTEP_PATCH
 # V30_INSTRUMENT_SMART_SHIFT_PATCH
 # V29_LEAD_MELODY_ANALYSIS_PATCH
@@ -597,6 +598,8 @@ class RVCTransposeThread(QThread):
         protect: float,
         rms_mix_rate: float,
         speaker_id: int,
+        f0_stability_enabled: bool,
+        f0_stability_strength: str,
         lead_selector_enabled: bool,
         lead_selector_strength: str,
         harmony_guard_enabled: bool,
@@ -622,6 +625,13 @@ class RVCTransposeThread(QThread):
         self.protect = protect
         self.rms_mix_rate = rms_mix_rate
         self.speaker_id = speaker_id
+        self.f0_stability_enabled = bool(
+            f0_stability_enabled
+        )
+        self.f0_stability_strength = str(
+            f0_stability_strength
+            or "balanced"
+        )
         self.lead_selector_enabled = (
             lead_selector_enabled
         )
@@ -667,6 +677,8 @@ class RVCTransposeThread(QThread):
                 protect=self.protect,
                 rms_mix_rate=self.rms_mix_rate,
                 speaker_id=self.speaker_id,
+                f0_stability_enabled=self.f0_stability_enabled,
+                f0_stability_strength=self.f0_stability_strength,
                 lead_selector_enabled=self.lead_selector_enabled,
                 lead_selector_strength=self.lead_selector_strength,
                 harmony_guard_enabled=self.harmony_guard_enabled,
@@ -2964,6 +2976,63 @@ class MainWindow(QMainWindow):
             0
         )
 
+        self.rvc_f0_stability_check = QCheckBox(
+            "F0 Stability Guard 사용 (RMVPE 서브하모닉/옥타브 붕괴 보정)"
+        )
+        self.rvc_f0_stability_check.setChecked(
+            self.settings.value(
+                "rvc_f0_stability_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.rvc_f0_stability_check.setToolTip(
+            "RMVPE F0와 별도 pYIN 참조 F0를 비교하고, "
+            "RMVPE가 참조 pitch의 절반 이하 수준으로 추락하는 "
+            "명확한 subharmonic/octave collapse만 RVC 합성 전에 보정합니다. "
+            "정상 RMVPE frame은 그대로 유지합니다."
+        )
+
+        self.rvc_f0_stability_strength_combo = QComboBox()
+        self.rvc_f0_stability_strength_combo.addItem(
+            "보수적 - 매우 명확한 붕괴만 보정",
+            "conservative",
+        )
+        self.rvc_f0_stability_strength_combo.addItem(
+            "보통 - 권장",
+            "balanced",
+        )
+        self.rvc_f0_stability_strength_combo.addItem(
+            "강함 - 더 넓게 subharmonic 보정",
+            "strong",
+        )
+
+        saved_f0_stability_strength = self.settings.value(
+            "rvc_f0_stability_strength",
+            "balanced",
+            type=str,
+        )
+        saved_f0_stability_index = (
+            self.rvc_f0_stability_strength_combo.findData(
+                saved_f0_stability_strength
+            )
+        )
+        self.rvc_f0_stability_strength_combo.setCurrentIndex(
+            saved_f0_stability_index
+            if saved_f0_stability_index >= 0
+            else 1
+        )
+        self.rvc_f0_stability_strength_combo.setEnabled(
+            self.rvc_f0_stability_check.isChecked()
+        )
+
+        self.rvc_f0_stability_check.toggled.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+        self.rvc_f0_stability_strength_combo.currentIndexChanged.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+
         self.rvc_lead_selector_check = QCheckBox(
             "Lead Vocal Selector 사용 (RVC 전 메인 보컬 선별)"
         )
@@ -3155,6 +3224,9 @@ class MainWindow(QMainWindow):
             "메인 보컬 후보만 RVC로 보내고 Non-lead/화음 residual은 Pitch Shift only로 처리합니다.\n"
             "마지막 선별 결과는 cache\\rvc_lead_selector\\last_lead_candidate.wav 와 "
             "last_nonlead_residual.wav 에 저장되어 직접 들어볼 수 있습니다. "
+            "v3.2 F0 Stability Guard는 RVC 합성 전에 RMVPE의 명확한 "
+            "서브하모닉/옥타브 붕괴를 pYIN 참조 F0로 보정하고, "
+            "logs\\rvc_f0_stability_last.csv/json에 실제 보정 구간을 기록합니다.\n"
             "Artifact Guard와 수동 우회는 이후의 최종 안전망으로 그대로 유지됩니다."
         )
         self.rvc_help_label.setWordWrap(
@@ -3188,6 +3260,14 @@ class MainWindow(QMainWindow):
         rvc_layout.addRow(
             "Speaker ID",
             self.rvc_speaker_spin,
+        )
+        rvc_layout.addRow(
+            "",
+            self.rvc_f0_stability_check,
+        )
+        rvc_layout.addRow(
+            "F0 안정화 강도",
+            self.rvc_f0_stability_strength_combo,
         )
         rvc_layout.addRow(
             "",
@@ -6936,6 +7016,13 @@ class MainWindow(QMainWindow):
             self.rvc_harmony_guard_check.isChecked()
         )
 
+        f0_stability_enabled = (
+            self.rvc_f0_stability_check.isChecked()
+        )
+        self.rvc_f0_stability_strength_combo.setEnabled(
+            f0_stability_enabled
+        )
+
         lead_selector_enabled = (
             self.rvc_lead_selector_check.isChecked()
         )
@@ -6957,6 +7044,15 @@ class MainWindow(QMainWindow):
             manual_enabled
         )
 
+        self.settings.setValue(
+            "rvc_f0_stability_enabled",
+            f0_stability_enabled,
+        )
+        self.settings.setValue(
+            "rvc_f0_stability_strength",
+            self.rvc_f0_stability_strength_combo.currentData()
+            or "balanced",
+        )
         self.settings.setValue(
             "rvc_lead_selector_enabled",
             lead_selector_enabled,
@@ -8028,6 +8124,13 @@ class MainWindow(QMainWindow):
                 ),
                 speaker_id=(
                     self.rvc_speaker_spin.value()
+                ),
+                f0_stability_enabled=(
+                    self.rvc_f0_stability_check.isChecked()
+                ),
+                f0_stability_strength=(
+                    self.rvc_f0_stability_strength_combo.currentData()
+                    or "balanced"
                 ),
                 lead_selector_enabled=(
                     self.rvc_lead_selector_check.isChecked()
