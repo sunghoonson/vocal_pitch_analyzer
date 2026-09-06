@@ -90,7 +90,7 @@ if errorlevel 1 goto :error
 if errorlevel 1 goto :error
 
 "%RVC_VENV%\Scripts\python.exe" -m pip install ^
-  "huggingface_hub>=0.28.1"
+  "huggingface_hub==0.28.1"
 if errorlevel 1 goto :error
 
 echo.

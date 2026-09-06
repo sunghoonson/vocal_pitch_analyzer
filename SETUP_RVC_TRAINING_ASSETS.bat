@@ -28,7 +28,7 @@ if not exist "%RVC_DIR%\train\train.py" (
 )
 
 echo [1/2] Checking huggingface_hub...
-"%RVC_PY%" -m pip install -U "huggingface_hub>=0.28.1"
+"%RVC_PY%" -m pip install -U "huggingface_hub==0.28.1"
 if errorlevel 1 goto :error
 
 echo.
