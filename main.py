@@ -99,10 +99,17 @@ from batch_vocal_extractor import (
     BatchVocalExtractionError,
     extract_vocals_batch,
 )
+from rvc_training_dataset_cleaner import (
+    RVCTrainingDatasetCleanCancelled,
+    clean_training_dataset,
+    default_clean_output_dir,
+    is_lead_clean_dataset,
+)
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.7 / Lead Vocal Selector"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v2.8 / Training Lead Dataset Cleaner"
 
+# V28_TRAINING_LEAD_DATASET_CLEANER_PATCH
 # V27_LEAD_VOCAL_SELECTOR_PATCH
 # V26_ARTIFACT_PRIORITY_MANUAL_BYPASS_PATCH
 # V25_RVC_ARTIFACT_GUARD_PATCH
@@ -683,6 +690,7 @@ class RVCTrainingThread(QThread):
         str,
     )
     log_line = Signal(str)
+    dataset_prepared = Signal(str)
     training_done = Signal(
         str,
         str,
@@ -701,6 +709,8 @@ class RVCTrainingThread(QThread):
         gpu_id: int,
         cache_gpu: bool,
         training_mode: str,
+        lead_cleaner_enabled: bool,
+        lead_cleaner_strength: str,
         parent=None,
     ):
         super().__init__(parent)
@@ -724,6 +734,24 @@ class RVCTrainingThread(QThread):
         self.training_mode = (
             training_mode
         )
+        self.lead_cleaner_enabled = bool(
+            lead_cleaner_enabled
+        )
+        self.lead_cleaner_strength = (
+            lead_cleaner_strength
+            if lead_cleaner_strength
+            in {
+                "gentle",
+                "balanced",
+                "strict",
+            }
+            else "balanced"
+        )
+        self._cleaner_used = bool(
+            self.lead_cleaner_enabled
+            and self.training_mode
+            != TRAINING_MODE_RESUME
+        )
 
         self.pipeline = RVCTrainingPipeline(
             log_callback=lambda text: (
@@ -731,12 +759,37 @@ class RVCTrainingThread(QThread):
                     text
                 )
             ),
-            progress_callback=lambda p, text: (
-                self.progress_changed.emit(
-                    p,
-                    text,
+            progress_callback=self._on_pipeline_progress,
+        )
+
+    def _on_pipeline_progress(
+        self,
+        percent: int,
+        text: str,
+    ):
+        if self._cleaner_used:
+            mapped = (
+                12
+                + int(
+                    max(
+                        0,
+                        min(
+                            100,
+                            percent,
+                        ),
+                    )
+                    * 0.88
                 )
+            )
+        else:
+            mapped = percent
+
+        self.progress_changed.emit(
+            min(
+                100,
+                mapped,
             ),
+            text,
         )
 
     def cancel(self):
@@ -744,8 +797,107 @@ class RVCTrainingThread(QThread):
 
     def run(self):
         try:
+            training_dataset = Path(
+                self.dataset_dir
+            ).expanduser().resolve()
+
+            if self._cleaner_used:
+                clean_output = (
+                    default_clean_output_dir(
+                        training_dataset
+                    )
+                )
+
+                self.progress_changed.emit(
+                    0,
+                    "학습 전 Lead Vocal Dataset 정제를 준비하는 중...",
+                )
+                self.log_line.emit(
+                    (
+                        "[LEAD CLEAN] 학습 전 Lead Vocal Cleaner 적용 "
+                        f"(강도={self.lead_cleaner_strength})"
+                    )
+                )
+                self.log_line.emit(
+                    (
+                        "[LEAD CLEAN] 원본 데이터셋: "
+                        f"{training_dataset}"
+                    )
+                )
+                self.log_line.emit(
+                    (
+                        "[LEAD CLEAN] 정제 데이터셋: "
+                        f"{clean_output}"
+                    )
+                )
+
+                clean_result = clean_training_dataset(
+                    training_dataset,
+                    output_dir=clean_output,
+                    strength=self.lead_cleaner_strength,
+                    overwrite=False,
+                    log_callback=lambda text: (
+                        self.log_line.emit(
+                            "[LEAD CLEAN] "
+                            + text
+                        )
+                    ),
+                    progress_callback=lambda p, text: (
+                        self.progress_changed.emit(
+                            min(
+                                11,
+                                int(
+                                    max(
+                                        0,
+                                        min(
+                                            100,
+                                            p,
+                                        ),
+                                    )
+                                    * 0.11
+                                ),
+                            ),
+                            text,
+                        )
+                    ),
+                    cancel_check=lambda: (
+                        self.pipeline.cancelled
+                    ),
+                )
+
+                training_dataset = (
+                    clean_result.output_dir
+                )
+                self.dataset_prepared.emit(
+                    str(
+                        training_dataset
+                    )
+                )
+
+                self.log_line.emit(
+                    (
+                        "[LEAD CLEAN] 실제 RVC 학습 데이터셋 전환 완료: "
+                        f"{training_dataset} "
+                        f"(사용 {len(clean_result.outputs)}/{clean_result.total}, "
+                        f"검토 {clean_result.review}, 실패 {clean_result.failed})"
+                    )
+                )
+
+            elif (
+                self.lead_cleaner_enabled
+                and self.training_mode
+                == TRAINING_MODE_RESUME
+            ):
+                self.log_line.emit(
+                    (
+                        "[LEAD CLEAN] 기존 학습 이어하기 모드는 "
+                        "기존 전처리/F0/HuBERT 특징을 재사용하므로 "
+                        "Lead Cleaner를 새로 적용하지 않습니다."
+                    )
+                )
+
             result = self.pipeline.run(
-                dataset_dir=self.dataset_dir,
+                dataset_dir=training_dataset,
                 experiment_name=self.experiment_name,
                 epochs=self.epochs,
                 batch_size=self.batch_size,
@@ -767,6 +919,11 @@ class RVCTrainingThread(QThread):
                     if result.index_path
                     else ""
                 ),
+            )
+
+        except RVCTrainingDatasetCleanCancelled:
+            self.training_failed.emit(
+                "사용자가 학습용 Lead Dataset 정제를 중지했습니다."
             )
 
         except Exception:
@@ -957,8 +1114,9 @@ class MainWindow(QMainWindow):
 
         batch_help = QLabel(
             "유튜브 등에서 모아둔 같은 가수의 여러 곡을 한 번에 선택하면 "
-            "현재 BS-RoFormer 보컬 분리기를 이용해 한 곡씩 순차 처리합니다. "
-            "완료된 vocals WAV 폴더를 그대로 RVC 학습 데이터셋으로 사용할 수 있습니다."
+            "현재 BS-RoFormer 보컬 분리기를 이용해 원본 vocals WAV를 만듭니다. "
+            "아래 학습용 Lead Cleaner가 ON이면 학습 시작 시 원본을 보존한 채 "
+            "_rvc_lead_vocals 정제본을 별도로 만들고 그 폴더로 실제 학습합니다."
         )
         batch_help.setWordWrap(
             True
@@ -1175,6 +1333,71 @@ class MainWindow(QMainWindow):
             True
         )
 
+        self.rvc_training_lead_cleaner_check = QCheckBox(
+            "학습 전 Lead Vocal Selector로 데이터셋 정제"
+        )
+        self.rvc_training_lead_cleaner_check.setChecked(
+            self.settings.value(
+                "rvc_training_lead_cleaner_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.rvc_training_lead_cleaner_check.setToolTip(
+            "원본 데이터셋을 덮어쓰지 않습니다. "
+            "학습 시작 전에 Lead 후보만 별도 폴더로 정제하고, "
+            "RVC는 그 정제본을 실제 데이터셋으로 사용합니다."
+        )
+
+        self.rvc_training_lead_strength_combo = QComboBox()
+        self.rvc_training_lead_strength_combo.addItem(
+            "약함 - 발음/음색 보존 우선",
+            "gentle",
+        )
+        self.rvc_training_lead_strength_combo.addItem(
+            "보통 - 권장",
+            "balanced",
+        )
+        self.rvc_training_lead_strength_combo.addItem(
+            "강함 - 화음/백킹 제거 우선",
+            "strict",
+        )
+
+        saved_training_strength = self.settings.value(
+            "rvc_training_lead_cleaner_strength",
+            "balanced",
+            type=str,
+        )
+        saved_training_strength_index = (
+            self.rvc_training_lead_strength_combo.findData(
+                saved_training_strength
+            )
+        )
+        self.rvc_training_lead_strength_combo.setCurrentIndex(
+            (
+                saved_training_strength_index
+                if saved_training_strength_index >= 0
+                else 1
+            )
+        )
+
+        self.rvc_training_lead_output_label = QLabel(
+            "Lead 정제 출력 폴더는 데이터셋 선택 후 표시됩니다."
+        )
+        self.rvc_training_lead_output_label.setWordWrap(
+            True
+        )
+        self.rvc_training_lead_output_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        self.rvc_training_lead_cleaner_check.toggled.connect(
+            self.on_rvc_training_lead_cleaner_settings_changed
+        )
+        self.rvc_training_lead_strength_combo.currentIndexChanged.connect(
+            self.on_rvc_training_lead_cleaner_settings_changed
+        )
+
         training_data_layout.addRow(
             "데이터셋",
             dataset_row,
@@ -1182,6 +1405,18 @@ class MainWindow(QMainWindow):
         training_data_layout.addRow(
             "",
             self.rvc_training_dataset_status,
+        )
+        training_data_layout.addRow(
+            "",
+            self.rvc_training_lead_cleaner_check,
+        )
+        training_data_layout.addRow(
+            "학습 Lead 강도",
+            self.rvc_training_lead_strength_combo,
+        )
+        training_data_layout.addRow(
+            "정제 출력",
+            self.rvc_training_lead_output_label,
         )
 
         rvc_training_root.addWidget(
@@ -4488,7 +4723,167 @@ class MainWindow(QMainWindow):
         self.rvc_training_start_button.setText(
             button_text
         )
+
+        if hasattr(
+            self,
+            "rvc_training_lead_cleaner_check",
+        ):
+            cleaner_allowed = (
+                mode
+                != TRAINING_MODE_RESUME
+            )
+
+            self.rvc_training_lead_cleaner_check.setEnabled(
+                cleaner_allowed
+            )
+            self.rvc_training_lead_strength_combo.setEnabled(
+                cleaner_allowed
+                and self.rvc_training_lead_cleaner_check.isChecked()
+            )
+
+            if cleaner_allowed:
+                self.rvc_training_lead_cleaner_check.setToolTip(
+                    "학습 전에 원본 데이터셋을 Lead-only 정제본으로 만들고 "
+                    "그 폴더를 실제 학습 데이터로 사용합니다."
+                )
+            else:
+                self.rvc_training_lead_cleaner_check.setToolTip(
+                    "기존 학습 이어하기는 이미 만들어진 전처리/F0/HuBERT를 "
+                    "그대로 재사용하므로 새 Lead Cleaner가 적용되지 않습니다. "
+                    "정제 데이터를 기존 모델에 반영하려면 "
+                    "'데이터 추가 후 파인튜닝'을 사용하세요."
+                )
+
+            self.on_rvc_training_lead_cleaner_settings_changed()
+
         self.refresh_rvc_training_experiment_status()
+
+    def on_rvc_training_lead_cleaner_settings_changed(
+        self,
+        *_args,
+    ):
+        if not hasattr(
+            self,
+            "rvc_training_lead_cleaner_check",
+        ):
+            return
+
+        enabled = (
+            self.rvc_training_lead_cleaner_check.isChecked()
+        )
+        mode = (
+            self._current_rvc_training_mode()
+            if hasattr(
+                self,
+                "rvc_training_mode_combo",
+            )
+            else TRAINING_MODE_NEW
+        )
+        allowed = (
+            mode
+            != TRAINING_MODE_RESUME
+        )
+
+        self.rvc_training_lead_strength_combo.setEnabled(
+            enabled
+            and allowed
+        )
+
+        self.settings.setValue(
+            "rvc_training_lead_cleaner_enabled",
+            enabled,
+        )
+        self.settings.setValue(
+            "rvc_training_lead_cleaner_strength",
+            self.rvc_training_lead_strength_combo.currentData()
+            or "balanced",
+        )
+
+        dataset_dir = self.settings.value(
+            "rvc_training_dataset_dir",
+            "",
+            type=str,
+        )
+
+        if not dataset_dir:
+            self.rvc_training_lead_output_label.setText(
+                "Lead 정제 출력 폴더는 데이터셋 선택 후 표시됩니다."
+            )
+            return
+
+        dataset_path = Path(
+            dataset_dir
+        ).expanduser().resolve()
+
+        if is_lead_clean_dataset(
+            dataset_path
+        ):
+            output_path = (
+                dataset_path
+            )
+            prefix = (
+                "이미 v2.8 Lead 정제 데이터셋: "
+            )
+        else:
+            output_path = (
+                default_clean_output_dir(
+                    dataset_path
+                )
+            )
+            prefix = (
+                "학습 시 생성/재사용: "
+            )
+
+        if not allowed:
+            self.rvc_training_lead_output_label.setText(
+                (
+                    "이어하기 모드: 기존 특징을 재사용하므로 "
+                    "새 정제는 수행하지 않음"
+                )
+            )
+        elif enabled:
+            self.rvc_training_lead_output_label.setText(
+                prefix
+                + str(
+                    output_path
+                )
+            )
+        else:
+            self.rvc_training_lead_output_label.setText(
+                "OFF - 선택한 데이터셋을 그대로 학습"
+            )
+
+    def on_rvc_training_dataset_prepared(
+        self,
+        dataset_dir: str,
+    ):
+        path = Path(
+            dataset_dir
+        ).expanduser().resolve()
+
+        self.settings.setValue(
+            "rvc_training_dataset_dir",
+            str(
+                path
+            ),
+        )
+        self.rvc_training_dataset_label.setText(
+            str(
+                path
+            )
+        )
+        self.rvc_training_dataset_status.setText(
+            dataset_status_text(
+                path
+            )
+            + " / Lead Cleaner 정제본"
+        )
+        self.rvc_training_lead_output_label.setText(
+            "실제 학습 데이터셋: "
+            + str(
+                path
+            )
+        )
 
     def choose_rvc_training_dataset(self):
         current = self.settings.value(
@@ -4524,6 +4919,7 @@ class MainWindow(QMainWindow):
             )
         )
 
+        self.on_rvc_training_lead_cleaner_settings_changed()
         self.refresh_rvc_training_status()
 
     def start_rvc_training(self):
@@ -4587,6 +4983,19 @@ class MainWindow(QMainWindow):
             training_mode,
         )
 
+        cleaner_requested = (
+            self.rvc_training_lead_cleaner_check.isChecked()
+        )
+        cleaner_enabled_for_run = bool(
+            cleaner_requested
+            and training_mode
+            != TRAINING_MODE_RESUME
+        )
+        cleaner_strength = (
+            self.rvc_training_lead_strength_combo.currentData()
+            or "balanced"
+        )
+
         extra_text = ""
 
         if training_mode == TRAINING_MODE_RESUME:
@@ -4598,6 +5007,42 @@ class MainWindow(QMainWindow):
             extra_text = (
                 "\n기존 G/D 체크포인트는 보존하고, "
                 "현재 폴더의 기존+신규 데이터 전체에서 특징을 재구축합니다."
+            )
+
+        if cleaner_enabled_for_run:
+            cleaner_output = (
+                default_clean_output_dir(
+                    dataset_path
+                )
+            )
+            cleaner_label = {
+                "gentle": "약함",
+                "balanced": "보통",
+                "strict": "강함",
+            }.get(
+                cleaner_strength,
+                "보통",
+            )
+            extra_text += (
+                "\nLead 학습 정제: ON "
+                f"({cleaner_label})"
+                "\n원본은 보존하고 실제 학습은 다음 정제본을 사용합니다:"
+                f"\n{cleaner_output}"
+            )
+
+        elif (
+            cleaner_requested
+            and training_mode
+            == TRAINING_MODE_RESUME
+        ):
+            extra_text += (
+                "\nLead 학습 정제: 이어하기 모드에서는 적용 안 함 "
+                "(기존 특징 재사용)"
+            )
+
+        else:
+            extra_text += (
+                "\nLead 학습 정제: OFF"
             )
 
         answer = QMessageBox.question(
@@ -4660,6 +5105,8 @@ class MainWindow(QMainWindow):
                 self.rvc_training_cache_gpu_check.isChecked()
             ),
             training_mode=training_mode,
+            lead_cleaner_enabled=cleaner_enabled_for_run,
+            lead_cleaner_strength=cleaner_strength,
             parent=self,
         )
 
@@ -4668,6 +5115,9 @@ class MainWindow(QMainWindow):
         )
         self.rvc_training_worker.log_line.connect(
             self.on_rvc_training_log
+        )
+        self.rvc_training_worker.dataset_prepared.connect(
+            self.on_rvc_training_dataset_prepared
         )
         self.rvc_training_worker.training_done.connect(
             self.on_rvc_training_done
