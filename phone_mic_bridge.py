@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V36_S24_SMART_VOICE_GAIN_PATCH
 # V35_S24_NOISE_MONITOR_PATCH
 # V34_S24_PHONE_MIC_BRIDGE_PATCH
 #
@@ -487,6 +488,21 @@ class SimpleDSP:
         self.transient_reduction_db = 10.0
         self.transient_hits = 0
 
+        # v3.6 Smart Voice Gain:
+        # slow upward gain / fast downward correction, followed by a
+        # packet-safe limiter. This is designed for desk-distance speech.
+        self.smart_gain_enabled = True
+        self.smart_gain_target_db = -20.0
+        self.smart_gain_max_boost_db = 18.0
+        self.smart_gain_max_cut_db = 12.0
+        self.smart_gain_speech_floor_db = -48.0
+        self.limiter_enabled = True
+        self.limiter_ceiling_db = -1.0
+        self.smart_gain_current_db = 0.0
+        self.smart_gain_last_input_rms_db = -120.0
+        self.smart_gain_last_output_rms_db = -120.0
+        self.limiter_reduction_db = 0.0
+
         self._hp_x1 = 0.0
         self._hp_y1 = 0.0
         self._gate_gain = 1.0
@@ -496,6 +512,10 @@ class SimpleDSP:
         self._hp_y1 = 0.0
         self._gate_gain = 1.0
         self.transient_hits = 0
+        self.smart_gain_current_db = 0.0
+        self.smart_gain_last_input_rms_db = -120.0
+        self.smart_gain_last_output_rms_db = -120.0
+        self.limiter_reduction_db = 0.0
 
     def process(self, data: np.ndarray) -> np.ndarray:
         x = np.asarray(
@@ -668,7 +688,141 @@ class SimpleDSP:
         )
         x *= float(gain)
 
-        # Avoid Windows output clipping.
+        # ----------------------------------------------------
+        # v3.6 Smart Voice Gain
+        # ----------------------------------------------------
+        #
+        # The phone can be 40~80 cm away on a desk. Fixed gain alone
+        # either stays too quiet or clips when the user moves closer.
+        # This leveler follows speech RMS toward a target, increases
+        # gain slowly, reduces it quickly, and does NOT chase silence.
+        rms = float(
+            np.sqrt(
+                np.mean(
+                    x.astype(np.float64) ** 2
+                )
+                + 1e-12
+            )
+        )
+        input_rms_db = (
+            20.0
+            * math.log10(
+                max(
+                    rms,
+                    1e-8,
+                )
+            )
+        )
+        self.smart_gain_last_input_rms_db = float(
+            input_rms_db
+        )
+
+        if self.smart_gain_enabled:
+            if input_rms_db >= float(
+                self.smart_gain_speech_floor_db
+            ):
+                desired_db = float(
+                    self.smart_gain_target_db
+                ) - float(
+                    input_rms_db
+                )
+                desired_db = max(
+                    -abs(
+                        float(
+                            self.smart_gain_max_cut_db
+                        )
+                    ),
+                    min(
+                        abs(
+                            float(
+                                self.smart_gain_max_boost_db
+                            )
+                        ),
+                        desired_db,
+                    ),
+                )
+
+                # When the signal suddenly gets louder, reduce gain fast
+                # to avoid clipping. Raise gain slowly to avoid pumping.
+                if desired_db < self.smart_gain_current_db:
+                    alpha = 0.35
+                else:
+                    alpha = 0.055
+
+                self.smart_gain_current_db += (
+                    desired_db
+                    - self.smart_gain_current_db
+                ) * alpha
+
+            # If the frame is below the speech floor, hold the current
+            # gain instead of turning room noise up toward the target.
+            auto_gain = 10.0 ** (
+                float(
+                    self.smart_gain_current_db
+                )
+                / 20.0
+            )
+            x *= float(
+                auto_gain
+            )
+        else:
+            self.smart_gain_current_db = 0.0
+
+        # Packet-safe peak limiter. The whole 20 ms packet is scaled
+        # together, which avoids hard sample clipping.
+        self.limiter_reduction_db = 0.0
+
+        if self.limiter_enabled:
+            ceiling = 10.0 ** (
+                float(
+                    self.limiter_ceiling_db
+                )
+                / 20.0
+            )
+            peak = float(
+                np.max(
+                    np.abs(
+                        x
+                    )
+                )
+                + 1e-12
+            )
+
+            if peak > ceiling:
+                scale = float(
+                    ceiling
+                    / peak
+                )
+                x *= scale
+                self.limiter_reduction_db = float(
+                    20.0
+                    * math.log10(
+                        max(
+                            scale,
+                            1e-8,
+                        )
+                    )
+                )
+
+        output_rms = float(
+            np.sqrt(
+                np.mean(
+                    x.astype(np.float64) ** 2
+                )
+                + 1e-12
+            )
+        )
+        self.smart_gain_last_output_rms_db = float(
+            20.0
+            * math.log10(
+                max(
+                    output_rms,
+                    1e-8,
+                )
+            )
+        )
+
+        # Final numerical safety.
         np.clip(
             x,
             -0.999,
@@ -1271,6 +1425,11 @@ class PhoneMicRuntime:
         gate_threshold_db: float,
         transient_suppression_enabled: bool,
         transient_reduction_db: float,
+        smart_gain_enabled: bool,
+        smart_gain_target_db: float,
+        smart_gain_max_boost_db: float,
+        limiter_enabled: bool,
+        limiter_ceiling_db: float,
         record_clean_copy: bool,
     ) -> None:
         with self._settings_lock:
@@ -1297,6 +1456,21 @@ class PhoneMicRuntime:
             )
             self.dsp.transient_reduction_db = float(
                 transient_reduction_db
+            )
+            self.dsp.smart_gain_enabled = bool(
+                smart_gain_enabled
+            )
+            self.dsp.smart_gain_target_db = float(
+                smart_gain_target_db
+            )
+            self.dsp.smart_gain_max_boost_db = float(
+                smart_gain_max_boost_db
+            )
+            self.dsp.limiter_enabled = bool(
+                limiter_enabled
+            )
+            self.dsp.limiter_ceiling_db = float(
+                limiter_ceiling_db
             )
             self.record_clean_copy = bool(
                 record_clean_copy
@@ -2077,6 +2251,18 @@ class PhoneMicRuntime:
             "transient_hits": int(
                 self.dsp.transient_hits
             ),
+            "smart_gain_db": float(
+                self.dsp.smart_gain_current_db
+            ),
+            "smart_gain_input_rms_db": float(
+                self.dsp.smart_gain_last_input_rms_db
+            ),
+            "smart_gain_output_rms_db": float(
+                self.dsp.smart_gain_last_output_rms_db
+            ),
+            "limiter_reduction_db": float(
+                self.dsp.limiter_reduction_db
+            ),
         }
 
 
@@ -2124,7 +2310,7 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         intro = QGroupBox(
-            "Galaxy S24 Ultra Phone Mic Bridge v3.5"
+            "Galaxy S24 Ultra Phone Mic Bridge v3.6"
         )
         intro_layout = QVBoxLayout(
             intro
@@ -2311,9 +2497,10 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         raw_note = QLabel(
-            "RAW WAV는 PC DSP 전 신호를 그대로 보존합니다. "
-            "CLEAN WAV 동시 저장을 켜면 아래 DSP/순간음 억제를 적용한 파일도 같이 저장합니다. "
-            "휴대폰 웹페이지의 Browser Noise Suppression은 PC에 오기 전에 적용되므로 RAW에도 반영됩니다."
+            "RAW WAV는 PC DSP/Smart Gain 전 신호를 그대로 보존합니다. "
+            "CLEAN WAV에는 Gain/HPF/Gate/순간음 억제/Smart Voice Gain/Limiter가 적용됩니다. "
+            "책상 거치 실사용에서는 CLEAN 파일을 바로 쓰고, RAW는 원본 보관용으로 남길 수 있습니다. "
+            "휴대폰 Browser Noise Suppression은 PC에 오기 전에 적용되므로 RAW에도 반영됩니다."
         )
         raw_note.setWordWrap(
             True
@@ -2480,8 +2667,141 @@ class PhoneMicBridgeWidget(QWidget):
             transient_row,
         )
 
+        self.smart_gain_check = QCheckBox(
+            "Smart Voice Gain 사용 (책상 거리 음성 증폭, 권장)"
+        )
+        self.smart_gain_check.setChecked(
+            self.settings.value(
+                "phone_mic_smart_gain_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.smart_gain_check.setToolTip(
+            "말소리의 단기 RMS를 목표 레벨 쪽으로 천천히 올리고, "
+            "가까이 말해서 갑자기 커질 때는 빠르게 Gain을 줄입니다. "
+            "무음 구간은 목표 레벨까지 끌어올리지 않아 배경 소음 펌핑을 줄입니다."
+        )
+
+        self.smart_gain_target_spin = QDoubleSpinBox()
+        self.smart_gain_target_spin.setRange(
+            -30.0,
+            -12.0,
+        )
+        self.smart_gain_target_spin.setDecimals(
+            1
+        )
+        self.smart_gain_target_spin.setSingleStep(
+            1.0
+        )
+        self.smart_gain_target_spin.setSuffix(
+            " dBFS RMS"
+        )
+        self.smart_gain_target_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_smart_gain_target_db",
+                    -20.0,
+                )
+            )
+        )
+
+        self.smart_gain_max_spin = QDoubleSpinBox()
+        self.smart_gain_max_spin.setRange(
+            0.0,
+            30.0,
+        )
+        self.smart_gain_max_spin.setDecimals(
+            1
+        )
+        self.smart_gain_max_spin.setSingleStep(
+            1.0
+        )
+        self.smart_gain_max_spin.setSuffix(
+            " dB"
+        )
+        self.smart_gain_max_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_smart_gain_max_boost_db",
+                    18.0,
+                )
+            )
+        )
+
+        smart_gain_row = QHBoxLayout()
+        smart_gain_row.addWidget(
+            self.smart_gain_check
+        )
+        smart_gain_row.addWidget(
+            QLabel(
+                "Target"
+            )
+        )
+        smart_gain_row.addWidget(
+            self.smart_gain_target_spin
+        )
+        smart_gain_row.addWidget(
+            QLabel(
+                "Max"
+            )
+        )
+        smart_gain_row.addWidget(
+            self.smart_gain_max_spin
+        )
+        dsp_layout.addRow(
+            "Voice Level",
+            smart_gain_row,
+        )
+
+        self.limiter_check = QCheckBox(
+            "Limiter 사용"
+        )
+        self.limiter_check.setChecked(
+            self.settings.value(
+                "phone_mic_limiter_enabled",
+                True,
+                type=bool,
+            )
+        )
+
+        self.limiter_ceiling_spin = QDoubleSpinBox()
+        self.limiter_ceiling_spin.setRange(
+            -6.0,
+            -0.1,
+        )
+        self.limiter_ceiling_spin.setDecimals(
+            1
+        )
+        self.limiter_ceiling_spin.setSingleStep(
+            0.5
+        )
+        self.limiter_ceiling_spin.setSuffix(
+            " dBFS"
+        )
+        self.limiter_ceiling_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_limiter_ceiling_db",
+                    -1.0,
+                )
+            )
+        )
+
+        limiter_row = QHBoxLayout()
+        limiter_row.addWidget(
+            self.limiter_check
+        )
+        limiter_row.addWidget(
+            self.limiter_ceiling_spin
+        )
+        dsp_layout.addRow(
+            "Peak Safety",
+            limiter_row,
+        )
+
         self.clean_record_check = QCheckBox(
-            "CLEAN WAV 동시 저장 (PC DSP 적용)"
+            "CLEAN WAV 동시 저장 (PC DSP + Smart Gain 적용)"
         )
         self.clean_record_check.setChecked(
             self.settings.value(
@@ -2795,6 +3115,26 @@ class PhoneMicBridgeWidget(QWidget):
             self.transient_reduction_spin.value(),
         )
         self.settings.setValue(
+            "phone_mic_smart_gain_enabled",
+            self.smart_gain_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_smart_gain_target_db",
+            self.smart_gain_target_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_smart_gain_max_boost_db",
+            self.smart_gain_max_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_limiter_enabled",
+            self.limiter_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_limiter_ceiling_db",
+            self.limiter_ceiling_spin.value(),
+        )
+        self.settings.setValue(
             "phone_mic_record_clean_copy",
             self.clean_record_check.isChecked(),
         )
@@ -2811,6 +3151,11 @@ class PhoneMicBridgeWidget(QWidget):
             gate_threshold_db=self.gate_spin.value(),
             transient_suppression_enabled=self.transient_check.isChecked(),
             transient_reduction_db=self.transient_reduction_spin.value(),
+            smart_gain_enabled=self.smart_gain_check.isChecked(),
+            smart_gain_target_db=self.smart_gain_target_spin.value(),
+            smart_gain_max_boost_db=self.smart_gain_max_spin.value(),
+            limiter_enabled=self.limiter_check.isChecked(),
+            limiter_ceiling_db=self.limiter_ceiling_spin.value(),
             record_clean_copy=self.clean_record_check.isChecked(),
         )
 
@@ -2851,6 +3196,11 @@ class PhoneMicBridgeWidget(QWidget):
                 gate_threshold_db=self.gate_spin.value(),
                 transient_suppression_enabled=self.transient_check.isChecked(),
                 transient_reduction_db=self.transient_reduction_spin.value(),
+                smart_gain_enabled=self.smart_gain_check.isChecked(),
+                smart_gain_target_db=self.smart_gain_target_spin.value(),
+                smart_gain_max_boost_db=self.smart_gain_max_spin.value(),
+                limiter_enabled=self.limiter_check.isChecked(),
+                limiter_ceiling_db=self.limiter_ceiling_spin.value(),
                 record_clean_copy=self.clean_record_check.isChecked(),
             )
             QMessageBox.warning(
@@ -3062,7 +3412,9 @@ class PhoneMicBridgeWidget(QWidget):
             f"last {age_text} / "
             f"underflow {snap['underflow_ms']:.0f}ms / "
             f"overflow {snap['overflow_ms']:.0f}ms / "
-            f"click suppress {snap['transient_hits']}"
+            f"click suppress {snap['transient_hits']} / "
+            f"auto gain {snap['smart_gain_db']:+.1f}dB / "
+            f"clean RMS {snap['smart_gain_output_rms_db']:.1f}dBFS"
         )
 
         if snap["recording"]:
