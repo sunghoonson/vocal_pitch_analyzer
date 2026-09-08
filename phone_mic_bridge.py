@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V42_RVC_AB_ALIGNMENT_LOW_LATENCY_PATCH
 # V41_RVC_AB_DEBUG_RECORD_PATCH
 # V40_S24_CAMERA_VIRTUAL_WEBCAM_PATCH
 # V39B_REALTIME_RVC_INDEX_HOTFIX
@@ -74,6 +75,11 @@ from nvidia_broadcast_capture import (
 
 from nvidia_broadcast_ab_renderer import (
     NvidiaBroadcastABRenderer,
+)
+
+from rvc_ab_audio_align import (
+    align_wav_to_reference,
+    write_ab_report,
 )
 
 from realtime_rvc_engine import (
@@ -997,6 +1003,8 @@ class PhoneMicRuntime:
         self._ab_last_clean_rvc_path: Path | None = None
         self._ab_last_broadcast_original_path: Path | None = None
         self._ab_last_broadcast_rvc_path: Path | None = None
+        self._ab_last_report_path: Path | None = None
+        self._ab_clean_rvc_alignment: dict = {}
         self._ab_render_state = "idle"
         self._ab_render_error = ""
         self._ab_rendering = False
@@ -2012,6 +2020,8 @@ class PhoneMicRuntime:
             self._ab_last_clean_rvc_path = None
             self._ab_last_broadcast_original_path = None
             self._ab_last_broadcast_rvc_path = None
+            self._ab_last_report_path = None
+            self._ab_clean_rvc_alignment = {}
             self._ab_render_state = "idle"
             self._ab_render_error = ""
 
@@ -2353,6 +2363,51 @@ class PhoneMicRuntime:
                         "broadcast_rvc"
                     ]
                 )
+
+                report_payload = {
+                    "version": "v4.2",
+                    "stamp": str(
+                        stamp
+                    ),
+                    "clean_original": str(
+                        clean_original_path
+                    ),
+                    "clean_rvc": str(
+                        clean_rvc_path
+                    ),
+                    "clean_rvc_alignment": dict(
+                        self._ab_clean_rvc_alignment
+                    ),
+                    "broadcast_original": str(
+                        self._ab_last_broadcast_original_path
+                    ),
+                    "broadcast_rvc": str(
+                        self._ab_last_broadcast_rvc_path
+                    ),
+                    "broadcast_original_alignment": outputs.get(
+                        "broadcast_original_alignment",
+                        {},
+                    ),
+                    "broadcast_rvc_alignment": outputs.get(
+                        "broadcast_rvc_alignment",
+                        {},
+                    ),
+                    "broadcast_preroll_ms": outputs.get(
+                        "broadcast_preroll_ms",
+                        0,
+                    ),
+                }
+
+                report_path = (
+                    Path(
+                        parent_dir
+                    )
+                    / f"s24_rvc_ab_report_{stamp}.json"
+                )
+                self._ab_last_report_path = write_ab_report(
+                    path=report_path,
+                    payload=report_payload,
+                )
                 self._ab_render_state = "done"
 
                 self.log(
@@ -2371,6 +2426,10 @@ class PhoneMicRuntime:
                 self.log(
                     "  BROADCAST RVC: "
                     f"{self._ab_last_broadcast_rvc_path}"
+                )
+                self.log(
+                    "  REPORT: "
+                    f"{self._ab_last_report_path}"
                 )
 
             except Exception as exc:
@@ -2468,6 +2527,52 @@ class PhoneMicRuntime:
             self.log(
                 "[RVC A/B] CLEAN 2종 녹음 완료."
             )
+
+            try:
+                alignment = align_wav_to_reference(
+                    reference_path=ab_original_path,
+                    target_path=ab_rvc_path,
+                    max_lag_ms=max(
+                        600,
+                        int(
+                            self.realtime_rvc_block_ms
+                            * 3
+                        ),
+                    ),
+                    minimum_correlation=0.35,
+                    fade_in_ms=5.0,
+                )
+                self._ab_clean_rvc_alignment = dict(
+                    alignment
+                )
+
+                if alignment.get(
+                    "applied"
+                ):
+                    self.log(
+                        "[RVC A/B] CLEAN RVC 녹음 경계 자동 정렬: "
+                        f"{float(alignment.get('lag_ms', 0.0)):.0f}ms trim / "
+                        f"corr={float(alignment.get('correlation', 0.0)):.3f}"
+                    )
+                else:
+                    self.log(
+                        "[RVC A/B] CLEAN RVC 자동 정렬 생략: "
+                        f"lag={float(alignment.get('lag_ms', 0.0)):.0f}ms / "
+                        f"corr={float(alignment.get('correlation', 0.0)):.3f}"
+                    )
+
+            except Exception as exc:
+                self._ab_clean_rvc_alignment = {
+                    "applied": False,
+                    "error": (
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+                self.log(
+                    "[RVC A/B] CLEAN RVC 자동 정렬 실패: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
             self._start_ab_broadcast_render(
                 clean_original_path=ab_original_path,
                 clean_rvc_path=ab_rvc_path,
@@ -2623,6 +2728,16 @@ class PhoneMicRuntime:
                 )
                 if self._ab_last_broadcast_rvc_path
                 else ""
+            ),
+            "rvc_ab_report_path": (
+                str(
+                    self._ab_last_report_path
+                )
+                if self._ab_last_report_path
+                else ""
+            ),
+            "rvc_ab_clean_rvc_alignment": dict(
+                self._ab_clean_rvc_alignment
             ),
             "transient_hits": int(
                 self.dsp.transient_hits
@@ -3610,19 +3725,27 @@ class PhoneMicBridgeWidget(QWidget):
         self.realtime_rvc_block_combo = QComboBox()
         for label, value in (
             (
-                "150 ms - 낮은 지연 / 부하 높음",
+                "100 ms - 초저지연 / RTX 50 권장 테스트",
+                100,
+            ),
+            (
+                "120 ms - 저지연",
+                120,
+            ),
+            (
+                "150 ms - 균형",
                 150,
             ),
             (
-                "200 ms - 권장",
+                "200 ms - 안정성 우선",
                 200,
             ),
             (
-                "250 ms - 안정성 우선",
+                "250 ms - 높은 안정성",
                 250,
             ),
             (
-                "300 ms - 더 안정적 / 지연 큼",
+                "300 ms - 지연 큼",
                 300,
             ),
         ):
@@ -3643,7 +3766,12 @@ class PhoneMicBridgeWidget(QWidget):
         self.realtime_rvc_block_combo.setCurrentIndex(
             block_index
             if block_index >= 0
-            else 1
+            else max(
+                0,
+                self.realtime_rvc_block_combo.findData(
+                    200
+                ),
+            )
         )
         rvc_layout.addRow(
             "Processing Block",
@@ -3651,6 +3779,21 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         rvc_button_row = QHBoxLayout()
+        self.realtime_rvc_low_latency_button = QPushButton(
+            "저지연 프리셋"
+        )
+        self.realtime_rvc_low_latency_button.setToolTip(
+            "RVC Block=100ms / Jitter=30ms로 설정합니다. "
+            "RTX 5070 Ti에서 우선 테스트하고 worker roundtrip이 90ms 이상이면 "
+            "120~150ms로 올리세요. 변경 후 RVC 엔진 재시작이 필요합니다."
+        )
+        self.realtime_rvc_low_latency_button.clicked.connect(
+            self.apply_realtime_rvc_low_latency_preset
+        )
+        rvc_button_row.addWidget(
+            self.realtime_rvc_low_latency_button
+        )
+
         self.realtime_rvc_start_button = QPushButton(
             "RVC 엔진 로드 / 재시작"
         )
@@ -3693,7 +3836,7 @@ class PhoneMicBridgeWidget(QWidget):
             "CABLE Input → NVIDIA Broadcast → 게임. "
             "모델 로딩 중/실패 시에는 CLEAN 원음이 자동 통과합니다. "
             "RMVPE + SOLA / eager CUDA 경로를 사용합니다. v3.9b는 added IVF index의 nprobe=1 sparse-search 문제를 런타임에서 보정합니다. "
-            "A/B 디버그는 CLEAN 원본/RVC를 동시에 저장하고, 녹음 종료 후 NVIDIA Broadcast 원본/RVC를 비동기로 렌더합니다."
+            "A/B 디버그는 녹음 경계에서 생기는 RVC stale block을 자동 감지/trim해 ORIGINAL과 시간축을 맞춘 뒤, NVIDIA Broadcast 2종도 각각 자동 정렬합니다."
         )
         rvc_note.setWordWrap(
             True
@@ -3988,6 +4131,30 @@ class PhoneMicBridgeWidget(QWidget):
                 self.realtime_rvc_block_combo.currentData()
                 or 200
             ),
+        )
+
+    def apply_realtime_rvc_low_latency_preset(
+        self,
+    ) -> None:
+        block_index = self.realtime_rvc_block_combo.findData(
+            100
+        )
+
+        if block_index >= 0:
+            self.realtime_rvc_block_combo.setCurrentIndex(
+                block_index
+            )
+
+        self.jitter_spin.setValue(
+            30
+        )
+        self._save_realtime_rvc_settings()
+        self._save_settings()
+
+        self.runtime.log(
+            "[Realtime RVC] 저지연 프리셋 설정: "
+            "Block=100ms / Jitter=30ms. "
+            "RVC 엔진을 재시작하면 적용됩니다."
         )
 
     def start_realtime_rvc(
@@ -4871,12 +5038,45 @@ class PhoneMicBridgeWidget(QWidget):
             or ""
         )
 
+        current_block_ms = int(
+            self.realtime_rvc_block_combo.currentData()
+            or 200
+        )
+        current_jitter_ms = int(
+            self.jitter_spin.value()
+        )
+        estimated_app_delay_ms = (
+            float(
+                current_block_ms
+            )
+            + float(
+                rt_ms
+            )
+            + float(
+                current_jitter_ms
+            )
+            + float(
+                rt_queue
+            )
+        )
+
         self.realtime_rvc_live_label.setText(
             f"State: {rt_state} / "
             f"READY={rt_ready} / "
             f"worker roundtrip={rt_ms:.1f}ms / "
             f"queue≈{rt_queue:.0f}ms / "
             f"dropped={rt_drop}"
+            + (
+                f"\n앱 내부 예상 지연≈{estimated_app_delay_ms:.0f}ms "
+                f"(block {current_block_ms} + worker {rt_ms:.0f} + jitter {current_jitter_ms})"
+                if rt_ready
+                else ""
+            )
+            + (
+                "\n※ NVIDIA Broadcast 지연은 위 예상값에 포함되지 않습니다."
+                if rt_ready
+                else ""
+            )
             + (
                 f"\nERROR: {rt_error}"
                 if rt_error
@@ -4925,6 +5125,17 @@ class PhoneMicBridgeWidget(QWidget):
             )
             or ""
         )
+        ab_report = str(
+            snap.get(
+                "rvc_ab_report_path",
+                "",
+            )
+            or ""
+        )
+        ab_alignment = snap.get(
+            "rvc_ab_clean_rvc_alignment",
+            {},
+        )
 
         ab_lines = [
             f"A/B: {ab_state}",
@@ -4953,6 +5164,24 @@ class PhoneMicBridgeWidget(QWidget):
         if ab_broadcast_rvc:
             ab_lines.append(
                 f"Broadcast RVC: {ab_broadcast_rvc}"
+            )
+
+        if (
+            isinstance(
+                ab_alignment,
+                dict,
+            )
+            and ab_alignment
+        ):
+            ab_lines.append(
+                "CLEAN RVC alignment: "
+                f"{float(ab_alignment.get('lag_ms', 0.0)):.0f}ms / "
+                f"corr={float(ab_alignment.get('correlation', 0.0)):.3f}"
+            )
+
+        if ab_report:
+            ab_lines.append(
+                f"Report: {ab_report}"
             )
 
         self.rvc_ab_status_label.setText(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V42_RVC_AB_ALIGNMENT_LOW_LATENCY_PATCH
 # V41_RVC_AB_DEBUG_RECORD_PATCH
 
 from pathlib import Path
@@ -12,6 +13,8 @@ import numpy as np
 
 from nvidia_broadcast_capture import NvidiaBroadcastCapture
 
+from rvc_ab_audio_align import align_wav_to_reference
+
 try:
     import sounddevice as sd
 except Exception as exc:
@@ -19,6 +22,10 @@ except Exception as exc:
     SOUNDDEVICE_ERROR = f"{type(exc).__name__}: {exc}"
 else:
     SOUNDDEVICE_ERROR = ""
+
+
+BROADCAST_PREROLL_SECONDS = 0.35
+BROADCAST_POSTROLL_SECONDS = 0.45
 
 
 class NvidiaBroadcastABRenderer:
@@ -293,7 +300,7 @@ class NvidiaBroadcastABRenderer:
             # Pre-roll captures Broadcast's steady idle state and makes sure
             # its PortAudio input stream is active before playback starts.
             time.sleep(
-                0.35
+                BROADCAST_PREROLL_SECONDS
             )
 
             self._play_to_output(
@@ -305,7 +312,7 @@ class NvidiaBroadcastABRenderer:
 
             # Preserve the final Broadcast tail/latency.
             time.sleep(
-                0.45
+                BROADCAST_POSTROLL_SECONDS
             )
 
         finally:
@@ -368,6 +375,20 @@ class NvidiaBroadcastABRenderer:
             label="original",
         )
 
+        original_alignment = align_wav_to_reference(
+            reference_path=original,
+            target_path=original_out,
+            max_lag_ms=1800,
+            minimum_correlation=0.30,
+            fade_in_ms=5.0,
+        )
+        self._log(
+            "[RVC A/B] Broadcast ORIGINAL 자동 정렬: "
+            f"lag={float(original_alignment.get('lag_ms', 0.0)):.0f}ms / "
+            f"corr={float(original_alignment.get('correlation', 0.0)):.3f} / "
+            f"applied={bool(original_alignment.get('applied', False))}"
+        )
+
         rvc_out = self._render_one(
             source_path=rvc,
             output_device=int(
@@ -383,6 +404,20 @@ class NvidiaBroadcastABRenderer:
             label="rvc",
         )
 
+        rvc_alignment = align_wav_to_reference(
+            reference_path=rvc,
+            target_path=rvc_out,
+            max_lag_ms=1800,
+            minimum_correlation=0.30,
+            fade_in_ms=5.0,
+        )
+        self._log(
+            "[RVC A/B] Broadcast RVC 자동 정렬: "
+            f"lag={float(rvc_alignment.get('lag_ms', 0.0)):.0f}ms / "
+            f"corr={float(rvc_alignment.get('correlation', 0.0)):.3f} / "
+            f"applied={bool(rvc_alignment.get('applied', False))}"
+        )
+
         self._log(
             "[RVC A/B] NVIDIA Broadcast 비교 렌더 완료."
         )
@@ -390,4 +425,12 @@ class NvidiaBroadcastABRenderer:
         return {
             "broadcast_original": original_out,
             "broadcast_rvc": rvc_out,
+            "broadcast_original_alignment": original_alignment,
+            "broadcast_rvc_alignment": rvc_alignment,
+            "broadcast_preroll_ms": int(
+                round(
+                    BROADCAST_PREROLL_SECONDS
+                    * 1000.0
+                )
+            ),
         }
