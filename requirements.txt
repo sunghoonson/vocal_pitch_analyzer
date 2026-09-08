@@ -3,3 +3,5 @@ librosa==1.0.0
 pyqtgraph==0.14.0
 soundfile==0.14.0
 numpy>=2.0,<3
+sounddevice>=0.5,<1
+websockets>=12,<16

@@ -119,10 +119,13 @@ from rvc_training_dataset_cleaner import (
     default_clean_output_dir,
     is_lead_clean_dataset,
 )
+from phone_mic_bridge import PhoneMicBridgeWidget
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.3 / Neural Lead-Backing RVC"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.5 / S24 Noise Control"
 
+# V35_S24_NOISE_MONITOR_PATCH
+# V34_S24_PHONE_MIC_BRIDGE_PATCH
 # V33_NEURAL_LEAD_BACKING_RVC_PATCH
 # V32_RVC_F0_STABILITY_GUARD_PATCH
 # V31_AI_REMIX_ACESTEP_PATCH
@@ -1360,6 +1363,14 @@ class MainWindow(QMainWindow):
             "ai_remix_tab"
         )
 
+        self.phone_mic_tab = PhoneMicBridgeWidget(
+            settings=self.settings,
+            parent=self.main_tabs,
+        )
+        self.phone_mic_tab.setObjectName(
+            "phone_mic_tab"
+        )
+
         self.main_tabs.addTab(
             self.analysis_tab,
             "분석 / 설정",
@@ -1379,6 +1390,10 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(
             self.rvc_training_tab,
             "RVC 모델 학습",
+        )
+        self.main_tabs.addTab(
+            self.phone_mic_tab,
+            "S24 마이크 브리지",
         )
 
         # ====================================================
@@ -8752,6 +8767,15 @@ class MainWindow(QMainWindow):
             ):
                 event.ignore()
                 return
+
+        if hasattr(
+            self,
+            "phone_mic_tab",
+        ):
+            try:
+                self.phone_mic_tab.shutdown()
+            except Exception:
+                pass
 
         self._release_vocal_resource()
         super().closeEvent(event)
