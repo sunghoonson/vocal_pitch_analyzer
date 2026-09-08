@@ -121,8 +121,9 @@ from rvc_training_dataset_cleaner import (
 )
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.2 / RVC F0 Stability"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.3 / Neural Lead-Backing RVC"
 
+# V33_NEURAL_LEAD_BACKING_RVC_PATCH
 # V32_RVC_F0_STABILITY_GUARD_PATCH
 # V31_AI_REMIX_ACESTEP_PATCH
 # V30_INSTRUMENT_SMART_SHIFT_PATCH
@@ -600,6 +601,7 @@ class RVCTransposeThread(QThread):
         speaker_id: int,
         f0_stability_enabled: bool,
         f0_stability_strength: str,
+        neural_lead_separator_enabled: bool,
         lead_selector_enabled: bool,
         lead_selector_strength: str,
         harmony_guard_enabled: bool,
@@ -631,6 +633,9 @@ class RVCTransposeThread(QThread):
         self.f0_stability_strength = str(
             f0_stability_strength
             or "balanced"
+        )
+        self.neural_lead_separator_enabled = bool(
+            neural_lead_separator_enabled
         )
         self.lead_selector_enabled = (
             lead_selector_enabled
@@ -679,6 +684,8 @@ class RVCTransposeThread(QThread):
                 speaker_id=self.speaker_id,
                 f0_stability_enabled=self.f0_stability_enabled,
                 f0_stability_strength=self.f0_stability_strength,
+                neural_lead_separator_enabled=self.neural_lead_separator_enabled,
+                neural_lead_separator_preset="karaoke",
                 lead_selector_enabled=self.lead_selector_enabled,
                 lead_selector_strength=self.lead_selector_strength,
                 harmony_guard_enabled=self.harmony_guard_enabled,
@@ -2976,6 +2983,28 @@ class MainWindow(QMainWindow):
             0
         )
 
+        self.rvc_neural_lead_separator_check = QCheckBox(
+            "AI Lead/Backing 2차 분리 사용 (Karaoke RoFormer ensemble, 권장)"
+        )
+        self.rvc_neural_lead_separator_check.setChecked(
+            self.settings.value(
+                "rvc_neural_lead_separator_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.rvc_neural_lead_separator_check.setToolTip(
+            "1차 BS-RoFormer의 vocals stem을 audio-separator의 "
+            "Karaoke 3-model ensemble로 다시 분리합니다. "
+            "Lead만 RVC로 변환하고 Backing/Harmony/Double은 "
+            "RVC를 통과시키지 않고 같은 semitone으로 Pitch Shift한 뒤 재합성합니다. "
+            "첫 실행에는 Karaoke 모델 3개 다운로드 때문에 시간이 오래 걸릴 수 있습니다. "
+            "실패하면 아래 Heuristic Lead Selector로 자동 fallback합니다."
+        )
+        self.rvc_neural_lead_separator_check.toggled.connect(
+            self.on_rvc_harmony_guard_settings_changed
+        )
+
         self.rvc_f0_stability_check = QCheckBox(
             "F0 Stability Guard 사용 (RMVPE 서브하모닉/옥타브 붕괴 보정)"
         )
@@ -3034,7 +3063,7 @@ class MainWindow(QMainWindow):
         )
 
         self.rvc_lead_selector_check = QCheckBox(
-            "Lead Vocal Selector 사용 (RVC 전 메인 보컬 선별)"
+            "Heuristic Lead Selector fallback 사용"
         )
         self.rvc_lead_selector_check.setChecked(
             self.settings.value(
@@ -3044,10 +3073,9 @@ class MainWindow(QMainWindow):
             )
         )
         self.rvc_lead_selector_check.setToolTip(
-            "BS-RoFormer vocals stem을 바로 RVC에 넣지 않고, "
-            "F0/배음/센터 성분을 분석해 메인 보컬 후보와 "
-            "Non-lead/화음 residual로 나눕니다. "
-            "Lead만 RVC, 나머지는 Pitch Shift only로 처리합니다."
+            "AI Lead/Backing 2차 분리가 꺼져 있거나 실패한 경우에만 "
+            "기존 F0/배음/센터 기반 heuristic Lead Selector를 사용합니다. "
+            "AI 2차 분리가 성공하면 중복 필터링을 피하기 위해 이 단계는 건너뜁니다."
         )
 
         self.rvc_lead_selector_strength_combo = QComboBox()
@@ -3217,17 +3245,15 @@ class MainWindow(QMainWindow):
         )
 
         self.rvc_help_label = QLabel(
-            "v3.0은 RVC Lead Vocal Selector에 더해 원곡 전체 변환 시 "
-            "반주를 Demucs 4-stem으로 분리해 Drums는 기본 원키 유지하고 "
-            "Bass/Other/Residual만 같은 semitone으로 이동합니다.\n"
-            "RVC 전에 Lead Vocal Selector를 적용해 "
-            "메인 보컬 후보만 RVC로 보내고 Non-lead/화음 residual은 Pitch Shift only로 처리합니다.\n"
-            "마지막 선별 결과는 cache\\rvc_lead_selector\\last_lead_candidate.wav 와 "
-            "last_nonlead_residual.wav 에 저장되어 직접 들어볼 수 있습니다. "
-            "v3.2 F0 Stability Guard는 RVC 합성 전에 RMVPE의 명확한 "
-            "서브하모닉/옥타브 붕괴를 pYIN 참조 F0로 보정하고, "
-            "logs\\rvc_f0_stability_last.csv/json에 실제 보정 구간을 기록합니다.\n"
-            "Artifact Guard와 수동 우회는 이후의 최종 안전망으로 그대로 유지됩니다."
+            "v3.3은 RVC 앞단을 실제 AI 2단 분리 구조로 변경합니다. "
+            "1차 BS-RoFormer는 Vocals/Instrumental을 분리하고, "
+            "2차 Karaoke RoFormer ensemble이 vocals를 Lead와 Backing/Harmony로 다시 나눕니다.\n"
+            "Lead만 RVC로 보내고 Backing/Harmony/Double은 RVC를 통과시키지 않은 채 "
+            "같은 semitone으로 이동해 다시 섞습니다. "
+            "직접 확인용 WAV는 cache\\rvc_neural_lead_backing\\last_lead.wav / "
+            "last_backing.wav 에 저장됩니다.\n"
+            "AI 2차 분리 실패 시 기존 Heuristic Lead Selector로 자동 fallback합니다. "
+            "F0 Stability Guard와 Artifact Guard/수동 우회도 최종 안전망으로 유지됩니다."
         )
         self.rvc_help_label.setWordWrap(
             True
@@ -3260,6 +3286,10 @@ class MainWindow(QMainWindow):
         rvc_layout.addRow(
             "Speaker ID",
             self.rvc_speaker_spin,
+        )
+        rvc_layout.addRow(
+            "",
+            self.rvc_neural_lead_separator_check,
         )
         rvc_layout.addRow(
             "",
@@ -7016,6 +7046,10 @@ class MainWindow(QMainWindow):
             self.rvc_harmony_guard_check.isChecked()
         )
 
+        neural_lead_separator_enabled = (
+            self.rvc_neural_lead_separator_check.isChecked()
+        )
+
         f0_stability_enabled = (
             self.rvc_f0_stability_check.isChecked()
         )
@@ -7044,6 +7078,10 @@ class MainWindow(QMainWindow):
             manual_enabled
         )
 
+        self.settings.setValue(
+            "rvc_neural_lead_separator_enabled",
+            neural_lead_separator_enabled,
+        )
         self.settings.setValue(
             "rvc_f0_stability_enabled",
             f0_stability_enabled,
@@ -7761,6 +7799,16 @@ class MainWindow(QMainWindow):
                     "\n반주 Smart Shift: OFF / 반주 전체 Pitch Shift"
                 )
 
+            if self.rvc_neural_lead_separator_check.isChecked():
+                preview += (
+                    "\nAI Lead/Backing 2차 분리: ON / "
+                    "Karaoke 3-model ensemble / Lead만 RVC"
+                )
+            else:
+                preview += (
+                    "\nAI Lead/Backing 2차 분리: OFF"
+                )
+
             if self.rvc_lead_selector_check.isChecked():
                 lead_strength_label = {
                     "gentle": "약함",
@@ -7771,13 +7819,12 @@ class MainWindow(QMainWindow):
                     "보통",
                 )
                 preview += (
-                    "\nLead Vocal Selector: ON / "
-                    f"강도 {lead_strength_label} / "
-                    "Lead만 RVC"
+                    "\nHeuristic Lead Selector fallback: ON / "
+                    f"강도 {lead_strength_label}"
                 )
             else:
                 preview += (
-                    "\nLead Vocal Selector: OFF / 전체 vocals를 RVC"
+                    "\nHeuristic Lead Selector fallback: OFF"
                 )
 
             if self.rvc_harmony_guard_check.isChecked():
@@ -8131,6 +8178,9 @@ class MainWindow(QMainWindow):
                 f0_stability_strength=(
                     self.rvc_f0_stability_strength_combo.currentData()
                     or "balanced"
+                ),
+                neural_lead_separator_enabled=(
+                    self.rvc_neural_lead_separator_check.isChecked()
                 ),
                 lead_selector_enabled=(
                     self.rvc_lead_selector_check.isChecked()

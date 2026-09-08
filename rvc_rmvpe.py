@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import traceback
@@ -33,7 +34,13 @@ from rvc_lead_selector import (
     LeadVocalSelectorError,
     select_lead_vocal,
 )
+from rvc_neural_lead_separator import (
+    DEFAULT_KARAOKE_PRESET,
+    NeuralLeadBackingError,
+    separate_lead_backing_for_rvc,
+)
 
+# V33_NEURAL_LEAD_BACKING_RVC_PATCH
 # V32_RVC_F0_STABILITY_GUARD_PATCH
 # V30_INSTRUMENT_SMART_SHIFT_PATCH
 # V25_RVC_ARTIFACT_GUARD_PATCH
@@ -1605,6 +1612,8 @@ def _prepare_rvc_vocal_pipeline(
     speaker_id: int,
     f0_stability_enabled: bool,
     f0_stability_strength: str,
+    neural_lead_separator_enabled: bool,
+    neural_lead_separator_preset: str,
     lead_selector_enabled: bool,
     lead_selector_strength: str,
     harmony_guard_enabled: bool,
@@ -1621,6 +1630,169 @@ def _prepare_rvc_vocal_pipeline(
         selector_done,
         residual_shift_percent,
     ) = selector_progress
+
+    # --------------------------------------------------------
+    # v3.3 real neural Lead / Backing second-stage separation.
+    # --------------------------------------------------------
+    #
+    # BS-RoFormer solves Vocals vs Instrumental.
+    # Karaoke RoFormer ensemble is then applied to that vocal-only stem:
+    #
+    #   lead       -> RVC
+    #   backing    -> pitch shift only
+    #
+    # If it fails, preserve the previous heuristic Lead Selector path.
+    if neural_lead_separator_enabled:
+        _progress(
+            progress,
+            selector_start,
+            "AI Lead/Backing 2차 분리: Karaoke RoFormer ensemble 실행 중...",
+        )
+
+        try:
+            neural_result = (
+                separate_lead_backing_for_rvc(
+                    source_vocal,
+                    preset=(
+                        neural_lead_separator_preset
+                        or DEFAULT_KARAOKE_PRESET
+                    ),
+                    use_cache=True,
+                    use_autocast=True,
+                    log_callback=log_callback,
+                )
+            )
+
+            _progress(
+                progress,
+                selector_done,
+                (
+                    "AI Lead/Backing 분리 완료: "
+                    f"Lead energy {neural_result.lead_energy_ratio * 100.0:.1f}%"
+                ),
+            )
+
+            _emit(
+                log_callback,
+                (
+                    "[Neural Lead/Backing] RVC 입력을 전체 vocals가 아닌 "
+                    "AI 분리 Lead stem으로 교체합니다."
+                ),
+            )
+
+            converted_lead = (
+                _prepare_adaptive_rvc_vocal(
+                    Path(
+                        neural_result.lead_path
+                    ),
+                    temp_dir,
+                    model_path=model_path,
+                    index_path=index_path,
+                    semitones=semitones,
+                    index_rate=index_rate,
+                    protect=protect,
+                    rms_mix_rate=rms_mix_rate,
+                    speaker_id=speaker_id,
+                    f0_stability_enabled=bool(
+                        f0_stability_enabled
+                    ),
+                    f0_stability_strength=str(
+                        f0_stability_strength
+                    ),
+                    harmony_guard_enabled=harmony_guard_enabled,
+                    harmony_guard_sensitivity=harmony_guard_sensitivity,
+                    harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
+                    manual_bypass_ranges=manual_bypass_ranges,
+                    progress=progress,
+                    progress_points=adaptive_progress,
+                    log_callback=log_callback,
+                )
+            )
+
+            shifted_backing = (
+                temp_dir
+                / "neural_backing_shifted.wav"
+            )
+
+            _progress(
+                progress,
+                residual_shift_percent,
+                (
+                    "AI Backing/Harmony stem을 RVC 없이 "
+                    "같은 키로 이동하는 중..."
+                ),
+            )
+
+            if int(
+                semitones
+            ) == 0:
+                shutil.copy2(
+                    neural_result.backing_path,
+                    shifted_backing,
+                )
+            else:
+                try:
+                    transpose_audio(
+                        neural_result.backing_path,
+                        shifted_backing,
+                        semitones=semitones,
+                        preserve_formant=True,
+                        quality="quality",
+                    )
+                except AudioTransposeError as exc:
+                    raise RVCRMVPEError(
+                        "AI Lead RVC는 생성됐지만 Backing/Harmony "
+                        "Pitch Shift에 실패했습니다.\n\n"
+                        f"{exc}"
+                    ) from exc
+
+            combined_vocal = (
+                temp_dir
+                / "neural_lead_rvc_backing_mix.wav"
+            )
+
+            def neural_mix_log(
+                text: str,
+            ) -> None:
+                _emit(
+                    log_callback,
+                    str(
+                        text
+                    ).replace(
+                        "Seed-VC 보컬 레벨 보정",
+                        "RVC Neural Lead 보컬 레벨 보정",
+                    ),
+                )
+
+            _mix_stems(
+                converted_lead,
+                shifted_backing,
+                Path(
+                    neural_result.lead_path
+                ),
+                combined_vocal,
+                log_callback=neural_mix_log,
+            )
+
+            _emit(
+                log_callback,
+                (
+                    "[Neural Lead/Backing] 재합성 완료: "
+                    "Lead=RVC / Backing·Harmony·Double=Pitch Shift only"
+                ),
+            )
+
+            return combined_vocal
+
+        except Exception as exc:
+            _emit(
+                log_callback,
+                (
+                    "[Neural Lead/Backing] AI 2차 분리 실패 - "
+                    "기존 Heuristic Lead Selector 경로로 fallback합니다: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
 
     if not lead_selector_enabled:
         _emit(
@@ -1781,6 +1953,12 @@ def _prepare_rvc_vocal_pipeline(
         protect=protect,
         rms_mix_rate=rms_mix_rate,
         speaker_id=speaker_id,
+        f0_stability_enabled=bool(
+            f0_stability_enabled
+        ),
+        f0_stability_strength=str(
+            f0_stability_strength
+        ),
         harmony_guard_enabled=harmony_guard_enabled,
         harmony_guard_sensitivity=harmony_guard_sensitivity,
         harmony_guard_crossfade_ms=harmony_guard_crossfade_ms,
@@ -1869,6 +2047,8 @@ def convert_vocal_rvc(
     speaker_id: int = 0,
     f0_stability_enabled: bool = True,
     f0_stability_strength: str = "balanced",
+    neural_lead_separator_enabled: bool = True,
+    neural_lead_separator_preset: str = DEFAULT_KARAOKE_PRESET,
     lead_selector_enabled: bool = True,
     lead_selector_strength: str = "balanced",
     harmony_guard_enabled: bool = True,
@@ -1919,6 +2099,13 @@ def convert_vocal_rvc(
                 ),
                 f0_stability_strength=str(
                     f0_stability_strength
+                ),
+                neural_lead_separator_enabled=bool(
+                    neural_lead_separator_enabled
+                ),
+                neural_lead_separator_preset=str(
+                    neural_lead_separator_preset
+                    or DEFAULT_KARAOKE_PRESET
                 ),
                 lead_selector_enabled=bool(
                     lead_selector_enabled
@@ -1988,6 +2175,8 @@ def convert_full_mix_rvc(
     speaker_id: int = 0,
     f0_stability_enabled: bool = True,
     f0_stability_strength: str = "balanced",
+    neural_lead_separator_enabled: bool = True,
+    neural_lead_separator_preset: str = DEFAULT_KARAOKE_PRESET,
     lead_selector_enabled: bool = True,
     lead_selector_strength: str = "balanced",
     harmony_guard_enabled: bool = True,
@@ -2079,6 +2268,13 @@ def convert_full_mix_rvc(
                 ),
                 f0_stability_strength=str(
                     f0_stability_strength
+                ),
+                neural_lead_separator_enabled=bool(
+                    neural_lead_separator_enabled
+                ),
+                neural_lead_separator_preset=str(
+                    neural_lead_separator_preset
+                    or DEFAULT_KARAOKE_PRESET
                 ),
                 lead_selector_enabled=bool(
                     lead_selector_enabled
