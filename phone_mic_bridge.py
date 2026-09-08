@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# V41_RVC_AB_DEBUG_RECORD_PATCH
+# V40_S24_CAMERA_VIRTUAL_WEBCAM_PATCH
 # V39B_REALTIME_RVC_INDEX_HOTFIX
 # V39A_PHONE_MIC_SCROLL_PATCH
 # V39_REALTIME_RVC_VOICE_CHANGER_PATCH
@@ -35,7 +37,7 @@ import wave
 import numpy as np
 
 from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -70,9 +72,18 @@ from nvidia_broadcast_capture import (
     find_nvidia_broadcast_inputs,
 )
 
+from nvidia_broadcast_ab_renderer import (
+    NvidiaBroadcastABRenderer,
+)
+
 from realtime_rvc_engine import (
     RealtimeRVCClient,
     realtime_rvc_status_text,
+)
+
+from s24_camera_bridge import (
+    S24CameraController,
+    camera_runtime_status_text,
 )
 
 try:
@@ -86,6 +97,8 @@ else:
 
 HTTP_PORT = 8790
 WS_PORT = 8791
+VIDEO_WS_PORT = 8792
+CAMERA_CONTROL_PORT = 8793
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_PACKET_MS = 20
 DEFAULT_JITTER_MS = 80
@@ -212,6 +225,7 @@ def setup_adb_reverse_and_open_browser(
     *,
     http_port: int = HTTP_PORT,
     ws_port: int = WS_PORT,
+    video_ws_port: int = VIDEO_WS_PORT,
 ) -> tuple[str, str]:
     devices = adb_devices()
 
@@ -241,7 +255,7 @@ def setup_adb_reverse_and_open_browser(
 
     serial = online[0]
 
-    for port in (int(http_port), int(ws_port)):
+    for port in (int(http_port), int(ws_port), int(video_ws_port)):
         result = _run_adb(
             [
                 "reverse",
@@ -853,469 +867,69 @@ class SimpleDSP:
 def _phone_page_html(
     *,
     ws_port: int,
+    video_ws_port: int = VIDEO_WS_PORT,
 ) -> str:
-    return f"""<!doctype html>
+    template = r'''<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>S24 Ultra Phone Mic Bridge</title>
+<title>S24 AV Bridge</title>
 <style>
-:root {{ color-scheme: dark; }}
-body {{
-  margin: 0;
-  padding: 20px;
-  font-family: system-ui, -apple-system, "Noto Sans KR", sans-serif;
-  background: #111318;
-  color: #f2f3f5;
-}}
-.card {{
-  max-width: 760px;
-  margin: 0 auto 14px auto;
-  padding: 18px;
-  border-radius: 16px;
-  background: #1d2128;
-}}
-h1 {{ font-size: 24px; margin: 0 0 12px 0; }}
-h2 {{ font-size: 17px; margin: 0 0 10px 0; }}
-p {{ line-height: 1.55; color: #cfd3da; }}
-button, select {{
-  width: 100%;
-  min-height: 52px;
-  margin-top: 10px;
-  border: 0;
-  border-radius: 12px;
-  font-size: 16px;
-  padding: 10px 12px;
-}}
-button {{ font-weight: 700; }}
-#start {{ background: #4d8dff; color: white; }}
-#stop {{ background: #3a3e46; color: white; }}
-#meter {{
-  width: 100%;
-  height: 18px;
-  background: #30343b;
-  border-radius: 10px;
-  overflow: hidden;
-}}
-#bar {{
-  width: 0%;
-  height: 100%;
-  background: #6ea1ff;
-  transition: width 80ms linear;
-}}
-.small {{
-  font-size: 13px;
-  color: #9fa7b2;
-  word-break: break-all;
-}}
-.ok {{ color: #76d39b; }}
-.warn {{ color: #ffcc66; }}
-.bad {{ color: #ff7f7f; }}
-.option-row {{
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  color: #d8dce3;
-}}
-.option-row input {{
-  width: 22px;
-  height: 22px;
-}}
+:root { color-scheme: dark; }
+body { margin:0; padding:20px; font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif; background:#111318; color:#f2f3f5; }
+.card { max-width:820px; margin:0 auto 14px; padding:18px; border-radius:16px; background:#1d2128; }
+h1 { font-size:24px; margin:0 0 12px; } h2 { font-size:17px; margin:0 0 10px; }
+p { line-height:1.55; color:#cfd3da; }
+button,select { width:100%; min-height:50px; margin-top:10px; border:0; border-radius:12px; font-size:16px; padding:10px 12px; }
+button { font-weight:700; }.primary{background:#4d8dff;color:white}.secondary{background:#3a3e46;color:white}
+#meter{width:100%;height:18px;background:#30343b;border-radius:10px;overflow:hidden}#bar{width:0%;height:100%;background:#6ea1ff;transition:width 80ms linear}
+.small{font-size:13px;color:#9fa7b2;word-break:break-all}.ok{color:#76d39b}.warn{color:#ffcc66}.bad{color:#ff7f7f}
+.option-row{display:flex;align-items:center;gap:10px;margin-top:10px;color:#d8dce3}.option-row input{width:22px;height:22px}
+#videoPreview{width:100%;max-height:60vh;margin-top:12px;border-radius:12px;background:#050608;object-fit:contain}
 </style>
 </head>
 <body>
+<div class="card"><h1>Galaxy S24 Ultra → PC AV Bridge</h1><p>USB/ADB reverse로 마이크 PCM과 카메라 JPEG 프레임을 PC로 전송합니다. 오디오와 카메라는 독립적으로 시작/중지할 수 있습니다.</p><div id="secure" class="small"></div></div>
 <div class="card">
-  <h1>Galaxy S24 Ultra → PC 마이크</h1>
-  <p>
-    휴대폰 마이크를 20ms PCM 패킷으로 PC에 전송합니다.
-    USB/ADB reverse를 사용하므로 이 페이지는 휴대폰의 localhost에서 열립니다.
-  </p>
-  <div id="secure" class="small"></div>
+<h2>마이크</h2><select id="device"></select>
+<label class="option-row"><input id="noiseSuppression" type="checkbox" checked><span>브라우저 Noise Suppression</span></label>
+<label class="option-row"><input id="echoCancellation" type="checkbox"><span>Echo Cancellation</span></label>
+<label class="option-row"><input id="autoGainControl" type="checkbox"><span>Auto Gain Control</span></label>
+<button id="start" class="primary">마이크 시작</button><button id="stop" class="secondary" disabled>마이크 중지</button><p id="state" class="small">대기 중</p><div id="meter"><div id="bar"></div></div>
 </div>
-
 <div class="card">
-  <h2>마이크</h2>
-  <select id="device"></select>
-  <label class="option-row">
-    <input id="noiseSuppression" type="checkbox" checked>
-    <span>브라우저 Noise Suppression 사용 (키보드/마우스/생활소음 억제, 권장)</span>
-  </label>
-  <label class="option-row">
-    <input id="echoCancellation" type="checkbox">
-    <span>Echo Cancellation 사용 (PC 스피커 모니터를 켤 때만 권장)</span>
-  </label>
-  <label class="option-row">
-    <input id="autoGainControl" type="checkbox">
-    <span>Auto Gain Control 사용 (학습용 녹음에는 보통 OFF 권장)</span>
-  </label>
-  <button id="start">마이크 시작</button>
-  <button id="stop" disabled>중지</button>
-  <p id="state" class="small">대기 중</p>
-  <div id="meter"><div id="bar"></div></div>
+<h2>카메라</h2><p class="small">아래 버튼을 한 번 눌러 카메라 권한과 PC 영상 브리지를 연결하세요. 이후 카메라 선택, 해상도, FPS, 미러링, 보정, 가상배경은 PC 앱에서 제어합니다.</p>
+<button id="cameraConnect" class="primary">카메라 권한 허용 / PC 제어 연결</button><button id="cameraStop" class="secondary" disabled>카메라 중지</button><p id="cameraState" class="small">카메라 대기 중</p><video id="videoPreview" autoplay playsinline muted></video>
 </div>
-
-<div class="card">
-  <h2>권장</h2>
-  <p class="small">
-    마이크 권한을 허용하세요. 녹음 중에는 화면을 켜 두는 것이 가장 안정적입니다.
-    Galaxy Buds가 연결되어 있다면 마이크 목록에서 휴대폰 내장 마이크가 아닌
-    Bluetooth 입력이 선택될 수 있으므로 장치 이름을 확인하세요.
-  </p>
-</div>
-
+<div class="card"><h2>권장</h2><p class="small">카메라 사용 중에는 화면을 켜 두는 것이 가장 안정적입니다. 영상 처리는 PC에서 수행합니다.</p></div>
 <script>
-const WS_PORT = {int(ws_port)};
-const PACKET_FRAMES = 960; // 20ms at 48 kHz.
-
-let ws = null;
-let stream = null;
-let context = null;
-let source = null;
-let worklet = null;
-let sink = null;
-let wakeLock = null;
-let meterTimer = null;
-let analyser = null;
-
-const deviceSelect = document.getElementById("device");
-const startButton = document.getElementById("start");
-const stopButton = document.getElementById("stop");
-const state = document.getElementById("state");
-const bar = document.getElementById("bar");
-const secure = document.getElementById("secure");
-const noiseSuppressionCheck = document.getElementById("noiseSuppression");
-const echoCancellationCheck = document.getElementById("echoCancellation");
-const autoGainControlCheck = document.getElementById("autoGainControl");
-
-secure.textContent =
-  "Secure context: " + window.isSecureContext +
-  " / page=" + location.href;
-
-secure.className = window.isSecureContext ? "small ok" : "small bad";
-
-function setState(text, cls="small") {{
-  state.textContent = text;
-  state.className = cls;
-}}
-
-async function refreshDevices() {{
-  let devices = [];
-  try {{
-    devices = await navigator.mediaDevices.enumerateDevices();
-  }} catch (err) {{
-    setState("장치 목록 실패: " + err, "small warn");
-    return;
-  }}
-
-  const inputs = devices.filter(d => d.kind === "audioinput");
-  const previous = deviceSelect.value;
-  deviceSelect.innerHTML = "";
-
-  inputs.forEach((d, i) => {{
-    const option = document.createElement("option");
-    option.value = d.deviceId;
-    option.textContent = d.label || ("마이크 " + (i + 1));
-    deviceSelect.appendChild(option);
-  }});
-
-  if ([...deviceSelect.options].some(o => o.value === previous)) {{
-    deviceSelect.value = previous;
-  }}
-}}
-
-function connectSocket() {{
-  return new Promise((resolve, reject) => {{
-    const url = "ws://localhost:" + WS_PORT + "/";
-    const socket = new WebSocket(url);
-    socket.binaryType = "arraybuffer";
-
-    const timeout = setTimeout(() => {{
-      try {{ socket.close(); }} catch (_) {{}}
-      reject(new Error("WebSocket 연결 시간 초과"));
-    }}, 5000);
-
-    socket.onopen = () => {{
-      clearTimeout(timeout);
-      ws = socket;
-      resolve(socket);
-    }};
-
-    socket.onerror = () => {{
-      clearTimeout(timeout);
-      reject(new Error("PC WebSocket 연결 실패"));
-    }};
-
-    socket.onclose = () => {{
-      if (ws === socket) {{
-        ws = null;
-      }}
-    }};
-  }});
-}}
-
-async function requestWakeLock() {{
-  try {{
-    if ("wakeLock" in navigator) {{
-      wakeLock = await navigator.wakeLock.request("screen");
-    }}
-  }} catch (_) {{}}
-}}
-
-async function startMic() {{
-  if (!window.isSecureContext || !navigator.mediaDevices) {{
-    throw new Error(
-      "브라우저가 마이크 API를 허용하지 않습니다. " +
-      "PC 버튼으로 adb reverse를 설정한 뒤 http://localhost 페이지를 여세요."
-    );
-  }}
-
-  if (!ws || ws.readyState !== WebSocket.OPEN) {{
-    await connectSocket();
-  }}
-
-  const selected = deviceSelect.value;
-  const constraints = {{
-    audio: {{
-      deviceId: selected ? {{ exact: selected }} : undefined,
-      channelCount: {{ ideal: 1 }},
-      sampleRate: {{ ideal: 48000 }},
-      echoCancellation: echoCancellationCheck.checked,
-      noiseSuppression: noiseSuppressionCheck.checked,
-      autoGainControl: autoGainControlCheck.checked
-    }},
-    video: false
-  }};
-
-  stream = await navigator.mediaDevices.getUserMedia(constraints);
-  await refreshDevices();
-
-  context = new AudioContext({{
-    sampleRate: 48000,
-    latencyHint: "interactive"
-  }});
-
-  const processorCode = `
-class PhoneMicProcessor extends AudioWorkletProcessor {{
-  constructor() {{
-    super();
-    this.packet = new Float32Array(${{PACKET_FRAMES}});
-    this.offset = 0;
-  }}
-
-  process(inputs) {{
-    const input = inputs[0];
-    if (!input || input.length === 0 || !input[0]) return true;
-
-    const channel = input[0];
-    let pos = 0;
-
-    while (pos < channel.length) {{
-      const take = Math.min(
-        channel.length - pos,
-        this.packet.length - this.offset
-      );
-
-      this.packet.set(
-        channel.subarray(pos, pos + take),
-        this.offset
-      );
-
-      this.offset += take;
-      pos += take;
-
-      if (this.offset >= this.packet.length) {{
-        const ready = this.packet;
-        this.packet = new Float32Array(${{PACKET_FRAMES}});
-        this.offset = 0;
-        this.port.postMessage(ready.buffer, [ready.buffer]);
-      }}
-    }}
-
-    return true;
-  }}
-}}
-registerProcessor("phone-mic-processor", PhoneMicProcessor);
-`;
-
-  const blob = new Blob(
-    [processorCode],
-    {{ type: "application/javascript" }}
-  );
-  const moduleURL = URL.createObjectURL(blob);
-  await context.audioWorklet.addModule(moduleURL);
-  URL.revokeObjectURL(moduleURL);
-
-  source = context.createMediaStreamSource(stream);
-  worklet = new AudioWorkletNode(
-    context,
-    "phone-mic-processor",
-    {{
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [1]
-    }}
-  );
-
-  analyser = context.createAnalyser();
-  analyser.fftSize = 1024;
-
-  sink = context.createGain();
-  sink.gain.value = 0.0;
-
-  source.connect(analyser);
-  source.connect(worklet);
-  worklet.connect(sink);
-  sink.connect(context.destination);
-
-  worklet.port.onmessage = event => {{
-    if (ws && ws.readyState === WebSocket.OPEN) {{
-      ws.send(event.data);
-    }}
-  }};
-
-  const track = stream.getAudioTracks()[0];
-  const settings = track ? track.getSettings() : {{}};
-
-  ws.send(JSON.stringify({{
-    type: "hello",
-    sampleRate: context.sampleRate,
-    packetFrames: PACKET_FRAMES,
-    deviceLabel: track ? track.label : "",
-    trackSettings: settings,
-    requestedNoiseSuppression: noiseSuppressionCheck.checked,
-    requestedEchoCancellation: echoCancellationCheck.checked,
-    requestedAutoGainControl: autoGainControlCheck.checked
-  }}));
-
-  const meterData = new Float32Array(analyser.fftSize);
-
-  meterTimer = setInterval(() => {{
-    if (!analyser) return;
-
-    analyser.getFloatTimeDomainData(meterData);
-    let sum = 0;
-
-    for (let i = 0; i < meterData.length; i++) {{
-      sum += meterData[i] * meterData[i];
-    }}
-
-    const rms = Math.sqrt(sum / meterData.length);
-    const db = 20 * Math.log10(Math.max(rms, 1e-6));
-    const pct = Math.max(0, Math.min(100, (db + 60) / 60 * 100));
-    bar.style.width = pct + "%";
-  }}, 80);
-
-  await context.resume();
-  await requestWakeLock();
-
-  startButton.disabled = true;
-  stopButton.disabled = false;
-  noiseSuppressionCheck.disabled = true;
-  echoCancellationCheck.disabled = true;
-  autoGainControlCheck.disabled = true;
-
-  setState(
-    "전송 중 / " +
-    (track ? track.label : "microphone") +
-    " / AudioContext " + context.sampleRate + " Hz",
-    "small ok"
-  );
-}}
-
-async function stopMic() {{
-  if (meterTimer) {{
-    clearInterval(meterTimer);
-    meterTimer = null;
-  }}
-
-  if (worklet) {{
-    try {{ worklet.disconnect(); }} catch (_) {{}}
-    worklet = null;
-  }}
-
-  if (source) {{
-    try {{ source.disconnect(); }} catch (_) {{}}
-    source = null;
-  }}
-
-  if (sink) {{
-    try {{ sink.disconnect(); }} catch (_) {{}}
-    sink = null;
-  }}
-
-  analyser = null;
-
-  if (stream) {{
-    stream.getTracks().forEach(t => t.stop());
-    stream = null;
-  }}
-
-  if (context) {{
-    try {{ await context.close(); }} catch (_) {{}}
-    context = null;
-  }}
-
-  if (ws) {{
-    try {{ ws.close(); }} catch (_) {{}}
-    ws = null;
-  }}
-
-  if (wakeLock) {{
-    try {{ await wakeLock.release(); }} catch (_) {{}}
-    wakeLock = null;
-  }}
-
-  bar.style.width = "0%";
-  startButton.disabled = false;
-  stopButton.disabled = true;
-  noiseSuppressionCheck.disabled = false;
-  echoCancellationCheck.disabled = false;
-  autoGainControlCheck.disabled = false;
-  setState("중지됨");
-}}
-
-startButton.addEventListener("click", async () => {{
-  startButton.disabled = true;
-  setState("마이크 권한/연결 준비 중...");
-
-  try {{
-    await startMic();
-  }} catch (err) {{
-    console.error(err);
-    setState("시작 실패: " + err, "small bad");
-    startButton.disabled = false;
-    stopButton.disabled = true;
-  }}
-}});
-
-stopButton.addEventListener("click", stopMic);
-
-deviceSelect.addEventListener("change", async () => {{
-  if (stream) {{
-    await stopMic();
-    setState("마이크 장치가 변경되었습니다. 다시 시작하세요.", "small warn");
-  }}
-}});
-
-document.addEventListener("visibilitychange", async () => {{
-  if (
-    document.visibilityState === "visible"
-    && stream
-    && (!wakeLock || wakeLock.released)
-  ) {{
-    await requestWakeLock();
-  }}
-}});
-
-if (navigator.mediaDevices) {{
-  refreshDevices();
-}}
+const AUDIO_WS_PORT=__AUDIO_WS_PORT__, VIDEO_WS_PORT=__VIDEO_WS_PORT__, PACKET_FRAMES=960;
+let ws=null,stream=null,context=null,source=null,worklet=null,sink=null,wakeLock=null,meterTimer=null,analyser=null;
+let videoWs=null,videoStream=null,videoTimer=null,videoEncoding=false;
+let videoCanvas=document.createElement("canvas"),videoContext=videoCanvas.getContext("2d",{alpha:false});
+let lastCameraConfig={deviceId:"",width:1280,height:720,fps:15,quality:.72};
+const deviceSelect=document.getElementById("device"),startButton=document.getElementById("start"),stopButton=document.getElementById("stop"),state=document.getElementById("state"),bar=document.getElementById("bar"),secure=document.getElementById("secure"),noiseSuppressionCheck=document.getElementById("noiseSuppression"),echoCancellationCheck=document.getElementById("echoCancellation"),autoGainControlCheck=document.getElementById("autoGainControl");
+const cameraConnectButton=document.getElementById("cameraConnect"),cameraStopButton=document.getElementById("cameraStop"),cameraState=document.getElementById("cameraState"),videoPreview=document.getElementById("videoPreview");
+secure.textContent="Secure context: "+window.isSecureContext+" / page="+location.href; secure.className=window.isSecureContext?"small ok":"small bad";
+function setState(t,c="small"){state.textContent=t;state.className=c}
+function setCameraState(t,c="small"){cameraState.textContent=t;cameraState.className=c;if(videoWs&&videoWs.readyState===WebSocket.OPEN){try{videoWs.send(JSON.stringify({type:"camera_state",state:t,running:!!videoStream}))}catch(_){}}}
+async function refreshDevices(){let ds=[];try{ds=await navigator.mediaDevices.enumerateDevices()}catch(e){setState("장치 목록 실패: "+e,"small warn");return}const inputs=ds.filter(d=>d.kind==="audioinput"),prev=deviceSelect.value;deviceSelect.innerHTML="";inputs.forEach((d,i)=>{const o=document.createElement("option");o.value=d.deviceId;o.textContent=d.label||("마이크 "+(i+1));deviceSelect.appendChild(o)});if([...deviceSelect.options].some(o=>o.value===prev))deviceSelect.value=prev}
+async function sendCameraDevices(){if(!navigator.mediaDevices)return;let ds=[];try{ds=await navigator.mediaDevices.enumerateDevices()}catch(_){return}const cams=ds.filter(d=>d.kind==="videoinput").map((d,i)=>({deviceId:d.deviceId,label:d.label||("카메라 "+(i+1))}));if(videoWs&&videoWs.readyState===WebSocket.OPEN)videoWs.send(JSON.stringify({type:"camera_devices",devices:cams}))}
+function connectSocket(){return new Promise((resolve,reject)=>{const socket=new WebSocket("ws://localhost:"+AUDIO_WS_PORT+"/");socket.binaryType="arraybuffer";const to=setTimeout(()=>{try{socket.close()}catch(_){}reject(new Error("Audio WebSocket 연결 시간 초과"))},5000);socket.onopen=()=>{clearTimeout(to);ws=socket;resolve(socket)};socket.onerror=()=>{clearTimeout(to);reject(new Error("PC Audio WebSocket 연결 실패"))};socket.onclose=()=>{if(ws===socket)ws=null}})}
+function connectVideoSocket(){return new Promise((resolve,reject)=>{if(videoWs&&videoWs.readyState===WebSocket.OPEN){resolve(videoWs);return}const socket=new WebSocket("ws://localhost:"+VIDEO_WS_PORT+"/");socket.binaryType="arraybuffer";const to=setTimeout(()=>{try{socket.close()}catch(_){}reject(new Error("Video WebSocket 연결 시간 초과"))},5000);socket.onopen=async()=>{clearTimeout(to);videoWs=socket;setCameraState("PC 영상 브리지 연결됨","small ok");await sendCameraDevices();resolve(socket)};socket.onerror=()=>{clearTimeout(to);reject(new Error("PC 영상 브리지 연결 실패. PC 앱에서 카메라 워커를 먼저 시작하세요."))};socket.onclose=()=>{if(videoWs===socket)videoWs=null;setCameraState("PC 영상 브리지 연결 끊김","small warn")};socket.onmessage=async e=>{if(typeof e.data!=="string")return;let p;try{p=JSON.parse(e.data)}catch(_){return}if(p.type!=="camera_control")return;if(p.action==="stop"){await stopCamera();return}if(p.action==="start"){try{await startCamera({deviceId:p.deviceId||"",width:Number(p.width||1280),height:Number(p.height||720),fps:Number(p.fps||15),quality:Number(p.quality||.72)})}catch(err){setCameraState("카메라 시작 실패: "+err,"small bad")}}if(p.action==="enumerate")await sendCameraDevices()}})}
+async function requestWakeLock(){try{if("wakeLock" in navigator)wakeLock=await navigator.wakeLock.request("screen")}catch(_){}}
+async function startMic(){if(!window.isSecureContext||!navigator.mediaDevices)throw new Error("브라우저가 마이크 API를 허용하지 않습니다.");if(!ws||ws.readyState!==WebSocket.OPEN)await connectSocket();const selected=deviceSelect.value;stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:selected?{exact:selected}:undefined,channelCount:{ideal:1},sampleRate:{ideal:48000},echoCancellation:echoCancellationCheck.checked,noiseSuppression:noiseSuppressionCheck.checked,autoGainControl:autoGainControlCheck.checked},video:false});await refreshDevices();context=new AudioContext({sampleRate:48000,latencyHint:"interactive"});const code=`class PhoneMicProcessor extends AudioWorkletProcessor{constructor(){super();this.packet=new Float32Array(${PACKET_FRAMES});this.offset=0}process(inputs){const input=inputs[0];if(!input||input.length===0||!input[0])return true;const channel=input[0];let pos=0;while(pos<channel.length){const take=Math.min(channel.length-pos,this.packet.length-this.offset);this.packet.set(channel.subarray(pos,pos+take),this.offset);this.offset+=take;pos+=take;if(this.offset>=this.packet.length){const ready=this.packet;this.packet=new Float32Array(${PACKET_FRAMES});this.offset=0;this.port.postMessage(ready.buffer,[ready.buffer])}}return true}}registerProcessor("phone-mic-processor",PhoneMicProcessor);`;const blob=new Blob([code],{type:"application/javascript"}),url=URL.createObjectURL(blob);await context.audioWorklet.addModule(url);URL.revokeObjectURL(url);source=context.createMediaStreamSource(stream);worklet=new AudioWorkletNode(context,"phone-mic-processor",{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});analyser=context.createAnalyser();analyser.fftSize=1024;sink=context.createGain();sink.gain.value=0;source.connect(analyser);source.connect(worklet);worklet.connect(sink);sink.connect(context.destination);worklet.port.onmessage=e=>{if(ws&&ws.readyState===WebSocket.OPEN)ws.send(e.data)};const track=stream.getAudioTracks()[0],settings=track?track.getSettings():{};ws.send(JSON.stringify({type:"hello",sampleRate:context.sampleRate,packetFrames:PACKET_FRAMES,deviceLabel:track?track.label:"",trackSettings:settings,requestedNoiseSuppression:noiseSuppressionCheck.checked,requestedEchoCancellation:echoCancellationCheck.checked,requestedAutoGainControl:autoGainControlCheck.checked}));const meterData=new Float32Array(analyser.fftSize);meterTimer=setInterval(()=>{if(!analyser)return;analyser.getFloatTimeDomainData(meterData);let sum=0;for(let i=0;i<meterData.length;i++)sum+=meterData[i]*meterData[i];const rms=Math.sqrt(sum/meterData.length),db=20*Math.log10(Math.max(rms,1e-6)),pct=Math.max(0,Math.min(100,(db+60)/60*100));bar.style.width=pct+"%"},80);await context.resume();await requestWakeLock();startButton.disabled=true;stopButton.disabled=false;noiseSuppressionCheck.disabled=true;echoCancellationCheck.disabled=true;autoGainControlCheck.disabled=true;setState("전송 중 / "+(track?track.label:"microphone")+" / "+context.sampleRate+" Hz","small ok")}
+async function stopMic(){if(meterTimer){clearInterval(meterTimer);meterTimer=null}if(worklet){try{worklet.disconnect()}catch(_){}worklet=null}if(source){try{source.disconnect()}catch(_){}source=null}if(sink){try{sink.disconnect()}catch(_){}sink=null}analyser=null;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(context){try{await context.close()}catch(_){}context=null}if(ws){try{ws.close()}catch(_){}ws=null}startButton.disabled=false;stopButton.disabled=true;noiseSuppressionCheck.disabled=false;echoCancellationCheck.disabled=false;autoGainControlCheck.disabled=false;bar.style.width="0%";setState("중지됨")}
+async function startCamera(config){if(!window.isSecureContext||!navigator.mediaDevices)throw new Error("브라우저가 카메라 API를 허용하지 않습니다.");if(!videoWs||videoWs.readyState!==WebSocket.OPEN)await connectVideoSocket();await stopCamera(false);lastCameraConfig={deviceId:String(config.deviceId||""),width:Math.max(320,Number(config.width||1280)),height:Math.max(240,Number(config.height||720)),fps:Math.max(5,Number(config.fps||15)),quality:Math.max(.30,Math.min(.95,Number(config.quality||.72)))};const vc={width:{ideal:lastCameraConfig.width},height:{ideal:lastCameraConfig.height},frameRate:{ideal:lastCameraConfig.fps,max:lastCameraConfig.fps}};if(lastCameraConfig.deviceId)vc.deviceId={exact:lastCameraConfig.deviceId};else vc.facingMode={ideal:"environment"};videoStream=await navigator.mediaDevices.getUserMedia({audio:false,video:vc});videoPreview.srcObject=videoStream;await videoPreview.play();const track=videoStream.getVideoTracks()[0],settings=track?track.getSettings():{},aw=Number(settings.width||lastCameraConfig.width),ah=Number(settings.height||lastCameraConfig.height),af=Number(settings.frameRate||lastCameraConfig.fps);videoCanvas.width=aw;videoCanvas.height=ah;await sendCameraDevices();videoWs.send(JSON.stringify({type:"camera_hello",label:track?track.label:"",settings}));const interval=Math.max(16,Math.round(1000/Math.max(5,lastCameraConfig.fps)));videoTimer=setInterval(async()=>{if(!videoStream||!videoWs||videoWs.readyState!==WebSocket.OPEN||videoEncoding)return;videoEncoding=true;try{videoContext.drawImage(videoPreview,0,0,videoCanvas.width,videoCanvas.height);const blob=await new Promise(resolve=>videoCanvas.toBlob(resolve,"image/jpeg",lastCameraConfig.quality));if(blob&&videoWs&&videoWs.readyState===WebSocket.OPEN)videoWs.send(await blob.arrayBuffer())}finally{videoEncoding=false}},interval);cameraConnectButton.textContent="카메라 브리지 연결됨 / PC에서 제어";cameraStopButton.disabled=false;setCameraState("전송 중 / "+(track?track.label:"camera")+" / "+aw+"x"+ah+" / "+af.toFixed(1)+"fps","small ok");await requestWakeLock()}
+async function stopCamera(notify=true){if(videoTimer){clearInterval(videoTimer);videoTimer=null}videoEncoding=false;if(videoStream){videoStream.getTracks().forEach(t=>t.stop());videoStream=null}videoPreview.srcObject=null;cameraStopButton.disabled=true;if(notify)setCameraState("카메라 중지됨")}
+cameraConnectButton.addEventListener("click",async()=>{try{await connectVideoSocket();await startCamera(lastCameraConfig)}catch(err){setCameraState("카메라 연결 실패: "+err,"small bad")}});cameraStopButton.addEventListener("click",async()=>await stopCamera());startButton.addEventListener("click",async()=>{try{setState("마이크 권한/오디오 장치 준비 중...");await startMic()}catch(err){setState("시작 실패: "+err,"small bad");try{await stopMic()}catch(_){}}});stopButton.addEventListener("click",async()=>await stopMic());navigator.mediaDevices.addEventListener("devicechange",async()=>{await refreshDevices();await sendCameraDevices()});document.addEventListener("visibilitychange",async()=>{if(document.visibilityState==="visible"&&(!wakeLock||wakeLock.released))await requestWakeLock()});window.addEventListener("beforeunload",()=>{if(ws)try{ws.close()}catch(_){}if(videoWs)try{videoWs.close()}catch(_){}});
+(async()=>{if(!navigator.mediaDevices){setState("mediaDevices API 없음","small bad");setCameraState("mediaDevices API 없음","small bad");return}await refreshDevices();try{await connectVideoSocket()}catch(_){setCameraState("PC 카메라 워커 대기 중 / PC에서 카메라 기능을 시작한 뒤 이 버튼을 누르세요.","small warn")}})();
 </script>
 </body>
 </html>
-"""
+'''
+    return template.replace("__AUDIO_WS_PORT__", str(int(ws_port))).replace("__VIDEO_WS_PORT__", str(int(video_ws_port)))
 
 
 class _PhonePageHandler(BaseHTTPRequestHandler):
@@ -1339,7 +953,7 @@ class _PhonePageHandler(BaseHTTPRequestHandler):
         )
         self.send_header(
             "Permissions-Policy",
-            "microphone=(self)",
+            "microphone=(self), camera=(self)",
         )
         self.end_headers()
         self.wfile.write(body)
@@ -1372,6 +986,24 @@ class PhoneMicRuntime:
         self.record_clean_copy = True
         self.broadcast_record_enabled = True
         self.broadcast_input_device: int | None = None
+
+        # v4.1 RVC A/B debug recorder.
+        self.rvc_ab_debug_enabled = False
+        self._ab_clean_original_wave: wave.Wave_write | None = None
+        self._ab_clean_rvc_wave: wave.Wave_write | None = None
+        self._ab_clean_original_path: Path | None = None
+        self._ab_clean_rvc_path: Path | None = None
+        self._ab_last_clean_original_path: Path | None = None
+        self._ab_last_clean_rvc_path: Path | None = None
+        self._ab_last_broadcast_original_path: Path | None = None
+        self._ab_last_broadcast_rvc_path: Path | None = None
+        self._ab_render_state = "idle"
+        self._ab_render_error = ""
+        self._ab_rendering = False
+        self._ab_render_thread: threading.Thread | None = None
+        self._ab_renderer = NvidiaBroadcastABRenderer(
+            log_callback=self.log
+        )
 
         self.ring = AudioRingBuffer(
             sample_rate=self.sample_rate,
@@ -1474,6 +1106,7 @@ class PhoneMicRuntime:
         broadcast_record_enabled: bool,
         broadcast_input_device: int | None,
         realtime_rvc_enabled: bool,
+        rvc_ab_debug_enabled: bool,
     ) -> None:
         with self._settings_lock:
             self.output_device = (
@@ -1531,6 +1164,9 @@ class PhoneMicRuntime:
             )
             self.realtime_rvc_enabled = bool(
                 realtime_rvc_enabled
+            )
+            self.rvc_ab_debug_enabled = bool(
+                rvc_ab_debug_enabled
             )
 
     def _output_callback(
@@ -1705,6 +1341,23 @@ class PhoneMicRuntime:
         self,
         data: np.ndarray,
     ) -> None:
+        audio = np.asarray(
+            data,
+            dtype=np.float32,
+        ).reshape(
+            -1
+        )
+
+        with self._record_lock:
+            ab_writer = self._ab_clean_rvc_wave
+
+            if ab_writer is not None:
+                ab_writer.writeframesraw(
+                    self._float_to_pcm16_bytes(
+                        audio
+                    )
+                )
+
         with self._settings_lock:
             enabled = bool(
                 self.realtime_rvc_enabled
@@ -1716,12 +1369,10 @@ class PhoneMicRuntime:
         if (
             enabled
             and output_enabled
+            and not self._ab_rendering
         ):
             self.ring.write(
-                np.asarray(
-                    data,
-                    dtype=np.float32,
-                )
+                audio
             )
 
     def start_realtime_rvc_async(
@@ -1904,6 +1555,7 @@ class PhoneMicRuntime:
     def _start_http(self) -> None:
         page = _phone_page_html(
             ws_port=self.ws_port,
+            video_ws_port=VIDEO_WS_PORT,
         )
 
         handler_type = type(
@@ -2090,26 +1742,38 @@ class PhoneMicRuntime:
                     processed=processed,
                 )
 
-                if output_enabled:
-                    rvc_client = (
-                        self.realtime_rvc_client
+                rvc_client = (
+                    self.realtime_rvc_client
+                )
+                rvc_active = (
+                    bool(
+                        self.realtime_rvc_enabled
                     )
-                    rvc_active = (
-                        bool(
-                            self.realtime_rvc_enabled
-                        )
-                        and self.realtime_rvc_state
-                        == "ready"
-                        and rvc_client
+                    and self.realtime_rvc_state
+                    == "ready"
+                    and rvc_client
+                    is not None
+                    and rvc_client.ready
+                )
+
+                with self._record_lock:
+                    ab_recording = (
+                        self._ab_clean_rvc_wave
                         is not None
-                        and rvc_client.ready
                     )
 
-                    if rvc_active:
+                if not self._ab_rendering:
+                    if (
+                        rvc_active
+                        and (
+                            output_enabled
+                            or ab_recording
+                        )
+                    ):
                         rvc_client.push(
                             processed
                         )
-                    else:
+                    elif output_enabled:
                         # Safe bypass while RVC is disabled/loading/failed.
                         self.ring.write(
                             processed
@@ -2332,10 +1996,52 @@ class PhoneMicRuntime:
                 parent
                 / f"s24_clean_{stamp}.wav"
             )
+            ab_clean_original_path = (
+                parent
+                / f"s24_clean_original_{stamp}.wav"
+            )
+            ab_clean_rvc_path = (
+                parent
+                / f"s24_clean_rvc_{stamp}.wav"
+            )
 
             self._record_session_stamp = stamp
             self._last_raw_record_path = None
             self._last_clean_record_path = None
+            self._ab_last_clean_original_path = None
+            self._ab_last_clean_rvc_path = None
+            self._ab_last_broadcast_original_path = None
+            self._ab_last_broadcast_rvc_path = None
+            self._ab_render_state = "idle"
+            self._ab_render_error = ""
+
+            ab_enabled = bool(
+                self.rvc_ab_debug_enabled
+            )
+
+            if ab_enabled:
+                rvc_client = self.realtime_rvc_client
+
+                if not (
+                    self.realtime_rvc_enabled
+                    and self.realtime_rvc_state
+                    == "ready"
+                    and rvc_client is not None
+                    and rvc_client.ready
+                ):
+                    raise RuntimeError(
+                        "RVC A/B 디버그 녹음은 Realtime RVC가 READY 상태여야 합니다."
+                    )
+
+                if self.output_device is None:
+                    raise RuntimeError(
+                        "RVC A/B Broadcast 렌더용 Windows 출력 장치를 선택하세요."
+                    )
+
+                if self.broadcast_input_device is None:
+                    raise RuntimeError(
+                        "RVC A/B Broadcast 렌더용 NVIDIA Broadcast 최종 마이크 입력을 선택하세요."
+                    )
 
             if self.record_raw_copy:
                 raw_writer = wave.open(
@@ -2362,7 +2068,10 @@ class PhoneMicRuntime:
                 self._record_wave = None
                 self._record_path = None
 
-            if self.record_clean_copy:
+            if (
+                self.record_clean_copy
+                and not ab_enabled
+            ):
                 clean_writer = wave.open(
                     str(
                         clean_path
@@ -2387,6 +2096,56 @@ class PhoneMicRuntime:
                 self._clean_record_wave = None
                 self._clean_record_path = None
 
+            if ab_enabled:
+                original_writer = wave.open(
+                    str(
+                        ab_clean_original_path
+                    ),
+                    "wb",
+                )
+                original_writer.setnchannels(
+                    1
+                )
+                original_writer.setsampwidth(
+                    2
+                )
+                original_writer.setframerate(
+                    int(
+                        self.sample_rate
+                    )
+                )
+
+                rvc_writer = wave.open(
+                    str(
+                        ab_clean_rvc_path
+                    ),
+                    "wb",
+                )
+                rvc_writer.setnchannels(
+                    1
+                )
+                rvc_writer.setsampwidth(
+                    2
+                )
+                rvc_writer.setframerate(
+                    int(
+                        self.sample_rate
+                    )
+                )
+
+                self._ab_clean_original_wave = original_writer
+                self._ab_clean_rvc_wave = rvc_writer
+                self._ab_clean_original_path = ab_clean_original_path
+                self._ab_clean_rvc_path = ab_clean_rvc_path
+                self._ab_last_clean_original_path = ab_clean_original_path
+                self._ab_last_clean_rvc_path = ab_clean_rvc_path
+                self._ab_render_state = "recording"
+            else:
+                self._ab_clean_original_wave = None
+                self._ab_clean_rvc_wave = None
+                self._ab_clean_original_path = None
+                self._ab_clean_rvc_path = None
+
         if self._record_path is not None:
             self.log(
                 f"RAW WAV 녹음 시작: {self._record_path}"
@@ -2406,7 +2165,21 @@ class PhoneMicRuntime:
                 "CLEAN WAV 저장 OFF"
             )
 
-        if self.broadcast_record_enabled:
+        if self.rvc_ab_debug_enabled:
+            self.log(
+                "[RVC A/B] CLEAN 원본/RVC 동시 녹음 시작: "
+                f"{self._ab_clean_original_path} / "
+                f"{self._ab_clean_rvc_path}"
+            )
+            self.log(
+                "[RVC A/B] Broadcast 원본/RVC는 녹음 종료 후 "
+                "NVIDIA Broadcast를 순차 통과시켜 자동 생성합니다."
+            )
+
+        if (
+            self.broadcast_record_enabled
+            and not self.rvc_ab_debug_enabled
+        ):
             if self.broadcast_input_device is None:
                 self.log(
                     "[NVIDIA Broadcast] 입력 장치가 선택되지 않아 "
@@ -2428,6 +2201,7 @@ class PhoneMicRuntime:
         primary = (
             self._record_path
             or self._clean_record_path
+            or self._ab_clean_original_path
             or Path(
                 self.broadcast_capture.snapshot().get(
                     "path",
@@ -2438,7 +2212,7 @@ class PhoneMicRuntime:
 
         if not primary or str(primary) == ".":
             raise RuntimeError(
-                "저장할 녹음 형식이 없습니다. RAW/CLEAN/BROADCAST 중 하나 이상을 켜세요."
+                "저장할 녹음 형식이 없습니다. RAW/CLEAN/BROADCAST 또는 RVC A/B 중 하나 이상을 켜세요."
             )
 
         return Path(
@@ -2474,6 +2248,7 @@ class PhoneMicRuntime:
         with self._record_lock:
             raw_writer = self._record_wave
             clean_writer = self._clean_record_wave
+            ab_original_writer = self._ab_clean_original_wave
 
             if raw_writer is not None:
                 raw_writer.writeframesraw(
@@ -2492,6 +2267,145 @@ class PhoneMicRuntime:
                     )
                 )
 
+            if (
+                ab_original_writer is not None
+                and processed is not None
+            ):
+                ab_original_writer.writeframesraw(
+                    self._float_to_pcm16_bytes(
+                        processed
+                    )
+                )
+
+    def _start_ab_broadcast_render(
+        self,
+        *,
+        clean_original_path: Path,
+        clean_rvc_path: Path,
+        parent_dir: Path,
+        stamp: str,
+    ) -> None:
+        output_device = self.output_device
+        broadcast_input_device = self.broadcast_input_device
+
+        if (
+            output_device is None
+            or broadcast_input_device is None
+        ):
+            self._ab_render_state = "error"
+            self._ab_render_error = (
+                "A/B Broadcast 렌더 장치가 선택되지 않았습니다."
+            )
+            return
+
+        if (
+            self._ab_render_thread is not None
+            and self._ab_render_thread.is_alive()
+        ):
+            self.log(
+                "[RVC A/B] 이전 Broadcast 렌더가 아직 진행 중입니다."
+            )
+            return
+
+        def worker() -> None:
+            self._ab_render_state = "rendering_broadcast"
+            self._ab_render_error = ""
+            self._ab_rendering = True
+
+            with self._settings_lock:
+                reopen_output = bool(
+                    self.output_enabled
+                )
+
+            self.log(
+                "[RVC A/B] Broadcast 2종 렌더 중에는 "
+                "실시간 CABLE 출력이 잠시 중지됩니다."
+            )
+            self.log(
+                "[RVC A/B] Discord/게임이 Broadcast 마이크를 사용 중이면 "
+                "테스트 녹음 음성이 다시 송신될 수 있으니 테스트 중에는 송신을 꺼두세요."
+            )
+
+            try:
+                self._close_output_stream()
+                self.ring.clear()
+
+                outputs = self._ab_renderer.render_pair(
+                    clean_original_path=clean_original_path,
+                    clean_rvc_path=clean_rvc_path,
+                    output_device=int(
+                        output_device
+                    ),
+                    broadcast_input_device=int(
+                        broadcast_input_device
+                    ),
+                    parent_dir=parent_dir,
+                    stamp=stamp,
+                )
+
+                self._ab_last_broadcast_original_path = Path(
+                    outputs[
+                        "broadcast_original"
+                    ]
+                )
+                self._ab_last_broadcast_rvc_path = Path(
+                    outputs[
+                        "broadcast_rvc"
+                    ]
+                )
+                self._ab_render_state = "done"
+
+                self.log(
+                    "[RVC A/B] 4종 비교 파일 준비 완료:"
+                )
+                self.log(
+                    f"  CLEAN ORIGINAL: {clean_original_path}"
+                )
+                self.log(
+                    f"  CLEAN RVC: {clean_rvc_path}"
+                )
+                self.log(
+                    "  BROADCAST ORIGINAL: "
+                    f"{self._ab_last_broadcast_original_path}"
+                )
+                self.log(
+                    "  BROADCAST RVC: "
+                    f"{self._ab_last_broadcast_rvc_path}"
+                )
+
+            except Exception as exc:
+                self._ab_render_state = "error"
+                self._ab_render_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.log(
+                    "[RVC A/B] Broadcast 비교 렌더 실패: "
+                    + self._ab_render_error
+                )
+
+            finally:
+                self._ab_rendering = False
+                self.ring.clear()
+
+                if (
+                    reopen_output
+                    and self._running
+                ):
+                    try:
+                        self._open_output_stream()
+                    except Exception as exc:
+                        self.log(
+                            "[RVC A/B] 실시간 출력 복구 실패: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+        self._ab_render_thread = threading.Thread(
+            target=worker,
+            name="RVCBroadcastABRender",
+            daemon=True,
+        )
+        self._ab_render_thread.start()
+
     def stop_recording(self) -> Path | None:
         broadcast_path = self.broadcast_capture.stop()
 
@@ -2500,11 +2414,22 @@ class PhoneMicRuntime:
             raw_path = self._record_path
             clean_writer = self._clean_record_wave
             clean_path = self._clean_record_path
+            ab_original_writer = self._ab_clean_original_wave
+            ab_rvc_writer = self._ab_clean_rvc_wave
+            ab_original_path = self._ab_clean_original_path
+            ab_rvc_path = self._ab_clean_rvc_path
+            ab_stamp = str(
+                self._record_session_stamp
+            )
 
             self._record_wave = None
             self._record_path = None
             self._clean_record_wave = None
             self._clean_record_path = None
+            self._ab_clean_original_wave = None
+            self._ab_clean_rvc_wave = None
+            self._ab_clean_original_path = None
+            self._ab_clean_rvc_path = None
 
             if raw_writer is not None:
                 with contextlib.suppress(Exception):
@@ -2513,6 +2438,14 @@ class PhoneMicRuntime:
             if clean_writer is not None:
                 with contextlib.suppress(Exception):
                     clean_writer.close()
+
+            if ab_original_writer is not None:
+                with contextlib.suppress(Exception):
+                    ab_original_writer.close()
+
+            if ab_rvc_writer is not None:
+                with contextlib.suppress(Exception):
+                    ab_rvc_writer.close()
 
         if raw_path is not None:
             self._last_raw_record_path = raw_path
@@ -2526,9 +2459,26 @@ class PhoneMicRuntime:
                 f"CLEAN WAV 녹음 완료: {clean_path}"
             )
 
+        if (
+            ab_original_path is not None
+            and ab_rvc_path is not None
+        ):
+            self._ab_last_clean_original_path = ab_original_path
+            self._ab_last_clean_rvc_path = ab_rvc_path
+            self.log(
+                "[RVC A/B] CLEAN 2종 녹음 완료."
+            )
+            self._start_ab_broadcast_render(
+                clean_original_path=ab_original_path,
+                clean_rvc_path=ab_rvc_path,
+                parent_dir=ab_original_path.parent,
+                stamp=ab_stamp,
+            )
+
         return (
             raw_path
             or clean_path
+            or ab_original_path
             or broadcast_path
         )
 
@@ -2602,6 +2552,8 @@ class PhoneMicRuntime:
             "recording": (
                 self._record_wave is not None
                 or self._clean_record_wave is not None
+                or self._ab_clean_original_wave is not None
+                or self._ab_clean_rvc_wave is not None
                 or bool(
                     broadcast["recording"]
                 )
@@ -2631,6 +2583,46 @@ class PhoneMicRuntime:
             ),
             "record_session_stamp": str(
                 self._record_session_stamp
+            ),
+            "rvc_ab_enabled": bool(
+                self.rvc_ab_debug_enabled
+            ),
+            "rvc_ab_rendering": bool(
+                self._ab_rendering
+            ),
+            "rvc_ab_state": str(
+                self._ab_render_state
+            ),
+            "rvc_ab_error": str(
+                self._ab_render_error
+            ),
+            "rvc_ab_clean_original_path": (
+                str(
+                    self._ab_last_clean_original_path
+                )
+                if self._ab_last_clean_original_path
+                else ""
+            ),
+            "rvc_ab_clean_rvc_path": (
+                str(
+                    self._ab_last_clean_rvc_path
+                )
+                if self._ab_last_clean_rvc_path
+                else ""
+            ),
+            "rvc_ab_broadcast_original_path": (
+                str(
+                    self._ab_last_broadcast_original_path
+                )
+                if self._ab_last_broadcast_original_path
+                else ""
+            ),
+            "rvc_ab_broadcast_rvc_path": (
+                str(
+                    self._ab_last_broadcast_rvc_path
+                )
+                if self._ab_last_broadcast_rvc_path
+                else ""
             ),
             "transient_hits": int(
                 self.dsp.transient_hits
@@ -2693,8 +2685,15 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         self.runtime = PhoneMicRuntime()
+        self.camera_controller = S24CameraController(
+            video_port=VIDEO_WS_PORT,
+            control_port=CAMERA_CONTROL_PORT,
+            log_callback=self.runtime.log,
+        )
         self._devices: list[tuple[int, str]] = []
         self._broadcast_input_devices: list[tuple[int, str]] = []
+        self._camera_device_signature: tuple = ()
+        self._camera_preview_seq = -1
 
         self._build_ui()
         self.refresh_output_devices()
@@ -2756,16 +2755,16 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         intro = QGroupBox(
-            "Galaxy S24 Ultra Phone Mic Bridge v3.9a"
+            "Galaxy S24 Ultra AV Bridge v4.0"
         )
         intro_layout = QVBoxLayout(
             intro
         )
 
         text = QLabel(
-            "S24 → PC DSP → 선택적 Realtime RVC → CABLE Input → NVIDIA Broadcast "
-            "구조를 지원합니다. Realtime RVC는 기존 .venv_rvc와 학습한 .pth/.index를 "
-            "그대로 사용하며 모델을 GPU에 상주시켜 블록 단위로 실시간 변환합니다."
+            "S24 마이크 + 카메라를 하나의 USB/ADB 브리지에서 처리합니다. "
+            "오디오는 Smart Gain/RVC/NVIDIA Broadcast로, 영상은 카메라 선택·미러·회전·줌·"
+            "색보정·AI 배경 흐림/교체를 거쳐 선택적으로 Windows 가상 웹캠으로 출력합니다."
         )
         text.setWordWrap(
             True
@@ -2801,7 +2800,7 @@ class PhoneMicBridgeWidget(QWidget):
             "휴대폰: 설정 → 휴대전화 정보 → 소프트웨어 정보 → "
             "'빌드번호' 7회 탭 → 개발자 옵션 → USB 디버깅 ON.\n"
             "USB 연결 후 휴대폰에 뜨는 PC 인증 창을 허용하세요. "
-            "그 다음 아래 버튼을 누르면 8790/8791 포트를 reverse하고 "
+            "그 다음 아래 버튼을 누르면 8790/8791/8792 포트를 reverse하고 "
             "휴대폰 Chrome에서 http://localhost:8790 을 엽니다."
         )
         guide.setWordWrap(
@@ -3327,8 +3326,71 @@ class PhoneMicBridgeWidget(QWidget):
             dsp_group
         )
 
+        camera_group = QGroupBox(
+            "4. S24 Camera / Virtual Webcam"
+        )
+        camera_layout = QVBoxLayout(camera_group)
+        self.camera_runtime_label = QLabel(camera_runtime_status_text())
+        self.camera_runtime_label.setWordWrap(True)
+        camera_layout.addWidget(self.camera_runtime_label)
+
+        self.camera_preview = QLabel("카메라 Preview")
+        self.camera_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.camera_preview.setMinimumSize(480, 270)
+        self.camera_preview.setStyleSheet("background:#050608; border:1px solid #30343b;")
+        camera_layout.addWidget(self.camera_preview)
+
+        camera_form = QFormLayout()
+        self.camera_device_combo = QComboBox()
+        self.camera_device_combo.addItem("휴대폰 카메라 목록 대기 중", "")
+        camera_form.addRow("Phone Camera", self.camera_device_combo)
+
+        self.camera_resolution_combo = QComboBox()
+        for label, size in (("640 x 480", (640,480)), ("1280 x 720 (권장)",(1280,720)), ("1920 x 1080",(1920,1080))):
+            self.camera_resolution_combo.addItem(label, size)
+        saved_res=self.settings.value("s24_camera_resolution","1280x720",type=str)
+        self.camera_resolution_combo.setCurrentIndex({"640x480":0,"1280x720":1,"1920x1080":2}.get(saved_res,1))
+        camera_form.addRow("Capture", self.camera_resolution_combo)
+
+        self.camera_fps_combo = QComboBox()
+        for fps in (10,15,20,30): self.camera_fps_combo.addItem(f"{fps} fps",fps)
+        idx=self.camera_fps_combo.findData(int(self.settings.value("s24_camera_fps",15)))
+        self.camera_fps_combo.setCurrentIndex(idx if idx>=0 else 1)
+        camera_form.addRow("FPS", self.camera_fps_combo)
+
+        self.camera_quality_spin=QDoubleSpinBox(); self.camera_quality_spin.setRange(.30,.95); self.camera_quality_spin.setDecimals(2); self.camera_quality_spin.setSingleStep(.05); self.camera_quality_spin.setValue(float(self.settings.value("s24_camera_jpeg_quality",.72)))
+        camera_form.addRow("USB JPEG Quality",self.camera_quality_spin)
+
+        row=QHBoxLayout()
+        self.camera_mirror_check=QCheckBox("미러"); self.camera_mirror_check.setChecked(self.settings.value("s24_camera_mirror",True,type=bool)); row.addWidget(self.camera_mirror_check)
+        self.camera_rotation_combo=QComboBox()
+        for v in (0,90,180,270): self.camera_rotation_combo.addItem(f"{v}°",v)
+        ridx=self.camera_rotation_combo.findData(int(self.settings.value("s24_camera_rotation",0))); self.camera_rotation_combo.setCurrentIndex(ridx if ridx>=0 else 0); row.addWidget(self.camera_rotation_combo)
+        self.camera_zoom_spin=QDoubleSpinBox(); self.camera_zoom_spin.setRange(1,4); self.camera_zoom_spin.setDecimals(2); self.camera_zoom_spin.setSingleStep(.1); self.camera_zoom_spin.setSuffix(" x"); self.camera_zoom_spin.setValue(float(self.settings.value("s24_camera_zoom",1.0))); row.addWidget(self.camera_zoom_spin)
+        camera_form.addRow("Transform",row)
+
+        self.camera_brightness_spin=QSpinBox(); self.camera_brightness_spin.setRange(-100,100); self.camera_brightness_spin.setValue(int(self.settings.value("s24_camera_brightness",0))); camera_form.addRow("Brightness",self.camera_brightness_spin)
+        self.camera_contrast_spin=QDoubleSpinBox(); self.camera_contrast_spin.setRange(0,3); self.camera_contrast_spin.setDecimals(2); self.camera_contrast_spin.setSingleStep(.05); self.camera_contrast_spin.setValue(float(self.settings.value("s24_camera_contrast",1.0))); camera_form.addRow("Contrast",self.camera_contrast_spin)
+        self.camera_saturation_spin=QDoubleSpinBox(); self.camera_saturation_spin.setRange(0,3); self.camera_saturation_spin.setDecimals(2); self.camera_saturation_spin.setSingleStep(.05); self.camera_saturation_spin.setValue(float(self.settings.value("s24_camera_saturation",1.0))); camera_form.addRow("Saturation",self.camera_saturation_spin)
+
+        self.camera_background_combo=QComboBox(); self.camera_background_combo.addItem("배경 처리 없음","none"); self.camera_background_combo.addItem("AI 배경 흐림","blur"); self.camera_background_combo.addItem("AI 가상 배경 이미지","image")
+        bidx=self.camera_background_combo.findData(self.settings.value("s24_camera_background_mode","none",type=str)); self.camera_background_combo.setCurrentIndex(bidx if bidx>=0 else 0); camera_form.addRow("Background",self.camera_background_combo)
+        self.camera_background_path=self.settings.value("s24_camera_background_image","",type=str)
+        bgrow=QHBoxLayout(); self.camera_background_label=QLabel(self.camera_background_path or "배경 이미지 미선택"); self.camera_background_label.setWordWrap(True); bgrow.addWidget(self.camera_background_label,1); self.camera_background_button=QPushButton("배경 이미지 선택"); self.camera_background_button.clicked.connect(self.choose_camera_background); bgrow.addWidget(self.camera_background_button); camera_form.addRow("Virtual BG Image",bgrow)
+        self.camera_blur_spin=QSpinBox(); self.camera_blur_spin.setRange(3,60); self.camera_blur_spin.setValue(int(self.settings.value("s24_camera_background_blur",25))); camera_form.addRow("Background Blur",self.camera_blur_spin)
+        self.camera_virtual_check=QCheckBox("Windows 가상 웹캠 출력 (OBS Virtual Camera driver 필요)"); self.camera_virtual_check.setChecked(self.settings.value("s24_camera_virtual_enabled",False,type=bool)); camera_form.addRow("",self.camera_virtual_check)
+        camera_layout.addLayout(camera_form)
+
+        brow=QHBoxLayout()
+        self.camera_worker_button=QPushButton("카메라 워커 시작"); self.camera_worker_button.clicked.connect(self.start_camera_worker); brow.addWidget(self.camera_worker_button)
+        self.camera_start_button=QPushButton("설정 적용 / 휴대폰 카메라 시작·재시작"); self.camera_start_button.clicked.connect(self.start_phone_camera); brow.addWidget(self.camera_start_button)
+        self.camera_stop_button=QPushButton("카메라 중지"); self.camera_stop_button.clicked.connect(self.stop_phone_camera); brow.addWidget(self.camera_stop_button); camera_layout.addLayout(brow)
+        self.camera_live_label=QLabel("Camera worker: stopped"); self.camera_live_label.setWordWrap(True); camera_layout.addWidget(self.camera_live_label)
+        note=QLabel("처음에는 카메라 워커 시작 → 휴대폰 페이지에서 카메라 권한 허용/PC 제어 연결을 한 번 누르세요. 이후 카메라/해상도/FPS와 영상 효과는 PC에서 제어합니다."); note.setWordWrap(True); camera_layout.addWidget(note)
+        root.addWidget(camera_group)
+
         rvc_group = QGroupBox(
-            "4. 실시간 RVC Voice Changer (Experimental)"
+            "5. 실시간 RVC Voice Changer (Experimental)"
         )
         rvc_layout = QFormLayout(
             rvc_group
@@ -3365,6 +3427,40 @@ class PhoneMicBridgeWidget(QWidget):
         rvc_layout.addRow(
             "",
             self.realtime_rvc_enable_check,
+        )
+
+        self.rvc_ab_debug_check = QCheckBox(
+            "RVC A/B 디버그 4종 비교 저장"
+        )
+        self.rvc_ab_debug_check.setChecked(
+            self.settings.value(
+                "phone_mic_rvc_ab_debug_enabled",
+                False,
+                type=bool,
+            )
+        )
+        self.rvc_ab_debug_check.setToolTip(
+            "테스트용. 녹음 중 CLEAN 원본과 RVC 적용본을 동시에 저장하고, "
+            "녹음 종료 후 두 파일을 NVIDIA Broadcast에 순차 재생해 "
+            "Broadcast 원본/RVC 파일까지 총 4종을 만듭니다."
+        )
+        rvc_layout.addRow(
+            "",
+            self.rvc_ab_debug_check,
+        )
+
+        self.rvc_ab_status_label = QLabel(
+            "A/B: idle"
+        )
+        self.rvc_ab_status_label.setWordWrap(
+            True
+        )
+        self.rvc_ab_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        rvc_layout.addRow(
+            "A/B Debug",
+            self.rvc_ab_status_label,
         )
 
         saved_rt_model = self.settings.value(
@@ -3596,7 +3692,8 @@ class PhoneMicBridgeWidget(QWidget):
             "권장 체인: S24 → Smart Voice Gain → Realtime RVC → "
             "CABLE Input → NVIDIA Broadcast → 게임. "
             "모델 로딩 중/실패 시에는 CLEAN 원음이 자동 통과합니다. "
-            "RMVPE + SOLA / eager CUDA 경로를 사용합니다. v3.9b는 added IVF index의 nprobe=1 sparse-search 문제를 런타임에서 보정합니다."
+            "RMVPE + SOLA / eager CUDA 경로를 사용합니다. v3.9b는 added IVF index의 nprobe=1 sparse-search 문제를 런타임에서 보정합니다. "
+            "A/B 디버그는 CLEAN 원본/RVC를 동시에 저장하고, 녹음 종료 후 NVIDIA Broadcast 원본/RVC를 비동기로 렌더합니다."
         )
         rvc_note.setWordWrap(
             True
@@ -3610,7 +3707,7 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         control_group = QGroupBox(
-            "5. 브리지 / 녹음"
+            "6. 브리지 / 녹음"
         )
         control_layout = QVBoxLayout(
             control_group
@@ -3726,6 +3823,47 @@ class PhoneMicBridgeWidget(QWidget):
             1,
         )
 
+    def _camera_settings_payload(self) -> dict:
+        res=self.camera_resolution_combo.currentData()
+        if not isinstance(res,tuple) or len(res)!=2: res=(1280,720)
+        return {"device_id":str(self.camera_device_combo.currentData() or ""),"width":int(res[0]),"height":int(res[1]),"fps":int(self.camera_fps_combo.currentData() or 15),"jpeg_quality":float(self.camera_quality_spin.value()),"mirror":self.camera_mirror_check.isChecked(),"rotation":int(self.camera_rotation_combo.currentData() or 0),"zoom":float(self.camera_zoom_spin.value()),"brightness":int(self.camera_brightness_spin.value()),"contrast":float(self.camera_contrast_spin.value()),"saturation":float(self.camera_saturation_spin.value()),"background_mode":str(self.camera_background_combo.currentData() or "none"),"background_image":str(self.camera_background_path or ""),"background_blur":int(self.camera_blur_spin.value()),"virtual_camera":self.camera_virtual_check.isChecked()}
+
+    def _save_camera_settings(self) -> None:
+        p=self._camera_settings_payload(); self.settings.setValue("s24_camera_resolution",f"{p['width']}x{p['height']}"); self.settings.setValue("s24_camera_fps",p['fps']); self.settings.setValue("s24_camera_jpeg_quality",p['jpeg_quality']); self.settings.setValue("s24_camera_mirror",p['mirror']); self.settings.setValue("s24_camera_rotation",p['rotation']); self.settings.setValue("s24_camera_zoom",p['zoom']); self.settings.setValue("s24_camera_brightness",p['brightness']); self.settings.setValue("s24_camera_contrast",p['contrast']); self.settings.setValue("s24_camera_saturation",p['saturation']); self.settings.setValue("s24_camera_background_mode",p['background_mode']); self.settings.setValue("s24_camera_background_image",p['background_image']); self.settings.setValue("s24_camera_background_blur",p['background_blur']); self.settings.setValue("s24_camera_virtual_enabled",p['virtual_camera'])
+
+    def choose_camera_background(self) -> None:
+        start=str(Path(self.camera_background_path).parent) if self.camera_background_path else str(project_root())
+        path,_=QFileDialog.getOpenFileName(self,"가상 배경 이미지 선택",start,"Images (*.png *.jpg *.jpeg *.webp *.bmp);;All files (*.*)")
+        if path:
+            self.camera_background_path=str(Path(path).resolve()); self.camera_background_label.setText(self.camera_background_path); self._save_camera_settings()
+
+    def start_camera_worker(self) -> None:
+        self._save_camera_settings(); self.camera_controller.start_worker_async()
+
+    def start_phone_camera(self) -> None:
+        self._save_camera_settings(); self.camera_controller.start_camera_async(self._camera_settings_payload())
+
+    def stop_phone_camera(self) -> None:
+        self.camera_controller.stop_camera_async()
+
+    def _refresh_camera_ui(self) -> None:
+        s=self.camera_controller.snapshot(); devices=s.get("camera_devices",[]); sig=tuple((str(i.get("deviceId","") or ""),str(i.get("label","") or "")) for i in devices if isinstance(i,dict))
+        if sig!=self._camera_device_signature:
+            prev=str(self.camera_device_combo.currentData() or ""); self.camera_device_combo.blockSignals(True); self.camera_device_combo.clear()
+            if not sig: self.camera_device_combo.addItem("휴대폰 카메라 목록 대기 중","")
+            else:
+                for n,(did,label) in enumerate(sig): self.camera_device_combo.addItem(label or f"Camera {n+1}",did)
+                idx=self.camera_device_combo.findData(prev)
+                if idx>=0:self.camera_device_combo.setCurrentIndex(idx)
+            self.camera_device_combo.blockSignals(False); self._camera_device_signature=sig
+        state=str(s.get("controller_state","stopped")); pc=bool(s.get("phone_connected",False)); run=bool(s.get("camera_running",False)); fps=float(s.get("fps",0) or 0); drop=int(s.get("dropped_frames",0) or 0); label=str(s.get("camera_label","") or ""); bg=str(s.get("background_status","") or ""); vc=bool(s.get("virtual_camera",False)); vd=str(s.get("virtual_camera_device","") or ""); ve=str(s.get("virtual_camera_error","") or ""); err=str(s.get("controller_error","") or "")
+        text=f"worker={state} / phone={'connected' if pc else 'waiting'} / camera={'ON' if run else 'OFF'} / fps={fps:.1f} / dropped={drop}"+(f" / {label}" if label else "")+(f"\nBG: {bg}" if bg else "")+(f"\nVirtualCam: ON ({vd})" if vc else (f"\nVirtualCam ERROR: {ve}" if ve else ""))+(f"\nERROR: {err}" if err else ""); self.camera_live_label.setText(text)
+        seq,jpeg=self.camera_controller.latest_jpeg()
+        if jpeg and seq!=self._camera_preview_seq:
+            image=QImage.fromData(jpeg,"JPEG")
+            if not image.isNull():
+                pix=QPixmap.fromImage(image); self.camera_preview.setPixmap(pix.scaled(self.camera_preview.size(),Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)); self._camera_preview_seq=seq
+
     def choose_realtime_rvc_model(
         self,
     ) -> None:
@@ -3823,6 +3961,10 @@ class PhoneMicBridgeWidget(QWidget):
         self.settings.setValue(
             "phone_mic_realtime_rvc_enabled",
             self.realtime_rvc_enable_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_rvc_ab_debug_enabled",
+            self.rvc_ab_debug_check.isChecked(),
         )
         self.settings.setValue(
             "phone_mic_realtime_rvc_model",
@@ -4193,6 +4335,7 @@ class PhoneMicBridgeWidget(QWidget):
             broadcast_name,
         )
         self._save_realtime_rvc_settings()
+        self._save_camera_settings()
 
     def _apply_runtime_settings(self) -> None:
         self.runtime.configure(
@@ -4216,6 +4359,7 @@ class PhoneMicBridgeWidget(QWidget):
             broadcast_record_enabled=self.broadcast_record_check.isChecked(),
             broadcast_input_device=self._selected_broadcast_input_device(),
             realtime_rvc_enabled=self.realtime_rvc_enable_check.isChecked(),
+            rvc_ab_debug_enabled=self.rvc_ab_debug_check.isChecked(),
         )
 
     def on_monitor_toggled(
@@ -4265,6 +4409,7 @@ class PhoneMicBridgeWidget(QWidget):
                 broadcast_record_enabled=self.broadcast_record_check.isChecked(),
                 broadcast_input_device=self._selected_broadcast_input_device(),
                 realtime_rvc_enabled=self.realtime_rvc_enable_check.isChecked(),
+                rvc_ab_debug_enabled=self.rvc_ab_debug_check.isChecked(),
             )
             QMessageBox.warning(
                 self,
@@ -4322,6 +4467,9 @@ class PhoneMicBridgeWidget(QWidget):
         self.broadcast_record_check.setEnabled(
             True
         )
+        self.rvc_ab_debug_check.setEnabled(
+            True
+        )
 
         self.output_combo.setEnabled(
             False
@@ -4345,6 +4493,7 @@ class PhoneMicBridgeWidget(QWidget):
 
     def stop_bridge(self) -> None:
         self.runtime.stop()
+        self.camera_controller.stop_worker()
 
         self.start_button.setEnabled(
             True
@@ -4389,7 +4538,7 @@ class PhoneMicBridgeWidget(QWidget):
             return
 
         self.runtime.log(
-            f"ADB reverse 완료: {serial} -> {url}"
+            f"ADB reverse 완료(8790/8791/8792): {serial} -> {url}"
         )
         self.refresh_adb_status()
 
@@ -4408,6 +4557,9 @@ class PhoneMicBridgeWidget(QWidget):
                 True
             )
             self.broadcast_record_check.setEnabled(
+                True
+            )
+            self.rvc_ab_debug_check.setEnabled(
                 True
             )
 
@@ -4436,6 +4588,26 @@ class PhoneMicBridgeWidget(QWidget):
                     )
                     or ""
                 )
+                ab_clean_original = str(
+                    snap_after.get(
+                        "rvc_ab_clean_original_path",
+                        "",
+                    )
+                    or ""
+                )
+                ab_clean_rvc = str(
+                    snap_after.get(
+                        "rvc_ab_clean_rvc_path",
+                        "",
+                    )
+                    or ""
+                )
+                ab_state = str(
+                    snap_after.get(
+                        "rvc_ab_state",
+                        "idle",
+                    )
+                )
 
                 if raw_last:
                     saved.append(
@@ -4452,6 +4624,25 @@ class PhoneMicBridgeWidget(QWidget):
                         f"BROADCAST: {broadcast_last}"
                     )
 
+                if ab_clean_original:
+                    saved.append(
+                        f"CLEAN ORIGINAL: {ab_clean_original}"
+                    )
+
+                if ab_clean_rvc:
+                    saved.append(
+                        f"CLEAN RVC: {ab_clean_rvc}"
+                    )
+
+                if (
+                    ab_clean_original
+                    and ab_clean_rvc
+                ):
+                    saved.append(
+                        "BROADCAST ORIGINAL/RVC: "
+                        f"{ab_state} - 백그라운드 렌더 후 자동 저장"
+                    )
+
                 QMessageBox.information(
                     self,
                     "녹음 저장 완료",
@@ -4465,16 +4656,57 @@ class PhoneMicBridgeWidget(QWidget):
             self.raw_record_check.isChecked()
             or self.clean_record_check.isChecked()
             or self.broadcast_record_check.isChecked()
+            or self.rvc_ab_debug_check.isChecked()
         ):
             QMessageBox.warning(
                 self,
                 "녹음 형식 없음",
-                "RAW / CLEAN / NVIDIA Broadcast 중 하나 이상을 켜세요.",
+                "RAW / CLEAN / NVIDIA Broadcast / RVC A/B 중 하나 이상을 켜세요.",
             )
             return
 
+        if self.rvc_ab_debug_check.isChecked():
+            rt = snap.get(
+                "realtime_rvc",
+                {},
+            )
+
+            if not (
+                self.realtime_rvc_enable_check.isChecked()
+                and bool(
+                    rt.get(
+                        "ready",
+                        False,
+                    )
+                )
+            ):
+                QMessageBox.warning(
+                    self,
+                    "RVC A/B 준비 필요",
+                    "RVC A/B 4종 비교 저장은 Realtime RVC가 READY=True여야 합니다.\n"
+                    "먼저 RVC 엔진을 로드한 뒤 다시 녹음을 시작하세요.",
+                )
+                return
+
+            if self._selected_output_device() is None:
+                QMessageBox.warning(
+                    self,
+                    "A/B 출력 장치 없음",
+                    "Broadcast 원본/RVC 비교를 만들려면 Windows 출력(CABLE Input)을 선택하세요.",
+                )
+                return
+
+            if self._selected_broadcast_input_device() is None:
+                QMessageBox.warning(
+                    self,
+                    "A/B NVIDIA Broadcast 입력 없음",
+                    "Broadcast 비교를 만들려면 Microphone (NVIDIA Broadcast) 입력을 선택하세요.",
+                )
+                return
+
         if (
             self.broadcast_record_check.isChecked()
+            and not self.rvc_ab_debug_check.isChecked()
             and self._selected_broadcast_input_device()
             is None
         ):
@@ -4509,6 +4741,9 @@ class PhoneMicBridgeWidget(QWidget):
         self.broadcast_record_check.setEnabled(
             False
         )
+        self.rvc_ab_debug_check.setEnabled(
+            False
+        )
         self.runtime.log(
             f"recording started path={path}"
         )
@@ -4522,6 +4757,7 @@ class PhoneMicBridgeWidget(QWidget):
             )
 
         snap = self.runtime.snapshot()
+        self._refresh_camera_ui()
 
         if snap["running"]:
             if snap["connected"]:
@@ -4648,6 +4884,83 @@ class PhoneMicBridgeWidget(QWidget):
             )
         )
 
+        ab_state = str(
+            snap.get(
+                "rvc_ab_state",
+                "idle",
+            )
+        )
+        ab_error = str(
+            snap.get(
+                "rvc_ab_error",
+                "",
+            )
+            or ""
+        )
+        ab_clean_original = str(
+            snap.get(
+                "rvc_ab_clean_original_path",
+                "",
+            )
+            or ""
+        )
+        ab_clean_rvc = str(
+            snap.get(
+                "rvc_ab_clean_rvc_path",
+                "",
+            )
+            or ""
+        )
+        ab_broadcast_original = str(
+            snap.get(
+                "rvc_ab_broadcast_original_path",
+                "",
+            )
+            or ""
+        )
+        ab_broadcast_rvc = str(
+            snap.get(
+                "rvc_ab_broadcast_rvc_path",
+                "",
+            )
+            or ""
+        )
+
+        ab_lines = [
+            f"A/B: {ab_state}",
+        ]
+
+        if ab_error:
+            ab_lines.append(
+                f"ERROR: {ab_error}"
+            )
+
+        if ab_clean_original:
+            ab_lines.append(
+                f"CLEAN original: {ab_clean_original}"
+            )
+
+        if ab_clean_rvc:
+            ab_lines.append(
+                f"CLEAN RVC: {ab_clean_rvc}"
+            )
+
+        if ab_broadcast_original:
+            ab_lines.append(
+                f"Broadcast original: {ab_broadcast_original}"
+            )
+
+        if ab_broadcast_rvc:
+            ab_lines.append(
+                f"Broadcast RVC: {ab_broadcast_rvc}"
+            )
+
+        self.rvc_ab_status_label.setText(
+            "\n".join(
+                ab_lines
+            )
+        )
+
         if snap["recording"]:
             self.record_button.setText(
                 "녹음 중지"
@@ -4660,3 +4973,4 @@ class PhoneMicBridgeWidget(QWidget):
     def shutdown(self) -> None:
         self._save_settings()
         self.runtime.stop()
+        self.camera_controller.stop_worker()

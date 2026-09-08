@@ -122,8 +122,10 @@ from rvc_training_dataset_cleaner import (
 from phone_mic_bridge import PhoneMicBridgeWidget
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.9b / Realtime RVC Index Hotfix"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v4.1 / RVC A/B Debug Recorder"
 
+# V41_RVC_AB_DEBUG_RECORD_PATCH
+# V40_S24_CAMERA_VIRTUAL_WEBCAM_PATCH
 # V39B_REALTIME_RVC_INDEX_HOTFIX
 # V39A_PHONE_MIC_SCROLL_PATCH
 # V39_REALTIME_RVC_VOICE_CHANGER_PATCH

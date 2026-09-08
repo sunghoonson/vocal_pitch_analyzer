@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V41_RVC_AB_DEBUG_RECORD_PATCH
 # V37_NVIDIA_BROADCAST_RECORD_PATCH
 
 from pathlib import Path
@@ -126,6 +127,7 @@ class NvidiaBroadcastCapture:
         device_index: int,
         parent_dir: str | Path,
         stamp: str,
+        filename: str | None = None,
     ) -> Path:
         self.stop()
 
@@ -158,7 +160,16 @@ class NvidiaBroadcastCapture:
 
         parent = Path(parent_dir).expanduser().resolve()
         parent.mkdir(parents=True, exist_ok=True)
-        path = parent / f"s24_broadcast_{stamp}.wav"
+        safe_filename = (
+            Path(
+                str(
+                    filename
+                )
+            ).name
+            if filename
+            else f"s24_broadcast_{stamp}.wav"
+        )
+        path = parent / safe_filename
 
         writer = wave.open(str(path), "wb")
         writer.setnchannels(1)
