@@ -122,8 +122,11 @@ from rvc_training_dataset_cleaner import (
 from phone_mic_bridge import PhoneMicBridgeWidget
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.6 / S24 Smart Voice Gain"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v3.9 / Realtime RVC Voice Changer"
 
+# V39_REALTIME_RVC_VOICE_CHANGER_PATCH
+# V38_RAW_RECORD_TOGGLE_PATCH
+# V37_NVIDIA_BROADCAST_RECORD_PATCH
 # V36_S24_SMART_VOICE_GAIN_PATCH
 # V35_S24_NOISE_MONITOR_PATCH
 # V34_S24_PHONE_MIC_BRIDGE_PATCH

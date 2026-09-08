@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# V39_REALTIME_RVC_VOICE_CHANGER_PATCH
+# V38_RAW_RECORD_TOGGLE_PATCH
+# V37_NVIDIA_BROADCAST_RECORD_PATCH
 # V36_S24_SMART_VOICE_GAIN_PATCH
 # V35_S24_NOISE_MONITOR_PATCH
 # V34_S24_PHONE_MIC_BRIDGE_PATCH
@@ -57,6 +60,16 @@ except Exception as exc:  # pragma: no cover - depends on runtime installation
     _SOUNDDEVICE_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 else:
     _SOUNDDEVICE_IMPORT_ERROR = ""
+
+from nvidia_broadcast_capture import (
+    NvidiaBroadcastCapture,
+    find_nvidia_broadcast_inputs,
+)
+
+from realtime_rvc_engine import (
+    RealtimeRVCClient,
+    realtime_rvc_status_text,
+)
 
 try:
     import websockets
@@ -1350,7 +1363,11 @@ class PhoneMicRuntime:
         # v3.5: monitor is OFF by default. Recording/bridge can run silently.
         self.output_enabled = False
         self.jitter_ms = DEFAULT_JITTER_MS
+        # v3.8: RAW is optional and defaults OFF.
+        self.record_raw_copy = False
         self.record_clean_copy = True
+        self.broadcast_record_enabled = True
+        self.broadcast_input_device: int | None = None
 
         self.ring = AudioRingBuffer(
             sample_rate=self.sample_rate,
@@ -1377,8 +1394,26 @@ class PhoneMicRuntime:
 
         self._record_wave: wave.Wave_write | None = None
         self._record_path: Path | None = None
+        self._last_raw_record_path: Path | None = None
+        self._last_clean_record_path: Path | None = None
+        self._record_session_stamp = ""
         self._clean_record_wave: wave.Wave_write | None = None
         self._clean_record_path: Path | None = None
+
+        self.broadcast_capture = NvidiaBroadcastCapture(
+            log_callback=self.log
+        )
+
+        self.realtime_rvc_enabled = False
+        self.realtime_rvc_client: RealtimeRVCClient | None = None
+        self.realtime_rvc_state = "stopped"
+        self.realtime_rvc_error = ""
+        self.realtime_rvc_model = ""
+        self.realtime_rvc_index = ""
+        self.realtime_rvc_pitch = 0
+        self.realtime_rvc_index_rate = 0.35
+        self.realtime_rvc_block_ms = 200
+        self._realtime_rvc_load_thread: threading.Thread | None = None
 
         self.client_connected = False
         self.client_device_label = ""
@@ -1430,7 +1465,11 @@ class PhoneMicRuntime:
         smart_gain_max_boost_db: float,
         limiter_enabled: bool,
         limiter_ceiling_db: float,
+        record_raw_copy: bool,
         record_clean_copy: bool,
+        broadcast_record_enabled: bool,
+        broadcast_input_device: int | None,
+        realtime_rvc_enabled: bool,
     ) -> None:
         with self._settings_lock:
             self.output_device = (
@@ -1472,8 +1511,22 @@ class PhoneMicRuntime:
             self.dsp.limiter_ceiling_db = float(
                 limiter_ceiling_db
             )
+            self.record_raw_copy = bool(
+                record_raw_copy
+            )
             self.record_clean_copy = bool(
                 record_clean_copy
+            )
+            self.broadcast_record_enabled = bool(
+                broadcast_record_enabled
+            )
+            self.broadcast_input_device = (
+                int(broadcast_input_device)
+                if broadcast_input_device is not None
+                else None
+            )
+            self.realtime_rvc_enabled = bool(
+                realtime_rvc_enabled
             )
 
     def _output_callback(
@@ -1643,6 +1696,206 @@ class PhoneMicRuntime:
             self.log(
                 "실시간 모니터 출력 OFF / 녹음은 계속됩니다."
             )
+
+    def _on_realtime_rvc_audio(
+        self,
+        data: np.ndarray,
+    ) -> None:
+        with self._settings_lock:
+            enabled = bool(
+                self.realtime_rvc_enabled
+            )
+            output_enabled = bool(
+                self.output_enabled
+            )
+
+        if (
+            enabled
+            and output_enabled
+        ):
+            self.ring.write(
+                np.asarray(
+                    data,
+                    dtype=np.float32,
+                )
+            )
+
+    def start_realtime_rvc_async(
+        self,
+        *,
+        model_path: str | Path,
+        index_path: str | Path | None,
+        pitch: int,
+        index_rate: float,
+        block_ms: int,
+    ) -> None:
+        model = str(
+            model_path
+            or ""
+        ).strip()
+
+        if not model:
+            raise RuntimeError(
+                "Realtime RVC .pth 모델을 선택하세요."
+            )
+
+        if not self.running:
+            raise RuntimeError(
+                "PC 브리지를 먼저 시작하세요. "
+                "출력 장치 sample rate가 결정된 뒤 Realtime RVC를 로드합니다."
+            )
+
+        if self.realtime_rvc_state == "loading":
+            return
+
+        self.stop_realtime_rvc()
+
+        self.realtime_rvc_state = "loading"
+        self.realtime_rvc_error = ""
+        self.realtime_rvc_model = model
+        self.realtime_rvc_index = str(
+            index_path
+            or ""
+        )
+        self.realtime_rvc_pitch = int(
+            pitch
+        )
+        self.realtime_rvc_index_rate = float(
+            index_rate
+        )
+        self.realtime_rvc_block_ms = int(
+            block_ms
+        )
+
+        self.log(
+            "[Realtime RVC] 모델 로딩 시작. "
+            "HuBERT/RMVPE/RVC를 GPU에 유지합니다."
+        )
+
+        def loader() -> None:
+            client = RealtimeRVCClient(
+                log_callback=self.log,
+                audio_callback=self._on_realtime_rvc_audio,
+            )
+
+            try:
+                client.start(
+                    model_path=model,
+                    index_path=(
+                        str(
+                            index_path
+                        )
+                        if index_path
+                        else None
+                    ),
+                    sample_rate=int(
+                        self.sample_rate
+                    ),
+                    pitch=int(
+                        pitch
+                    ),
+                    index_rate=float(
+                        index_rate
+                    ),
+                    block_ms=int(
+                        block_ms
+                    ),
+                    crossfade_ms=40,
+                    extra_ms=1000,
+                    f0_method="rmvpe",
+                    timeout=120.0,
+                )
+
+                self.realtime_rvc_client = client
+                self.realtime_rvc_state = "ready"
+                self.realtime_rvc_error = ""
+                self.ring.clear()
+
+                self.log(
+                    "[Realtime RVC] READY - "
+                    "이제 CLEAN 신호가 RVC를 통과한 뒤 Windows 출력으로 전달됩니다."
+                )
+
+            except Exception as exc:
+                client.stop()
+                self.realtime_rvc_client = None
+                self.realtime_rvc_state = "error"
+                self.realtime_rvc_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.log(
+                    "[Realtime RVC] 로드 실패 - CLEAN bypass 유지: "
+                    + self.realtime_rvc_error
+                )
+
+        self._realtime_rvc_load_thread = threading.Thread(
+            target=loader,
+            name="RealtimeRVCLoad",
+            daemon=True,
+        )
+        self._realtime_rvc_load_thread.start()
+
+    def stop_realtime_rvc(
+        self,
+    ) -> None:
+        client = self.realtime_rvc_client
+        self.realtime_rvc_client = None
+
+        if client is not None:
+            try:
+                client.stop()
+            except Exception:
+                pass
+
+        if self.realtime_rvc_state != "stopped":
+            self.log(
+                "[Realtime RVC] 엔진 중지"
+            )
+
+        self.realtime_rvc_state = "stopped"
+        self.realtime_rvc_error = ""
+        self.ring.clear()
+
+    def _realtime_rvc_snapshot(
+        self,
+    ) -> dict:
+        client = self.realtime_rvc_client
+
+        if client is None:
+            return {
+                "state": str(
+                    self.realtime_rvc_state
+                ),
+                "enabled": bool(
+                    self.realtime_rvc_enabled
+                ),
+                "error": str(
+                    self.realtime_rvc_error
+                ),
+                "ready": False,
+                "last_roundtrip_ms": 0.0,
+                "processed_blocks": 0,
+                "dropped_samples": 0,
+                "queue_packets": 0,
+                "queue_ms_estimate": 0.0,
+                "block_ms": int(
+                    self.realtime_rvc_block_ms
+                ),
+                "worker_pid": None,
+            }
+
+        snap = client.snapshot()
+        snap.update(
+            {
+                "state": str(
+                    self.realtime_rvc_state
+                ),
+                "enabled": bool(
+                    self.realtime_rvc_enabled
+                ),
+            }
+        )
+        return snap
 
     def _start_http(self) -> None:
         page = _phone_page_html(
@@ -1834,9 +2087,29 @@ class PhoneMicRuntime:
                 )
 
                 if output_enabled:
-                    self.ring.write(
-                        processed
+                    rvc_client = (
+                        self.realtime_rvc_client
                     )
+                    rvc_active = (
+                        bool(
+                            self.realtime_rvc_enabled
+                        )
+                        and self.realtime_rvc_state
+                        == "ready"
+                        and rvc_client
+                        is not None
+                        and rvc_client.ready
+                    )
+
+                    if rvc_active:
+                        rvc_client.push(
+                            processed
+                        )
+                    else:
+                        # Safe bypass while RVC is disabled/loading/failed.
+                        self.ring.write(
+                            processed
+                        )
 
                 with self._stats_lock:
                     self.peak_dbfs = float(db)
@@ -1944,6 +2217,7 @@ class PhoneMicRuntime:
             return
 
         self.stop_recording()
+        self.stop_realtime_rvc()
 
         loop = self._ws_loop
         stop_event = self._ws_stop_async
@@ -2000,9 +2274,16 @@ class PhoneMicRuntime:
         path: Path | None = None,
     ) -> Path:
         with self._record_lock:
-            if self._record_wave is not None:
-                assert self._record_path is not None
-                return self._record_path
+            if (
+                self._record_wave is not None
+                or self._clean_record_wave is not None
+            ):
+                active = (
+                    self._record_path
+                    or self._clean_record_path
+                )
+                if active is not None:
+                    return active
 
             recordings_dir().mkdir(
                 parents=True,
@@ -2013,82 +2294,152 @@ class PhoneMicRuntime:
                 stamp = _dt.datetime.now().strftime(
                     "%Y%m%d_%H%M%S"
                 )
-                path = (
-                    recordings_dir()
-                    / f"s24_raw_{stamp}.wav"
-                )
+                parent = recordings_dir()
             else:
-                path = Path(
+                requested = Path(
                     path
                 ).expanduser().resolve()
-                stem = path.stem
+                parent = requested.parent
+                stem = requested.stem
 
-                if not stem.startswith(
+                if stem.startswith(
                     "s24_raw_"
                 ):
-                    stamp = _dt.datetime.now().strftime(
-                        "%Y%m%d_%H%M%S"
-                    )
-                else:
                     stamp = stem[
                         len(
                             "s24_raw_"
                         ):
                     ]
+                else:
+                    stamp = _dt.datetime.now().strftime(
+                        "%Y%m%d_%H%M%S"
+                    )
 
-            path = Path(
-                path
-            ).expanduser().resolve()
-            path.parent.mkdir(
+            parent.mkdir(
                 parents=True,
                 exist_ok=True,
             )
 
-            writer = wave.open(
-                str(path),
-                "wb",
+            raw_path = (
+                parent
+                / f"s24_raw_{stamp}.wav"
             )
-            writer.setnchannels(1)
-            writer.setsampwidth(2)
-            writer.setframerate(
-                int(self.sample_rate)
-            )
-
-            self._record_wave = writer
-            self._record_path = path
-
             clean_path = (
-                path.parent
+                parent
                 / f"s24_clean_{stamp}.wav"
             )
 
-            if self.record_clean_copy:
-                clean_writer = wave.open(
-                    str(clean_path),
+            self._record_session_stamp = stamp
+            self._last_raw_record_path = None
+            self._last_clean_record_path = None
+
+            if self.record_raw_copy:
+                raw_writer = wave.open(
+                    str(
+                        raw_path
+                    ),
                     "wb",
                 )
-                clean_writer.setnchannels(1)
-                clean_writer.setsampwidth(2)
+                raw_writer.setnchannels(
+                    1
+                )
+                raw_writer.setsampwidth(
+                    2
+                )
+                raw_writer.setframerate(
+                    int(
+                        self.sample_rate
+                    )
+                )
+                self._record_wave = raw_writer
+                self._record_path = raw_path
+                self._last_raw_record_path = raw_path
+            else:
+                self._record_wave = None
+                self._record_path = None
+
+            if self.record_clean_copy:
+                clean_writer = wave.open(
+                    str(
+                        clean_path
+                    ),
+                    "wb",
+                )
+                clean_writer.setnchannels(
+                    1
+                )
+                clean_writer.setsampwidth(
+                    2
+                )
                 clean_writer.setframerate(
-                    int(self.sample_rate)
+                    int(
+                        self.sample_rate
+                    )
                 )
                 self._clean_record_wave = clean_writer
                 self._clean_record_path = clean_path
+                self._last_clean_record_path = clean_path
             else:
                 self._clean_record_wave = None
                 self._clean_record_path = None
 
-        self.log(
-            f"RAW WAV 녹음 시작: {path}"
-        )
+        if self._record_path is not None:
+            self.log(
+                f"RAW WAV 녹음 시작: {self._record_path}"
+            )
+        else:
+            self.log(
+                "RAW WAV 저장 OFF"
+            )
 
         if self._clean_record_path is not None:
             self.log(
                 "CLEAN WAV 동시 녹음 시작: "
                 f"{self._clean_record_path}"
             )
+        else:
+            self.log(
+                "CLEAN WAV 저장 OFF"
+            )
 
-        return path
+        if self.broadcast_record_enabled:
+            if self.broadcast_input_device is None:
+                self.log(
+                    "[NVIDIA Broadcast] 입력 장치가 선택되지 않아 "
+                    "Broadcast WAV를 생략합니다."
+                )
+            else:
+                try:
+                    self.broadcast_capture.start(
+                        device_index=self.broadcast_input_device,
+                        parent_dir=parent,
+                        stamp=stamp,
+                    )
+                except Exception as exc:
+                    self.log(
+                        "[NVIDIA Broadcast] 최종 보정 마이크 캡처 시작 실패: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        primary = (
+            self._record_path
+            or self._clean_record_path
+            or Path(
+                self.broadcast_capture.snapshot().get(
+                    "path",
+                    "",
+                )
+            )
+        )
+
+        if not primary or str(primary) == ".":
+            raise RuntimeError(
+                "저장할 녹음 형식이 없습니다. RAW/CLEAN/BROADCAST 중 하나 이상을 켜세요."
+            )
+
+        return Path(
+            primary
+        )
 
     @staticmethod
     def _float_to_pcm16_bytes(
@@ -2138,6 +2489,8 @@ class PhoneMicRuntime:
                 )
 
     def stop_recording(self) -> Path | None:
+        broadcast_path = self.broadcast_capture.stop()
+
         with self._record_lock:
             raw_writer = self._record_wave
             raw_path = self._record_path
@@ -2158,16 +2511,22 @@ class PhoneMicRuntime:
                     clean_writer.close()
 
         if raw_path is not None:
+            self._last_raw_record_path = raw_path
             self.log(
                 f"RAW WAV 녹음 완료: {raw_path}"
             )
 
         if clean_path is not None:
+            self._last_clean_record_path = clean_path
             self.log(
                 f"CLEAN WAV 녹음 완료: {clean_path}"
             )
 
-        return raw_path
+        return (
+            raw_path
+            or clean_path
+            or broadcast_path
+        )
 
     def snapshot(self) -> dict:
         with self._stats_lock:
@@ -2201,6 +2560,8 @@ class PhoneMicRuntime:
         )
 
         now = time.monotonic()
+        broadcast = self.broadcast_capture.snapshot()
+        realtime_rvc = self._realtime_rvc_snapshot()
 
         return {
             "running": bool(self._running),
@@ -2235,8 +2596,14 @@ class PhoneMicRuntime:
                 / float(self.sample_rate)
             ),
             "recording": (
-                self._record_wave
-                is not None
+                self._record_wave is not None
+                or self._clean_record_wave is not None
+                or bool(
+                    broadcast["recording"]
+                )
+            ),
+            "record_raw_enabled": bool(
+                self.record_raw_copy
             ),
             "record_path": (
                 str(self._record_path)
@@ -2247,6 +2614,19 @@ class PhoneMicRuntime:
                 str(self._clean_record_path)
                 if self._clean_record_path
                 else ""
+            ),
+            "last_raw_record_path": (
+                str(self._last_raw_record_path)
+                if self._last_raw_record_path
+                else ""
+            ),
+            "last_clean_record_path": (
+                str(self._last_clean_record_path)
+                if self._last_clean_record_path
+                else ""
+            ),
+            "record_session_stamp": str(
+                self._record_session_stamp
             ),
             "transient_hits": int(
                 self.dsp.transient_hits
@@ -2263,6 +2643,28 @@ class PhoneMicRuntime:
             "limiter_reduction_db": float(
                 self.dsp.limiter_reduction_db
             ),
+            "broadcast_recording": bool(
+                broadcast["recording"]
+            ),
+            "broadcast_record_path": str(
+                broadcast["path"]
+            ),
+            "broadcast_last_path": str(
+                broadcast["last_path"]
+            ),
+            "broadcast_sample_rate": int(
+                broadcast["sample_rate"]
+            ),
+            "broadcast_peak_dbfs": float(
+                broadcast["peak_dbfs"]
+            ),
+            "broadcast_received_frames": int(
+                broadcast["received_frames"]
+            ),
+            "broadcast_status": str(
+                broadcast["status"]
+            ),
+            "realtime_rvc": realtime_rvc,
         }
 
 
@@ -2288,6 +2690,7 @@ class PhoneMicBridgeWidget(QWidget):
 
         self.runtime = PhoneMicRuntime()
         self._devices: list[tuple[int, str]] = []
+        self._broadcast_input_devices: list[tuple[int, str]] = []
 
         self._build_ui()
         self.refresh_output_devices()
@@ -2310,17 +2713,16 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         intro = QGroupBox(
-            "Galaxy S24 Ultra Phone Mic Bridge v3.6"
+            "Galaxy S24 Ultra Phone Mic Bridge v3.9"
         )
         intro_layout = QVBoxLayout(
             intro
         )
 
         text = QLabel(
-            "USB 케이블 + ADB reverse를 이용해 S24 Ultra의 Chrome에서 "
-            "48kHz mono PCM을 PC로 전송합니다. "
-            "Windows 앱에서 마이크처럼 쓰려면 출력 장치로 "
-            "VB-CABLE의 'CABLE Input' 같은 가상 오디오 입력을 선택하세요."
+            "S24 → PC DSP → 선택적 Realtime RVC → CABLE Input → NVIDIA Broadcast "
+            "구조를 지원합니다. Realtime RVC는 기존 .venv_rvc와 학습한 .pth/.index를 "
+            "그대로 사용하며 모델을 GPU에 상주시켜 블록 단위로 실시간 변환합니다."
         )
         text.setWordWrap(
             True
@@ -2407,7 +2809,7 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         output_group = QGroupBox(
-            "2. Windows 오디오 출력"
+            "2. Windows 오디오 라우팅 / NVIDIA Broadcast"
         )
         output_layout = QFormLayout(
             output_group
@@ -2437,7 +2839,7 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         self.output_enabled_check = QCheckBox(
-            "실시간 스피커/Windows 모니터 출력"
+            "선택한 Windows 출력으로 CLEAN 신호 전송"
         )
         self.output_enabled_check.setChecked(
             self.settings.value(
@@ -2447,10 +2849,8 @@ class PhoneMicBridgeWidget(QWidget):
             )
         )
         self.output_enabled_check.setToolTip(
-            "OFF여도 휴대폰 수신과 WAV 녹음은 계속됩니다. "
-            "ON이면 선택한 Windows 출력 장치로 실시간 재생합니다. "
-            "일반 스피커에서는 하울링이 날 수 있으므로 평소에는 OFF를 권장합니다. "
-            "Discord/OBS용 VB-CABLE을 사용할 때는 ON으로 설정하세요."
+            "NVIDIA Broadcast 사용 시 출력 장치를 CABLE Input으로 선택하고 ON으로 두세요. "
+            "그러면 CLEAN 신호가 VB-CABLE을 통해 NVIDIA Broadcast로 전달됩니다."
         )
         self.output_enabled_check.toggled.connect(
             self.on_monitor_toggled
@@ -2458,6 +2858,48 @@ class PhoneMicBridgeWidget(QWidget):
         output_layout.addRow(
             "",
             self.output_enabled_check,
+        )
+
+        self.broadcast_record_check = QCheckBox(
+            "NVIDIA Broadcast 최종 보정음 동시 녹음"
+        )
+        self.broadcast_record_check.setChecked(
+            self.settings.value(
+                "phone_mic_broadcast_record_enabled",
+                True,
+                type=bool,
+            )
+        )
+
+        self.broadcast_input_combo = QComboBox()
+        self.broadcast_input_combo.setToolTip(
+            "보통 'Microphone (NVIDIA Broadcast)' 또는 "
+            "'마이크(NVIDIA Broadcast)'를 선택합니다."
+        )
+
+        broadcast_row = QHBoxLayout()
+        broadcast_row.addWidget(
+            self.broadcast_record_check
+        )
+        broadcast_row.addWidget(
+            self.broadcast_input_combo,
+            1,
+        )
+        output_layout.addRow(
+            "최종 마이크 녹음",
+            broadcast_row,
+        )
+
+        broadcast_note = QLabel(
+            "권장: 우리 앱 출력=CABLE Input → NVIDIA Broadcast 입력=CABLE Output → "
+            "최종 마이크 녹음=Microphone (NVIDIA Broadcast). "
+            "Broadcast 처리 지연 때문에 RAW/CLEAN과 시작 파형은 조금 어긋날 수 있습니다."
+        )
+        broadcast_note.setWordWrap(
+            True
+        )
+        output_layout.addRow(
+            broadcast_note
         )
 
         self.jitter_spin = QSpinBox()
@@ -2800,8 +3242,27 @@ class PhoneMicBridgeWidget(QWidget):
             limiter_row,
         )
 
+        self.raw_record_check = QCheckBox(
+            "RAW 입력 WAV 저장"
+        )
+        self.raw_record_check.setChecked(
+            self.settings.value(
+                "phone_mic_record_raw_copy",
+                False,
+                type=bool,
+            )
+        )
+        self.raw_record_check.setToolTip(
+            "PC DSP/Smart Voice Gain 전 입력 신호를 s24_raw_*.wav로 저장합니다. "
+            "평소에는 OFF를 권장하고, 필터 비교/디버그/원본 보관이 필요할 때만 켜세요."
+        )
+        dsp_layout.addRow(
+            "",
+            self.raw_record_check,
+        )
+
         self.clean_record_check = QCheckBox(
-            "CLEAN WAV 동시 저장 (PC DSP + Smart Gain 적용)"
+            "CLEAN WAV 저장 (PC DSP + Smart Gain 적용)"
         )
         self.clean_record_check.setChecked(
             self.settings.value(
@@ -2823,8 +3284,290 @@ class PhoneMicBridgeWidget(QWidget):
             dsp_group
         )
 
+        rvc_group = QGroupBox(
+            "4. 실시간 RVC Voice Changer (Experimental)"
+        )
+        rvc_layout = QFormLayout(
+            rvc_group
+        )
+
+        self.realtime_rvc_status_label = QLabel(
+            realtime_rvc_status_text()
+        )
+        self.realtime_rvc_status_label.setWordWrap(
+            True
+        )
+        self.realtime_rvc_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        rvc_layout.addRow(
+            "Runtime",
+            self.realtime_rvc_status_label,
+        )
+
+        self.realtime_rvc_enable_check = QCheckBox(
+            "실시간 RVC 사용"
+        )
+        self.realtime_rvc_enable_check.setChecked(
+            self.settings.value(
+                "phone_mic_realtime_rvc_enabled",
+                False,
+                type=bool,
+            )
+        )
+        self.realtime_rvc_enable_check.setToolTip(
+            "ON + 엔진 READY일 때 CLEAN 음성이 RVC를 거쳐 CABLE Input으로 전달됩니다. "
+            "엔진 로딩/실패 중에는 자동으로 CLEAN 원음을 bypass합니다."
+        )
+        rvc_layout.addRow(
+            "",
+            self.realtime_rvc_enable_check,
+        )
+
+        saved_rt_model = self.settings.value(
+            "phone_mic_realtime_rvc_model",
+            self.settings.value(
+                "rvc_model_path",
+                "",
+                type=str,
+            ),
+            type=str,
+        )
+        saved_rt_index = self.settings.value(
+            "phone_mic_realtime_rvc_index",
+            self.settings.value(
+                "rvc_index_path",
+                "",
+                type=str,
+            ),
+            type=str,
+        )
+
+        self.realtime_rvc_model_path = str(
+            saved_rt_model
+            or ""
+        )
+        self.realtime_rvc_index_path = str(
+            saved_rt_index
+            or ""
+        )
+
+        model_row = QHBoxLayout()
+        self.realtime_rvc_model_label = QLabel(
+            self.realtime_rvc_model_path
+            or "RVC .pth 모델을 선택하세요."
+        )
+        self.realtime_rvc_model_label.setWordWrap(
+            True
+        )
+        self.realtime_rvc_model_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.realtime_rvc_model_button = QPushButton(
+            ".pth 선택"
+        )
+        self.realtime_rvc_model_button.clicked.connect(
+            self.choose_realtime_rvc_model
+        )
+        model_row.addWidget(
+            self.realtime_rvc_model_label,
+            1,
+        )
+        model_row.addWidget(
+            self.realtime_rvc_model_button
+        )
+        rvc_layout.addRow(
+            "Model",
+            model_row,
+        )
+
+        index_row = QHBoxLayout()
+        self.realtime_rvc_index_label = QLabel(
+            self.realtime_rvc_index_path
+            or "Index 미선택 - Index Rate 0으로 동작"
+        )
+        self.realtime_rvc_index_label.setWordWrap(
+            True
+        )
+        self.realtime_rvc_index_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.realtime_rvc_index_button = QPushButton(
+            ".index 선택"
+        )
+        self.realtime_rvc_index_button.clicked.connect(
+            self.choose_realtime_rvc_index
+        )
+        self.realtime_rvc_index_clear_button = QPushButton(
+            "Index 지우기"
+        )
+        self.realtime_rvc_index_clear_button.clicked.connect(
+            self.clear_realtime_rvc_index
+        )
+        index_row.addWidget(
+            self.realtime_rvc_index_label,
+            1,
+        )
+        index_row.addWidget(
+            self.realtime_rvc_index_button
+        )
+        index_row.addWidget(
+            self.realtime_rvc_index_clear_button
+        )
+        rvc_layout.addRow(
+            "Feature Index",
+            index_row,
+        )
+
+        self.realtime_rvc_pitch_spin = QSpinBox()
+        self.realtime_rvc_pitch_spin.setRange(
+            -24,
+            24,
+        )
+        self.realtime_rvc_pitch_spin.setSuffix(
+            " semitone"
+        )
+        self.realtime_rvc_pitch_spin.setValue(
+            int(
+                self.settings.value(
+                    "phone_mic_realtime_rvc_pitch",
+                    0,
+                )
+            )
+        )
+        rvc_layout.addRow(
+            "Pitch",
+            self.realtime_rvc_pitch_spin,
+        )
+
+        self.realtime_rvc_index_rate_spin = QDoubleSpinBox()
+        self.realtime_rvc_index_rate_spin.setRange(
+            0.0,
+            1.0,
+        )
+        self.realtime_rvc_index_rate_spin.setDecimals(
+            2
+        )
+        self.realtime_rvc_index_rate_spin.setSingleStep(
+            0.05
+        )
+        self.realtime_rvc_index_rate_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_realtime_rvc_index_rate",
+                    0.35,
+                )
+            )
+        )
+        self.realtime_rvc_index_rate_spin.setToolTip(
+            "실시간 대화는 0.30~0.50부터 권장. "
+            "Index가 없으면 자동으로 0 처리됩니다."
+        )
+        rvc_layout.addRow(
+            "Index Rate",
+            self.realtime_rvc_index_rate_spin,
+        )
+
+        self.realtime_rvc_block_combo = QComboBox()
+        for label, value in (
+            (
+                "150 ms - 낮은 지연 / 부하 높음",
+                150,
+            ),
+            (
+                "200 ms - 권장",
+                200,
+            ),
+            (
+                "250 ms - 안정성 우선",
+                250,
+            ),
+            (
+                "300 ms - 더 안정적 / 지연 큼",
+                300,
+            ),
+        ):
+            self.realtime_rvc_block_combo.addItem(
+                label,
+                value,
+            )
+
+        saved_block = int(
+            self.settings.value(
+                "phone_mic_realtime_rvc_block_ms",
+                200,
+            )
+        )
+        block_index = self.realtime_rvc_block_combo.findData(
+            saved_block
+        )
+        self.realtime_rvc_block_combo.setCurrentIndex(
+            block_index
+            if block_index >= 0
+            else 1
+        )
+        rvc_layout.addRow(
+            "Processing Block",
+            self.realtime_rvc_block_combo,
+        )
+
+        rvc_button_row = QHBoxLayout()
+        self.realtime_rvc_start_button = QPushButton(
+            "RVC 엔진 로드 / 재시작"
+        )
+        self.realtime_rvc_start_button.clicked.connect(
+            self.start_realtime_rvc
+        )
+        self.realtime_rvc_stop_button = QPushButton(
+            "RVC 엔진 중지"
+        )
+        self.realtime_rvc_stop_button.clicked.connect(
+            self.stop_realtime_rvc
+        )
+        rvc_button_row.addWidget(
+            self.realtime_rvc_start_button
+        )
+        rvc_button_row.addWidget(
+            self.realtime_rvc_stop_button
+        )
+        rvc_layout.addRow(
+            "",
+            rvc_button_row,
+        )
+
+        self.realtime_rvc_live_label = QLabel(
+            "State: stopped"
+        )
+        self.realtime_rvc_live_label.setWordWrap(
+            True
+        )
+        self.realtime_rvc_live_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        rvc_layout.addRow(
+            "Live",
+            self.realtime_rvc_live_label,
+        )
+
+        rvc_note = QLabel(
+            "권장 체인: S24 → Smart Voice Gain → Realtime RVC → "
+            "CABLE Input → NVIDIA Broadcast → 게임. "
+            "모델 로딩 중/실패 시에는 CLEAN 원음이 자동 통과합니다. "
+            "첫 버전은 RMVPE + SOLA / eager CUDA 경로를 사용합니다."
+        )
+        rvc_note.setWordWrap(
+            True
+        )
+        rvc_layout.addRow(
+            rvc_note
+        )
+
+        root.addWidget(
+            rvc_group
+        )
+
         control_group = QGroupBox(
-            "4. 브리지 / 녹음"
+            "5. 브리지 / 녹음"
         )
         control_layout = QVBoxLayout(
             control_group
@@ -2856,7 +3599,7 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         self.record_button = QPushButton(
-            "RAW + CLEAN WAV 녹음 시작"
+            "선택한 WAV 녹음 시작"
         )
         self.record_button.clicked.connect(
             self.toggle_recording
@@ -2937,6 +3680,187 @@ class PhoneMicBridgeWidget(QWidget):
             1,
         )
 
+    def choose_realtime_rvc_model(
+        self,
+    ) -> None:
+        start_dir = (
+            str(
+                Path(
+                    self.realtime_rvc_model_path
+                ).parent
+            )
+            if self.realtime_rvc_model_path
+            else str(
+                project_root()
+                / "rvc_models"
+            )
+        )
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Realtime RVC 모델 선택",
+            start_dir,
+            "RVC model (*.pth);;All files (*.*)",
+        )
+
+        if not path:
+            return
+
+        self.realtime_rvc_model_path = str(
+            Path(
+                path
+            ).resolve()
+        )
+        self.realtime_rvc_model_label.setText(
+            self.realtime_rvc_model_path
+        )
+
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_model",
+            self.realtime_rvc_model_path,
+        )
+
+    def choose_realtime_rvc_index(
+        self,
+    ) -> None:
+        start_dir = (
+            str(
+                Path(
+                    self.realtime_rvc_model_path
+                ).parent
+            )
+            if self.realtime_rvc_model_path
+            else str(
+                project_root()
+                / "rvc_models"
+            )
+        )
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Realtime RVC Feature Index 선택",
+            start_dir,
+            "RVC index (*.index);;All files (*.*)",
+        )
+
+        if not path:
+            return
+
+        self.realtime_rvc_index_path = str(
+            Path(
+                path
+            ).resolve()
+        )
+        self.realtime_rvc_index_label.setText(
+            self.realtime_rvc_index_path
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_index",
+            self.realtime_rvc_index_path,
+        )
+
+    def clear_realtime_rvc_index(
+        self,
+    ) -> None:
+        self.realtime_rvc_index_path = ""
+        self.realtime_rvc_index_label.setText(
+            "Index 미선택 - Index Rate 0으로 동작"
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_index",
+            "",
+        )
+
+    def _save_realtime_rvc_settings(
+        self,
+    ) -> None:
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_enabled",
+            self.realtime_rvc_enable_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_model",
+            self.realtime_rvc_model_path,
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_index",
+            self.realtime_rvc_index_path,
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_pitch",
+            self.realtime_rvc_pitch_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_index_rate",
+            self.realtime_rvc_index_rate_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_block_ms",
+            int(
+                self.realtime_rvc_block_combo.currentData()
+                or 200
+            ),
+        )
+
+    def start_realtime_rvc(
+        self,
+    ) -> None:
+        self._save_realtime_rvc_settings()
+        self._apply_runtime_settings()
+
+        if not self.runtime.running:
+            QMessageBox.information(
+                self,
+                "PC 브리지 필요",
+                "먼저 PC 브리지를 시작하세요. "
+                "CABLE Input의 실제 sample rate가 결정된 뒤 RVC 엔진을 로드합니다.",
+            )
+            return
+
+        model = str(
+            self.realtime_rvc_model_path
+            or ""
+        ).strip()
+
+        if (
+            not model
+            or not Path(
+                model
+            ).is_file()
+        ):
+            QMessageBox.warning(
+                self,
+                "RVC 모델 없음",
+                "실시간 변환에 사용할 .pth 모델을 선택하세요.",
+            )
+            return
+
+        try:
+            self.runtime.start_realtime_rvc_async(
+                model_path=model,
+                index_path=(
+                    self.realtime_rvc_index_path
+                    or None
+                ),
+                pitch=self.realtime_rvc_pitch_spin.value(),
+                index_rate=self.realtime_rvc_index_rate_spin.value(),
+                block_ms=int(
+                    self.realtime_rvc_block_combo.currentData()
+                    or 200
+                ),
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Realtime RVC 시작 실패",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def stop_realtime_rvc(
+        self,
+    ) -> None:
+        self.runtime.stop_realtime_rvc()
+
     def _selected_output_device(
         self,
     ) -> int | None:
@@ -2950,6 +3874,62 @@ class PhoneMicBridgeWidget(QWidget):
         except Exception:
             return None
 
+    def _selected_broadcast_input_device(
+        self,
+    ) -> int | None:
+        data = self.broadcast_input_combo.currentData()
+
+        if data is None:
+            return None
+
+        try:
+            return int(data)
+        except Exception:
+            return None
+
+    def _refresh_broadcast_input_devices(self) -> None:
+        previous = self.settings.value(
+            "phone_mic_broadcast_input_device_name",
+            "",
+            type=str,
+        )
+
+        self.broadcast_input_combo.clear()
+        self._broadcast_input_devices.clear()
+
+        devices = find_nvidia_broadcast_inputs()
+
+        if not devices:
+            self.broadcast_input_combo.addItem(
+                "NVIDIA Broadcast 입력 장치 없음",
+                None,
+            )
+            return
+
+        selected_combo = 0
+
+        for device_index, name in devices:
+            self.broadcast_input_combo.addItem(
+                f"[{device_index}] {name}",
+                device_index,
+            )
+            self._broadcast_input_devices.append(
+                (
+                    int(device_index),
+                    str(name),
+                )
+            )
+
+            if previous and previous == name:
+                selected_combo = (
+                    self.broadcast_input_combo.count()
+                    - 1
+                )
+
+        self.broadcast_input_combo.setCurrentIndex(
+            selected_combo
+        )
+
     def refresh_output_devices(self) -> None:
         previous = self.settings.value(
             "phone_mic_output_device_name",
@@ -2962,6 +3942,11 @@ class PhoneMicBridgeWidget(QWidget):
 
         if sd is None:
             self.output_combo.addItem(
+                "sounddevice 미설치",
+                None,
+            )
+            self.broadcast_input_combo.clear()
+            self.broadcast_input_combo.addItem(
                 "sounddevice 미설치",
                 None,
             )
@@ -3034,6 +4019,8 @@ class PhoneMicBridgeWidget(QWidget):
             self.output_combo.setCurrentIndex(
                 best_index
             )
+
+        self._refresh_broadcast_input_devices()
 
     def refresh_adb_status(self) -> None:
         self.runtime_label.setText(
@@ -3135,9 +4122,31 @@ class PhoneMicBridgeWidget(QWidget):
             self.limiter_ceiling_spin.value(),
         )
         self.settings.setValue(
+            "phone_mic_record_raw_copy",
+            self.raw_record_check.isChecked(),
+        )
+        self.settings.setValue(
             "phone_mic_record_clean_copy",
             self.clean_record_check.isChecked(),
         )
+
+        broadcast_device = self._selected_broadcast_input_device()
+        broadcast_name = ""
+
+        for index, name in self._broadcast_input_devices:
+            if index == broadcast_device:
+                broadcast_name = name
+                break
+
+        self.settings.setValue(
+            "phone_mic_broadcast_record_enabled",
+            self.broadcast_record_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_broadcast_input_device_name",
+            broadcast_name,
+        )
+        self._save_realtime_rvc_settings()
 
     def _apply_runtime_settings(self) -> None:
         self.runtime.configure(
@@ -3156,7 +4165,11 @@ class PhoneMicBridgeWidget(QWidget):
             smart_gain_max_boost_db=self.smart_gain_max_spin.value(),
             limiter_enabled=self.limiter_check.isChecked(),
             limiter_ceiling_db=self.limiter_ceiling_spin.value(),
+            record_raw_copy=self.raw_record_check.isChecked(),
             record_clean_copy=self.clean_record_check.isChecked(),
+            broadcast_record_enabled=self.broadcast_record_check.isChecked(),
+            broadcast_input_device=self._selected_broadcast_input_device(),
+            realtime_rvc_enabled=self.realtime_rvc_enable_check.isChecked(),
         )
 
     def on_monitor_toggled(
@@ -3201,7 +4214,11 @@ class PhoneMicBridgeWidget(QWidget):
                 smart_gain_max_boost_db=self.smart_gain_max_spin.value(),
                 limiter_enabled=self.limiter_check.isChecked(),
                 limiter_ceiling_db=self.limiter_ceiling_spin.value(),
+                record_raw_copy=self.raw_record_check.isChecked(),
                 record_clean_copy=self.clean_record_check.isChecked(),
+                broadcast_record_enabled=self.broadcast_record_check.isChecked(),
+                broadcast_input_device=self._selected_broadcast_input_device(),
+                realtime_rvc_enabled=self.realtime_rvc_enable_check.isChecked(),
             )
             QMessageBox.warning(
                 self,
@@ -3250,6 +4267,16 @@ class PhoneMicBridgeWidget(QWidget):
             True
         )
 
+        self.raw_record_check.setEnabled(
+            True
+        )
+        self.clean_record_check.setEnabled(
+            True
+        )
+        self.broadcast_record_check.setEnabled(
+            True
+        )
+
         self.output_combo.setEnabled(
             False
         )
@@ -3257,6 +4284,18 @@ class PhoneMicBridgeWidget(QWidget):
         self.output_enabled_check.setEnabled(
             True
         )
+
+        if (
+            self.realtime_rvc_enable_check.isChecked()
+            and self.realtime_rvc_model_path
+            and Path(
+                self.realtime_rvc_model_path
+            ).is_file()
+        ):
+            QTimer.singleShot(
+                100,
+                self.start_realtime_rvc,
+            )
 
     def stop_bridge(self) -> None:
         self.runtime.stop()
@@ -3271,7 +4310,7 @@ class PhoneMicBridgeWidget(QWidget):
             False
         )
         self.record_button.setText(
-            "RAW + CLEAN WAV 녹음 시작"
+            "선택한 WAV 녹음 시작"
         )
 
         self.output_combo.setEnabled(
@@ -3314,15 +4353,92 @@ class PhoneMicBridgeWidget(QWidget):
         if snap["recording"]:
             path = self.runtime.stop_recording()
             self.record_button.setText(
-                "RAW + CLEAN WAV 녹음 시작"
+                "선택한 WAV 녹음 시작"
+            )
+            self.raw_record_check.setEnabled(
+                True
+            )
+            self.clean_record_check.setEnabled(
+                True
+            )
+            self.broadcast_record_check.setEnabled(
+                True
             )
 
             if path is not None:
+                snap_after = self.runtime.snapshot()
+                saved: list[str] = []
+
+                raw_last = str(
+                    snap_after.get(
+                        "last_raw_record_path",
+                        "",
+                    )
+                    or ""
+                )
+                clean_last = str(
+                    snap_after.get(
+                        "last_clean_record_path",
+                        "",
+                    )
+                    or ""
+                )
+                broadcast_last = str(
+                    snap_after.get(
+                        "broadcast_last_path",
+                        "",
+                    )
+                    or ""
+                )
+
+                if raw_last:
+                    saved.append(
+                        f"RAW: {raw_last}"
+                    )
+
+                if clean_last:
+                    saved.append(
+                        f"CLEAN: {clean_last}"
+                    )
+
+                if broadcast_last:
+                    saved.append(
+                        f"BROADCAST: {broadcast_last}"
+                    )
+
                 QMessageBox.information(
                     self,
                     "녹음 저장 완료",
-                    str(path),
+                    "\n".join(saved)
+                    if saved
+                    else str(path),
                 )
+            return
+
+        if not (
+            self.raw_record_check.isChecked()
+            or self.clean_record_check.isChecked()
+            or self.broadcast_record_check.isChecked()
+        ):
+            QMessageBox.warning(
+                self,
+                "녹음 형식 없음",
+                "RAW / CLEAN / NVIDIA Broadcast 중 하나 이상을 켜세요.",
+            )
+            return
+
+        if (
+            self.broadcast_record_check.isChecked()
+            and self._selected_broadcast_input_device()
+            is None
+        ):
+            QMessageBox.warning(
+                self,
+                "NVIDIA Broadcast 입력 없음",
+                "최종 보정음 동시 녹음이 켜져 있지만 NVIDIA Broadcast 입력 장치를 찾지 못했습니다.\n\n"
+                "NVIDIA Broadcast를 실행하고 '장치 새로고침'을 누른 뒤 "
+                "'Microphone (NVIDIA Broadcast)' 또는 '마이크(NVIDIA Broadcast)'를 확인하세요.",
+            )
             return
 
         try:
@@ -3336,10 +4452,19 @@ class PhoneMicBridgeWidget(QWidget):
             return
 
         self.record_button.setText(
-            "RAW + CLEAN WAV 녹음 중지"
+            "녹음 중지"
+        )
+        self.raw_record_check.setEnabled(
+            False
+        )
+        self.clean_record_check.setEnabled(
+            False
+        )
+        self.broadcast_record_check.setEnabled(
+            False
         )
         self.runtime.log(
-            f"학습용 RAW recording path={path}"
+            f"recording started path={path}"
         )
 
     def _refresh_runtime_ui(self) -> None:
@@ -3414,16 +4539,76 @@ class PhoneMicBridgeWidget(QWidget):
             f"overflow {snap['overflow_ms']:.0f}ms / "
             f"click suppress {snap['transient_hits']} / "
             f"auto gain {snap['smart_gain_db']:+.1f}dB / "
-            f"clean RMS {snap['smart_gain_output_rms_db']:.1f}dBFS"
+            f"clean RMS {snap['smart_gain_output_rms_db']:.1f}dBFS / "
+            f"Broadcast {snap['broadcast_status']} "
+            f"{snap['broadcast_peak_dbfs']:.1f}dBFS"
+        )
+
+        rt = snap.get(
+            "realtime_rvc",
+            {},
+        )
+        rt_state = str(
+            rt.get(
+                "state",
+                "stopped",
+            )
+        )
+        rt_ready = bool(
+            rt.get(
+                "ready",
+                False,
+            )
+        )
+        rt_ms = float(
+            rt.get(
+                "last_roundtrip_ms",
+                0.0,
+            )
+            or 0.0
+        )
+        rt_queue = float(
+            rt.get(
+                "queue_ms_estimate",
+                0.0,
+            )
+            or 0.0
+        )
+        rt_drop = int(
+            rt.get(
+                "dropped_samples",
+                0,
+            )
+            or 0
+        )
+        rt_error = str(
+            rt.get(
+                "error",
+                "",
+            )
+            or ""
+        )
+
+        self.realtime_rvc_live_label.setText(
+            f"State: {rt_state} / "
+            f"READY={rt_ready} / "
+            f"worker roundtrip={rt_ms:.1f}ms / "
+            f"queue≈{rt_queue:.0f}ms / "
+            f"dropped={rt_drop}"
+            + (
+                f"\nERROR: {rt_error}"
+                if rt_error
+                else ""
+            )
         )
 
         if snap["recording"]:
             self.record_button.setText(
-                "RAW + CLEAN WAV 녹음 중지"
+                "녹음 중지"
             )
         elif self.runtime.running:
             self.record_button.setText(
-                "RAW + CLEAN WAV 녹음 시작"
+                "선택한 WAV 녹음 시작"
             )
 
     def shutdown(self) -> None:
