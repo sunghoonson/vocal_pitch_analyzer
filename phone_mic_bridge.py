@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# V44_S24_NATIVE_SCREENOFF_MIC_PATCH
+# V43_REALTIME_RVC_F0_STABILITY_GUARD_PATCH
 # V42_RVC_AB_ALIGNMENT_LOW_LATENCY_PATCH
 # V41_RVC_AB_DEBUG_RECORD_PATCH
 # V40_S24_CAMERA_VIRTUAL_WEBCAM_PATCH
@@ -37,7 +39,7 @@ import wave
 
 import numpy as np
 
-from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtCore import QSettings, QTimer, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -105,6 +107,8 @@ HTTP_PORT = 8790
 WS_PORT = 8791
 VIDEO_WS_PORT = 8792
 CAMERA_CONTROL_PORT = 8793
+NATIVE_MIC_PACKAGE = "local.vocalpitch.s24mic"
+NATIVE_MIC_ACTIVITY = ".MainActivity"
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_PACKET_MS = 20
 DEFAULT_JITTER_MS = 80
@@ -227,12 +231,7 @@ def _run_adb(
     )
 
 
-def setup_adb_reverse_and_open_browser(
-    *,
-    http_port: int = HTTP_PORT,
-    ws_port: int = WS_PORT,
-    video_ws_port: int = VIDEO_WS_PORT,
-) -> tuple[str, str]:
+def _first_online_android_serial() -> str:
     devices = adb_devices()
 
     online = [
@@ -247,35 +246,257 @@ def setup_adb_reverse_and_open_browser(
         if state == "unauthorized"
     ]
 
-    if not online:
-        if unauthorized:
-            raise RuntimeError(
-                "Galaxy가 USB로 보이지만 아직 인증되지 않았습니다. "
-                "휴대폰에 나타난 'USB 디버깅을 허용할까요?' 창에서 허용한 뒤 다시 시도하세요."
-            )
+    if online:
+        return online[
+            0
+        ]
 
+    if unauthorized:
         raise RuntimeError(
-            "ADB에서 연결된 Android 기기를 찾지 못했습니다. "
-            "S24 Ultra의 개발자 옵션 > USB 디버깅을 켜고 USB 케이블로 연결하세요."
+            "Galaxy가 USB로 보이지만 아직 인증되지 않았습니다. "
+            "휴대폰의 USB 디버깅 허용 창에서 이 PC를 허용하세요."
         )
 
-    serial = online[0]
+    raise RuntimeError(
+        "ADB에서 연결된 Android 기기를 찾지 못했습니다. "
+        "USB 디버깅을 켜고 USB 케이블로 연결하세요."
+    )
 
-    for port in (int(http_port), int(ws_port), int(video_ws_port)):
+
+def _adb_reverse_ports(
+    serial: str,
+    ports: tuple[int, ...],
+) -> None:
+    for port in ports:
         result = _run_adb(
             [
                 "reverse",
-                f"tcp:{port}",
-                f"tcp:{port}",
+                f"tcp:{int(port)}",
+                f"tcp:{int(port)}",
             ],
             serial=serial,
         )
 
         if result.returncode != 0:
             raise RuntimeError(
-                f"adb reverse tcp:{port} 실패:\n"
-                + (result.stderr or result.stdout or "(출력 없음)")
+                f"adb reverse tcp:{int(port)} 실패:\n"
+                + (
+                    result.stderr
+                    or result.stdout
+                    or "(출력 없음)"
+                )
             )
+
+
+def native_mic_project_dir() -> Path:
+    return (
+        project_root()
+        / "android"
+        / "s24_native_mic"
+    )
+
+
+def native_mic_apk_candidates() -> tuple[Path, ...]:
+    return (
+        project_root()
+        / "tools"
+        / "s24_native_mic"
+        / "S24NativeMic-debug.apk",
+        native_mic_project_dir()
+        / "app"
+        / "build"
+        / "outputs"
+        / "apk"
+        / "debug"
+        / "app-debug.apk",
+    )
+
+
+def find_native_mic_apk() -> Path | None:
+    for path in native_mic_apk_candidates():
+        if path.is_file():
+            return path
+
+    return None
+
+
+def native_mic_installed(
+    *,
+    serial: str | None = None,
+) -> bool:
+    try:
+        serial = (
+            serial
+            or _first_online_android_serial()
+        )
+        result = _run_adb(
+            [
+                "shell",
+                "pm",
+                "path",
+                NATIVE_MIC_PACKAGE,
+            ],
+            serial=serial,
+            timeout=10.0,
+        )
+
+        return (
+            result.returncode == 0
+            and "package:" in result.stdout
+        )
+
+    except Exception:
+        return False
+
+
+def install_native_mic_app(
+    *,
+    serial: str | None = None,
+) -> tuple[str, Path]:
+    serial = (
+        serial
+        or _first_online_android_serial()
+    )
+
+    apk = find_native_mic_apk()
+
+    if apk is None:
+        raise RuntimeError(
+            "빌드된 S24 Native Mic APK를 찾지 못했습니다.\n\n"
+            "먼저 프로젝트의 dev_tools\\BUILD_S24_NATIVE_MIC.bat 을 실행하세요.\n"
+            "Android Studio/Android SDK가 한 번은 설치되어 있어야 합니다."
+        )
+
+    result = _run_adb(
+        [
+            "install",
+            "-r",
+            str(
+                apk
+            ),
+        ],
+        serial=serial,
+        timeout=120.0,
+    )
+
+    output = (
+        result.stdout
+        + "\n"
+        + result.stderr
+    ).strip()
+
+    if (
+        result.returncode != 0
+        or "Success" not in output
+    ):
+        raise RuntimeError(
+            "Native Mic APK 설치 실패:\n"
+            + (
+                output
+                or "(출력 없음)"
+            )
+        )
+
+    return (
+        serial,
+        apk,
+    )
+
+
+def launch_native_mic_app(
+    *,
+    auto_install: bool = True,
+    auto_start: bool = True,
+) -> tuple[str, bool]:
+    serial = _first_online_android_serial()
+
+    # The native app only needs the audio websocket.
+    _adb_reverse_ports(
+        serial,
+        (
+            WS_PORT,
+        ),
+    )
+
+    installed_now = False
+
+    if not native_mic_installed(
+        serial=serial
+    ):
+        if not auto_install:
+            raise RuntimeError(
+                "S24 Native Mic 앱이 설치되어 있지 않습니다."
+            )
+
+        install_native_mic_app(
+            serial=serial
+        )
+        installed_now = True
+
+    component = (
+        f"{NATIVE_MIC_PACKAGE}/"
+        f"{NATIVE_MIC_ACTIVITY}"
+    )
+
+    args = [
+        "shell",
+        "am",
+        "start",
+        "-n",
+        component,
+    ]
+
+    if auto_start:
+        args += [
+            "--ez",
+            "auto_start",
+            "true",
+        ]
+
+    result = _run_adb(
+        args,
+        serial=serial,
+        timeout=20.0,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "S24 Native Mic 실행 실패:\n"
+            + (
+                result.stderr
+                or result.stdout
+                or "(출력 없음)"
+            )
+        )
+
+    return (
+        serial,
+        installed_now,
+    )
+
+
+def setup_adb_reverse_and_open_browser(
+    *,
+    http_port: int = HTTP_PORT,
+    ws_port: int = WS_PORT,
+    video_ws_port: int = VIDEO_WS_PORT,
+) -> tuple[str, str]:
+    serial = _first_online_android_serial()
+
+    _adb_reverse_ports(
+        serial,
+        (
+            int(
+                http_port
+            ),
+            int(
+                ws_port
+            ),
+            int(
+                video_ws_port
+            ),
+        ),
+    )
 
     url = f"http://localhost:{int(http_port)}/"
 
@@ -1057,6 +1278,13 @@ class PhoneMicRuntime:
         self.realtime_rvc_pitch = 0
         self.realtime_rvc_index_rate = 0.35
         self.realtime_rvc_block_ms = 200
+        self.realtime_rvc_f0_guard_enabled = True
+        self.realtime_rvc_f0_diagnostic_enabled = True
+        self.realtime_rvc_rmvpe_threshold = 0.05
+        self.realtime_rvc_f0_quiet_rms_db = -48.0
+        self.realtime_rvc_f0_min_voiced_ratio = 0.15
+        self.realtime_rvc_f0_max_gap_ms = 30
+        self.realtime_rvc_f0_min_run_ms = 40
         self._realtime_rvc_load_thread: threading.Thread | None = None
 
         self.client_connected = False
@@ -1391,6 +1619,13 @@ class PhoneMicRuntime:
         pitch: int,
         index_rate: float,
         block_ms: int,
+        f0_guard_enabled: bool,
+        f0_diagnostic_enabled: bool,
+        rmvpe_threshold: float,
+        f0_quiet_rms_db: float,
+        f0_min_voiced_ratio: float,
+        f0_max_gap_ms: int,
+        f0_min_run_ms: int,
     ) -> None:
         model = str(
             model_path
@@ -1429,6 +1664,27 @@ class PhoneMicRuntime:
         self.realtime_rvc_block_ms = int(
             block_ms
         )
+        self.realtime_rvc_f0_guard_enabled = bool(
+            f0_guard_enabled
+        )
+        self.realtime_rvc_f0_diagnostic_enabled = bool(
+            f0_diagnostic_enabled
+        )
+        self.realtime_rvc_rmvpe_threshold = float(
+            rmvpe_threshold
+        )
+        self.realtime_rvc_f0_quiet_rms_db = float(
+            f0_quiet_rms_db
+        )
+        self.realtime_rvc_f0_min_voiced_ratio = float(
+            f0_min_voiced_ratio
+        )
+        self.realtime_rvc_f0_max_gap_ms = int(
+            f0_max_gap_ms
+        )
+        self.realtime_rvc_f0_min_run_ms = int(
+            f0_min_run_ms
+        )
 
         self.log(
             "[Realtime RVC] 모델 로딩 시작. "
@@ -1466,6 +1722,27 @@ class PhoneMicRuntime:
                     crossfade_ms=40,
                     extra_ms=1000,
                     f0_method="rmvpe",
+                    f0_guard_enabled=bool(
+                        f0_guard_enabled
+                    ),
+                    f0_diagnostic_enabled=bool(
+                        f0_diagnostic_enabled
+                    ),
+                    rmvpe_threshold=float(
+                        rmvpe_threshold
+                    ),
+                    f0_quiet_rms_db=float(
+                        f0_quiet_rms_db
+                    ),
+                    f0_min_voiced_ratio=float(
+                        f0_min_voiced_ratio
+                    ),
+                    f0_max_gap_ms=int(
+                        f0_max_gap_ms
+                    ),
+                    f0_min_run_ms=int(
+                        f0_min_run_ms
+                    ),
                     timeout=120.0,
                 )
 
@@ -2780,6 +3057,12 @@ class PhoneMicRuntime:
 
 
 class PhoneMicBridgeWidget(QWidget):
+    native_action_done = Signal(
+        str,
+        bool,
+        str,
+    )
+
     def __init__(
         self,
         *,
@@ -2809,6 +3092,11 @@ class PhoneMicBridgeWidget(QWidget):
         self._broadcast_input_devices: list[tuple[int, str]] = []
         self._camera_device_signature: tuple = ()
         self._camera_preview_seq = -1
+        self._native_action_busy = False
+
+        self.native_action_done.connect(
+            self._on_native_action_done
+        )
 
         self._build_ui()
         self.refresh_output_devices()
@@ -2914,9 +3202,10 @@ class PhoneMicBridgeWidget(QWidget):
         guide = QLabel(
             "휴대폰: 설정 → 휴대전화 정보 → 소프트웨어 정보 → "
             "'빌드번호' 7회 탭 → 개발자 옵션 → USB 디버깅 ON.\n"
-            "USB 연결 후 휴대폰에 뜨는 PC 인증 창을 허용하세요. "
-            "그 다음 아래 버튼을 누르면 8790/8791/8792 포트를 reverse하고 "
-            "휴대폰 Chrome에서 http://localhost:8790 을 엽니다."
+            "Chrome 브리지: 마이크+카메라 테스트/설정용. Android가 화면을 잠그거나 "
+            "Chrome 페이지를 freeze하면 AudioWorklet/WebSocket이 중단될 수 있어 화면 OFF용으로는 부적합합니다.\n"
+            "Native Mic: Android microphone Foreground Service + PARTIAL_WAKE_LOCK으로 동작하므로 "
+            "시작 후 화면을 끄거나 앱을 백그라운드로 보내도 마이크 전송을 계속하도록 만든 모드입니다."
         )
         guide.setWordWrap(
             True
@@ -2949,7 +3238,7 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         self.phone_open_button = QPushButton(
-            "USB 연결 + 휴대폰 Chrome 열기"
+            "Chrome AV 브리지 열기"
         )
         self.phone_open_button.clicked.connect(
             self.open_phone_page
@@ -2961,6 +3250,64 @@ class PhoneMicBridgeWidget(QWidget):
         adb_layout.addLayout(
             adb_row
         )
+
+        native_row = QHBoxLayout()
+
+        self.native_mic_status_label = QLabel(
+            "Native Mic 상태 확인 중..."
+        )
+        self.native_mic_status_label.setWordWrap(
+            True
+        )
+        self.native_mic_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        native_row.addWidget(
+            self.native_mic_status_label,
+            1,
+        )
+
+        self.native_mic_install_button = QPushButton(
+            "Native Mic APK 설치"
+        )
+        self.native_mic_install_button.clicked.connect(
+            self.install_native_mic
+        )
+        native_row.addWidget(
+            self.native_mic_install_button
+        )
+
+        self.native_mic_launch_button = QPushButton(
+            "Native Mic 실행 / 화면 OFF"
+        )
+        self.native_mic_launch_button.setToolTip(
+            "adb reverse tcp:8791을 설정하고 Native Mic Activity를 엽니다. "
+            "권한이 이미 있으면 microphone foreground service를 자동 시작합니다."
+        )
+        self.native_mic_launch_button.clicked.connect(
+            self.launch_native_mic
+        )
+        native_row.addWidget(
+            self.native_mic_launch_button
+        )
+
+        adb_layout.addLayout(
+            native_row
+        )
+
+        native_note = QLabel(
+            "최초 1회 APK 빌드가 필요하면 dev_tools\\BUILD_S24_NATIVE_MIC.bat을 실행하세요. "
+            "앱에서 마이크 권한을 허용한 뒤 'Start native mic'을 누르면 지속 알림이 표시됩니다. "
+            "그 알림이 떠 있는 동안에는 화면을 꺼도 마이크 서비스가 계속 동작합니다. "
+            "삼성 배터리 절전이 강하게 적용되는 경우 앱 배터리 사용을 '제한 없음'으로 바꾸세요."
+        )
+        native_note.setWordWrap(
+            True
+        )
+        adb_layout.addWidget(
+            native_note
+        )
+
         root.addWidget(
             adb_group
         )
@@ -3722,6 +4069,188 @@ class PhoneMicBridgeWidget(QWidget):
             self.realtime_rvc_index_rate_spin,
         )
 
+        self.realtime_rvc_f0_guard_check = QCheckBox(
+            "F0 Stability Guard"
+        )
+        self.realtime_rvc_f0_guard_check.setChecked(
+            self.settings.value(
+                "phone_mic_realtime_rvc_f0_guard_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.realtime_rvc_f0_guard_check.setToolTip(
+            "RMVPE의 짧은 오검출/무음 구간 F0 확산을 억제합니다. "
+            "특히 upstream 방식의 leading/trailing F0 extrapolation을 막습니다."
+        )
+        rvc_layout.addRow(
+            "",
+            self.realtime_rvc_f0_guard_check,
+        )
+
+        self.realtime_rvc_f0_diagnostic_check = QCheckBox(
+            "F0 진단 로그 저장"
+        )
+        self.realtime_rvc_f0_diagnostic_check.setChecked(
+            self.settings.value(
+                "phone_mic_realtime_rvc_f0_diagnostic_enabled",
+                True,
+                type=bool,
+            )
+        )
+        self.realtime_rvc_f0_diagnostic_check.setToolTip(
+            "logs/realtime_rvc_f0_last.csv 와 .json에 "
+            "입력 RMS, raw/guarded F0, voiced ratio, guard reason을 기록합니다."
+        )
+        rvc_layout.addRow(
+            "",
+            self.realtime_rvc_f0_diagnostic_check,
+        )
+
+        self.realtime_rvc_rmvpe_threshold_spin = QDoubleSpinBox()
+        self.realtime_rvc_rmvpe_threshold_spin.setRange(
+            0.01,
+            0.30,
+        )
+        self.realtime_rvc_rmvpe_threshold_spin.setDecimals(
+            3
+        )
+        self.realtime_rvc_rmvpe_threshold_spin.setSingleStep(
+            0.01
+        )
+        self.realtime_rvc_rmvpe_threshold_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_realtime_rvc_rmvpe_threshold",
+                    0.05,
+                )
+            )
+        )
+        self.realtime_rvc_rmvpe_threshold_spin.setToolTip(
+            "기존 RVC realtime 기본은 0.03. "
+            "실시간 마이크에서는 0.05부터 시작해 약한 잡음 F0 오검출을 줄입니다."
+        )
+        rvc_layout.addRow(
+            "RMVPE Threshold",
+            self.realtime_rvc_rmvpe_threshold_spin,
+        )
+
+        self.realtime_rvc_f0_quiet_rms_spin = QDoubleSpinBox()
+        self.realtime_rvc_f0_quiet_rms_spin.setRange(
+            -80.0,
+            -20.0,
+        )
+        self.realtime_rvc_f0_quiet_rms_spin.setDecimals(
+            1
+        )
+        self.realtime_rvc_f0_quiet_rms_spin.setSingleStep(
+            1.0
+        )
+        self.realtime_rvc_f0_quiet_rms_spin.setSuffix(
+            " dBFS"
+        )
+        self.realtime_rvc_f0_quiet_rms_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_realtime_rvc_f0_quiet_rms_db",
+                    -48.0,
+                )
+            )
+        )
+        self.realtime_rvc_f0_quiet_rms_spin.setToolTip(
+            "이 값 이하의 현재 CLEAN block은 F0를 강제로 unvoiced 처리합니다."
+        )
+        rvc_layout.addRow(
+            "F0 Quiet RMS",
+            self.realtime_rvc_f0_quiet_rms_spin,
+        )
+
+        self.realtime_rvc_f0_min_voiced_spin = QDoubleSpinBox()
+        self.realtime_rvc_f0_min_voiced_spin.setRange(
+            0.0,
+            1.0,
+        )
+        self.realtime_rvc_f0_min_voiced_spin.setDecimals(
+            2
+        )
+        self.realtime_rvc_f0_min_voiced_spin.setSingleStep(
+            0.05
+        )
+        self.realtime_rvc_f0_min_voiced_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_realtime_rvc_f0_min_voiced_ratio",
+                    0.15,
+                )
+            )
+        )
+        self.realtime_rvc_f0_min_voiced_spin.setToolTip(
+            "약한 입력에서 raw voiced ratio가 이 값보다 낮으면 "
+            "sparse F0 오검출로 판단해 현재 block F0를 제거합니다."
+        )
+        rvc_layout.addRow(
+            "Min Voiced Ratio",
+            self.realtime_rvc_f0_min_voiced_spin,
+        )
+
+        f0_time_row = QHBoxLayout()
+
+        self.realtime_rvc_f0_max_gap_spin = QSpinBox()
+        self.realtime_rvc_f0_max_gap_spin.setRange(
+            0,
+            200,
+        )
+        self.realtime_rvc_f0_max_gap_spin.setSuffix(
+            " ms gap"
+        )
+        self.realtime_rvc_f0_max_gap_spin.setValue(
+            int(
+                self.settings.value(
+                    "phone_mic_realtime_rvc_f0_max_gap_ms",
+                    30,
+                )
+            )
+        )
+        f0_time_row.addWidget(
+            self.realtime_rvc_f0_max_gap_spin
+        )
+
+        self.realtime_rvc_f0_min_run_spin = QSpinBox()
+        self.realtime_rvc_f0_min_run_spin.setRange(
+            0,
+            200,
+        )
+        self.realtime_rvc_f0_min_run_spin.setSuffix(
+            " ms min run"
+        )
+        self.realtime_rvc_f0_min_run_spin.setValue(
+            int(
+                self.settings.value(
+                    "phone_mic_realtime_rvc_f0_min_run_ms",
+                    40,
+                )
+            )
+        )
+        f0_time_row.addWidget(
+            self.realtime_rvc_f0_min_run_spin
+        )
+
+        rvc_layout.addRow(
+            "F0 Gap / Island",
+            f0_time_row,
+        )
+
+        self.realtime_rvc_f0_preset_button = QPushButton(
+            "F0 Guard 균형값 복원"
+        )
+        self.realtime_rvc_f0_preset_button.clicked.connect(
+            self.apply_realtime_rvc_f0_guard_balanced_preset
+        )
+        rvc_layout.addRow(
+            "",
+            self.realtime_rvc_f0_preset_button,
+        )
+
         self.realtime_rvc_block_combo = QComboBox()
         for label, value in (
             (
@@ -3836,7 +4365,7 @@ class PhoneMicBridgeWidget(QWidget):
             "CABLE Input → NVIDIA Broadcast → 게임. "
             "모델 로딩 중/실패 시에는 CLEAN 원음이 자동 통과합니다. "
             "RMVPE + SOLA / eager CUDA 경로를 사용합니다. v3.9b는 added IVF index의 nprobe=1 sparse-search 문제를 런타임에서 보정합니다. "
-            "A/B 디버그는 녹음 경계에서 생기는 RVC stale block을 자동 감지/trim해 ORIGINAL과 시간축을 맞춘 뒤, NVIDIA Broadcast 2종도 각각 자동 정렬합니다."
+            "F0 Stability Guard는 RMVPE raw F0를 먼저 기록하고, 짧은 voiced island를 제거하며 짧은 내부 gap만 보간합니다. 특히 upstream 방식처럼 첫/끝 무음까지 한 번의 F0로 extrapolation하지 않습니다. A/B 디버그는 녹음 경계도 자동 정렬합니다."
         )
         rvc_note.setWordWrap(
             True
@@ -4132,6 +4661,67 @@ class PhoneMicBridgeWidget(QWidget):
                 or 200
             ),
         )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_f0_guard_enabled",
+            self.realtime_rvc_f0_guard_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_f0_diagnostic_enabled",
+            self.realtime_rvc_f0_diagnostic_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_rmvpe_threshold",
+            self.realtime_rvc_rmvpe_threshold_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_f0_quiet_rms_db",
+            self.realtime_rvc_f0_quiet_rms_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_f0_min_voiced_ratio",
+            self.realtime_rvc_f0_min_voiced_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_f0_max_gap_ms",
+            self.realtime_rvc_f0_max_gap_spin.value(),
+        )
+        self.settings.setValue(
+            "phone_mic_realtime_rvc_f0_min_run_ms",
+            self.realtime_rvc_f0_min_run_spin.value(),
+        )
+
+    def apply_realtime_rvc_f0_guard_balanced_preset(
+        self,
+    ) -> None:
+        self.realtime_rvc_f0_guard_check.setChecked(
+            True
+        )
+        self.realtime_rvc_f0_diagnostic_check.setChecked(
+            True
+        )
+        self.realtime_rvc_rmvpe_threshold_spin.setValue(
+            0.05
+        )
+        self.realtime_rvc_f0_quiet_rms_spin.setValue(
+            -48.0
+        )
+        self.realtime_rvc_f0_min_voiced_spin.setValue(
+            0.15
+        )
+        self.realtime_rvc_f0_max_gap_spin.setValue(
+            30
+        )
+        self.realtime_rvc_f0_min_run_spin.setValue(
+            40
+        )
+        self._save_realtime_rvc_settings()
+
+        self.runtime.log(
+            "[Realtime RVC] F0 Guard 균형값: "
+            "RMVPE=0.05 / quiet=-48dBFS / "
+            "min voiced=0.15 / gap=30ms / min run=40ms. "
+            "RVC 엔진 재시작 후 적용됩니다."
+        )
 
     def apply_realtime_rvc_low_latency_preset(
         self,
@@ -4203,6 +4793,13 @@ class PhoneMicBridgeWidget(QWidget):
                     self.realtime_rvc_block_combo.currentData()
                     or 200
                 ),
+                f0_guard_enabled=self.realtime_rvc_f0_guard_check.isChecked(),
+                f0_diagnostic_enabled=self.realtime_rvc_f0_diagnostic_check.isChecked(),
+                rmvpe_threshold=self.realtime_rvc_rmvpe_threshold_spin.value(),
+                f0_quiet_rms_db=self.realtime_rvc_f0_quiet_rms_spin.value(),
+                f0_min_voiced_ratio=self.realtime_rvc_f0_min_voiced_spin.value(),
+                f0_max_gap_ms=self.realtime_rvc_f0_max_gap_spin.value(),
+                f0_min_run_ms=self.realtime_rvc_f0_min_run_spin.value(),
             )
         except Exception as exc:
             QMessageBox.critical(
@@ -4388,6 +4985,9 @@ class PhoneMicBridgeWidget(QWidget):
             self.adb_status_label.setText(
                 "ADB 없음"
             )
+            self.native_mic_status_label.setText(
+                "Native Mic: ADB 필요"
+            )
             return
 
         devices = adb_devices()
@@ -4395,6 +4995,9 @@ class PhoneMicBridgeWidget(QWidget):
         if not devices:
             self.adb_status_label.setText(
                 f"ADB OK / 기기 없음 / {adb}"
+            )
+            self.native_mic_status_label.setText(
+                "Native Mic: Galaxy USB 연결 대기"
             )
             return
 
@@ -4406,6 +5009,46 @@ class PhoneMicBridgeWidget(QWidget):
             "ADB: "
             + rendered
         )
+
+        online_serial = next(
+            (
+                serial
+                for serial, state in devices
+                if state == "device"
+            ),
+            None,
+        )
+
+        apk = find_native_mic_apk()
+
+        if online_serial is None:
+            self.native_mic_status_label.setText(
+                "Native Mic: Galaxy 연결 대기 / "
+                + (
+                    f"APK={apk.name}"
+                    if apk is not None
+                    else "APK 미빌드"
+                )
+            )
+        else:
+            installed = native_mic_installed(
+                serial=online_serial
+            )
+            self.native_mic_status_label.setText(
+                "Native Mic: "
+                + (
+                    "설치됨"
+                    if installed
+                    else "미설치"
+                )
+                + " / "
+                + (
+                    f"APK={apk.name}"
+                    if apk is not None
+                    else "APK 미빌드"
+                )
+                + " / screen-off foreground service 지원"
+            )
 
     def _save_settings(self) -> None:
         selected = self._selected_output_device()
@@ -4680,6 +5323,136 @@ class PhoneMicBridgeWidget(QWidget):
         )
         self.output_enabled_check.setEnabled(
             True
+        )
+
+    def _run_native_action(
+        self,
+        kind: str,
+        action,
+    ) -> None:
+        if self._native_action_busy:
+            self.runtime.log(
+                "[Native Mic] 이전 작업이 아직 진행 중입니다."
+            )
+            return
+
+        self._native_action_busy = True
+        self.native_mic_install_button.setEnabled(
+            False
+        )
+        self.native_mic_launch_button.setEnabled(
+            False
+        )
+        self.native_mic_status_label.setText(
+            f"Native Mic: {kind} 진행 중..."
+        )
+
+        def worker() -> None:
+            try:
+                message = str(
+                    action()
+                )
+                self.native_action_done.emit(
+                    kind,
+                    True,
+                    message,
+                )
+
+            except Exception as exc:
+                self.native_action_done.emit(
+                    kind,
+                    False,
+                    f"{type(exc).__name__}: {exc}",
+                )
+
+        threading.Thread(
+            target=worker,
+            name=f"S24NativeMic-{kind}",
+            daemon=True,
+        ).start()
+
+    def _on_native_action_done(
+        self,
+        kind: str,
+        ok: bool,
+        message: str,
+    ) -> None:
+        self._native_action_busy = False
+        self.native_mic_install_button.setEnabled(
+            True
+        )
+        self.native_mic_launch_button.setEnabled(
+            True
+        )
+        self.refresh_adb_status()
+
+        if ok:
+            self.runtime.log(
+                f"[Native Mic] {kind} 완료: {message}"
+            )
+
+            if kind == "설치":
+                QMessageBox.information(
+                    self,
+                    "Native Mic 설치 완료",
+                    message,
+                )
+        else:
+            self.runtime.log(
+                f"[Native Mic] {kind} 실패: {message}"
+            )
+            QMessageBox.critical(
+                self,
+                f"Native Mic {kind} 실패",
+                message,
+            )
+
+    def install_native_mic(
+        self,
+    ) -> None:
+        def action() -> str:
+            serial, apk = install_native_mic_app()
+            return (
+                f"Galaxy={serial}\\n"
+                f"APK={apk}\\n"
+                "설치 완료"
+            )
+
+        self._run_native_action(
+            "설치",
+            action,
+        )
+
+    def launch_native_mic(
+        self,
+    ) -> None:
+        if not self.runtime.running:
+            QMessageBox.information(
+                self,
+                "PC 브리지를 먼저 시작하세요",
+                "먼저 'PC 브리지 시작'을 누른 다음 Native Mic을 실행하세요.",
+            )
+            return
+
+        def action() -> str:
+            serial, installed_now = launch_native_mic_app(
+                auto_install=True,
+                auto_start=True,
+            )
+            return (
+                f"Galaxy={serial} / "
+                "tcp:8791 reverse 완료 / "
+                + (
+                    "APK 자동 설치 후 "
+                    if installed_now
+                    else ""
+                )
+                + "Native foreground microphone Activity 실행"
+            )
+
+        self._run_native_action(
+            "실행",
+            action,
         )
 
     def open_phone_page(self) -> None:

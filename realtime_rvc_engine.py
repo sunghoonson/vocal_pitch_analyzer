@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V43_REALTIME_RVC_F0_STABILITY_GUARD_PATCH
 # V39_REALTIME_RVC_VOICE_CHANGER_PATCH
 #
 # Main-process controller for the persistent RVC realtime worker.
@@ -305,6 +306,13 @@ class RealtimeRVCClient:
         crossfade_ms: int = 40,
         extra_ms: int = 1000,
         f0_method: str = "rmvpe",
+        f0_guard_enabled: bool = True,
+        f0_diagnostic_enabled: bool = True,
+        rmvpe_threshold: float = 0.05,
+        f0_quiet_rms_db: float = -48.0,
+        f0_min_voiced_ratio: float = 0.15,
+        f0_max_gap_ms: int = 30,
+        f0_min_run_ms: int = 40,
         timeout: float = 120.0,
     ) -> None:
         self.stop()
@@ -470,6 +478,36 @@ class RealtimeRVCClient:
                 f0_method
                 or "rmvpe"
             ),
+            "--f0-guard",
+            "1"
+            if bool(
+                f0_guard_enabled
+            )
+            else "0",
+            "--f0-diagnostic",
+            "1"
+            if bool(
+                f0_diagnostic_enabled
+            )
+            else "0",
+            "--rmvpe-threshold",
+            f"{float(rmvpe_threshold):.6f}",
+            "--f0-quiet-rms-db",
+            f"{float(f0_quiet_rms_db):.3f}",
+            "--f0-min-voiced-ratio",
+            f"{float(f0_min_voiced_ratio):.6f}",
+            "--f0-max-gap-ms",
+            str(
+                int(
+                    f0_max_gap_ms
+                )
+            ),
+            "--f0-min-run-ms",
+            str(
+                int(
+                    f0_min_run_ms
+                )
+            ),
         ]
 
         if index is not None:
@@ -508,7 +546,11 @@ class RealtimeRVCClient:
             f"pitch={int(pitch):+d} / "
             f"index_rate={effective_index_rate:.2f} / "
             f"block={self.block_ms}ms / "
-            f"sr={self.sample_rate}"
+            f"sr={self.sample_rate} / "
+            f"f0_guard={'ON' if f0_guard_enabled else 'OFF'} / "
+            f"rmvpe_th={float(rmvpe_threshold):.3f} / "
+            f"quiet={float(f0_quiet_rms_db):.1f}dBFS / "
+            f"min_voiced={float(f0_min_voiced_ratio):.2f}"
         )
 
         creationflags = int(

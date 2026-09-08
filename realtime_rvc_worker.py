@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V43_REALTIME_RVC_F0_STABILITY_GUARD_PATCH
 # V39B_REALTIME_RVC_INDEX_HOTFIX
 # V39_REALTIME_RVC_VOICE_CHANGER_PATCH
 #
@@ -10,6 +11,9 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import csv
+import json
+import math
 import os
 import socket
 import struct
@@ -67,7 +71,407 @@ def _parse_args():
     parser.add_argument("--crossfade-ms", default=40, type=int)
     parser.add_argument("--extra-ms", default=1000, type=int)
     parser.add_argument("--f0-method", default="rmvpe")
+    parser.add_argument("--f0-guard", default=1, type=int)
+    parser.add_argument("--f0-diagnostic", default=1, type=int)
+    parser.add_argument("--rmvpe-threshold", default=0.05, type=float)
+    parser.add_argument("--f0-quiet-rms-db", default=-48.0, type=float)
+    parser.add_argument("--f0-min-voiced-ratio", default=0.15, type=float)
+    parser.add_argument("--f0-max-gap-ms", default=30, type=int)
+    parser.add_argument("--f0-min-run-ms", default=40, type=int)
     return parser.parse_args()
+
+
+def _safe_dbfs(
+    samples: np.ndarray,
+) -> float:
+    data = np.asarray(
+        samples,
+        dtype=np.float32,
+    ).reshape(
+        -1
+    )
+
+    if data.size <= 0:
+        return -120.0
+
+    rms = float(
+        np.sqrt(
+            np.mean(
+                np.square(
+                    data.astype(
+                        np.float64
+                    )
+                )
+            )
+            + 1e-12
+        )
+    )
+
+    return float(
+        20.0
+        * np.log10(
+            max(
+                rms,
+                1e-7,
+            )
+        )
+    )
+
+
+def _f0_stats(
+    f0: np.ndarray,
+) -> dict:
+    data = np.asarray(
+        f0,
+        dtype=np.float32,
+    ).reshape(
+        -1
+    )
+    voiced = data[
+        np.isfinite(
+            data
+        )
+        & (
+            data > 0.0
+        )
+    ]
+
+    total = int(
+        data.size
+    )
+    count = int(
+        voiced.size
+    )
+
+    return {
+        "frames": total,
+        "voiced_frames": count,
+        "voiced_ratio": (
+            float(
+                count
+            )
+            / float(
+                total
+            )
+            if total > 0
+            else 0.0
+        ),
+        "min": (
+            float(
+                np.min(
+                    voiced
+                )
+            )
+            if count > 0
+            else 0.0
+        ),
+        "median": (
+            float(
+                np.median(
+                    voiced
+                )
+            )
+            if count > 0
+            else 0.0
+        ),
+        "max": (
+            float(
+                np.max(
+                    voiced
+                )
+            )
+            if count > 0
+            else 0.0
+        ),
+    }
+
+
+def _stabilize_f0_array(
+    raw_f0: np.ndarray,
+    *,
+    current_frames: int,
+    input_rms_db: float,
+    quiet_rms_db: float,
+    min_voiced_ratio: float,
+    max_gap_frames: int,
+    min_run_frames: int,
+) -> tuple[np.ndarray, dict]:
+    """
+    Conservative realtime F0 cleanup.
+
+    Key difference from upstream realtime RVC:
+      upstream np.interp() also extrapolates leading/trailing unvoiced frames,
+      so one false positive can spread a pitch through a mostly silent region.
+
+    Here:
+      * invalid/negative F0 -> 0
+      * very short voiced islands can be removed
+      * only short INTERNAL gaps are interpolated
+      * leading/trailing unvoiced regions stay 0
+      * definitely quiet current blocks are forced unvoiced
+    """
+
+    source = np.asarray(
+        raw_f0,
+        dtype=np.float32,
+    ).reshape(
+        -1
+    ).copy()
+
+    source[
+        ~np.isfinite(
+            source
+        )
+    ] = 0.0
+    source[
+        source < 0.0
+    ] = 0.0
+
+    guarded = source.copy()
+    total = int(
+        guarded.size
+    )
+
+    current_count = max(
+        1,
+        min(
+            int(
+                current_frames
+            ),
+            total,
+        ),
+    ) if total > 0 else 0
+
+    current_slice = slice(
+        total
+        - current_count,
+        total,
+    ) if current_count > 0 else slice(
+        0,
+        0,
+    )
+
+    raw_current = source[
+        current_slice
+    ]
+    raw_current_stats = _f0_stats(
+        raw_current
+    )
+
+    removed_run_frames = 0
+    bridged_gap_frames = 0
+    reasons: list[str] = []
+
+    # Remove isolated short voiced runs.
+    if (
+        total > 0
+        and int(
+            min_run_frames
+        ) > 1
+    ):
+        voiced = guarded > 0.0
+        i = 0
+
+        while i < total:
+            if not voiced[
+                i
+            ]:
+                i += 1
+                continue
+
+            start = i
+
+            while (
+                i < total
+                and voiced[
+                    i
+                ]
+            ):
+                i += 1
+
+            end = i
+            run_length = (
+                end
+                - start
+            )
+
+            if run_length < int(
+                min_run_frames
+            ):
+                guarded[
+                    start:end
+                ] = 0.0
+                removed_run_frames += int(
+                    run_length
+                )
+
+    if removed_run_frames > 0:
+        reasons.append(
+            "short_voiced_island"
+        )
+
+    # Only bridge INTERNAL unvoiced gaps. Never extrapolate through the
+    # leading/trailing silence as upstream np.interp() does.
+    max_gap = max(
+        0,
+        int(
+            max_gap_frames
+        ),
+    )
+
+    if (
+        max_gap > 0
+        and total >= 3
+    ):
+        i = 0
+
+        while i < total:
+            if guarded[
+                i
+            ] > 0.0:
+                i += 1
+                continue
+
+            gap_start = i
+
+            while (
+                i < total
+                and guarded[
+                    i
+                ] <= 0.0
+            ):
+                i += 1
+
+            gap_end = i
+            gap_length = (
+                gap_end
+                - gap_start
+            )
+
+            has_left = (
+                gap_start > 0
+                and guarded[
+                    gap_start
+                    - 1
+                ] > 0.0
+            )
+            has_right = (
+                gap_end < total
+                and guarded[
+                    gap_end
+                ] > 0.0
+            )
+
+            if (
+                has_left
+                and has_right
+                and gap_length <= max_gap
+            ):
+                left = float(
+                    guarded[
+                        gap_start
+                        - 1
+                    ]
+                )
+                right = float(
+                    guarded[
+                        gap_end
+                    ]
+                )
+
+                guarded[
+                    gap_start:gap_end
+                ] = np.linspace(
+                    left,
+                    right,
+                    gap_length
+                    + 2,
+                    dtype=np.float32,
+                )[
+                    1:-1
+                ]
+                bridged_gap_frames += int(
+                    gap_length
+                )
+
+    if bridged_gap_frames > 0:
+        reasons.append(
+            "short_gap_bridge"
+        )
+
+    # Current block activity guard.
+    clear_current = False
+
+    if current_count > 0:
+        if float(
+            input_rms_db
+        ) <= float(
+            quiet_rms_db
+        ):
+            clear_current = True
+            reasons.append(
+                "quiet_block"
+            )
+
+        elif (
+            float(
+                input_rms_db
+            )
+            <= float(
+                quiet_rms_db
+            )
+            + 6.0
+            and float(
+                raw_current_stats[
+                    "voiced_ratio"
+                ]
+            )
+            < float(
+                min_voiced_ratio
+            )
+        ):
+            clear_current = True
+            reasons.append(
+                "weak_sparse_f0"
+            )
+
+        if clear_current:
+            guarded[
+                current_slice
+            ] = 0.0
+
+    guarded_current = guarded[
+        current_slice
+    ]
+    guarded_current_stats = _f0_stats(
+        guarded_current
+    )
+
+    diagnostics = {
+        "raw_current": raw_current_stats,
+        "guarded_current": guarded_current_stats,
+        "removed_run_frames": int(
+            removed_run_frames
+        ),
+        "bridged_gap_frames": int(
+            bridged_gap_frames
+        ),
+        "clear_current": bool(
+            clear_current
+        ),
+        "reason": (
+            "+".join(
+                reasons
+            )
+            if reasons
+            else "none"
+        ),
+    }
+
+    return (
+        guarded,
+        diagnostics,
+    )
 
 
 class _SafeFaissSearchProxy:
@@ -266,6 +670,13 @@ class RealtimeProcessor:
         crossfade_ms: int,
         extra_ms: int,
         f0_method: str,
+        f0_guard_enabled: bool,
+        f0_diagnostic_enabled: bool,
+        rmvpe_threshold: float,
+        f0_quiet_rms_db: float,
+        f0_min_voiced_ratio: float,
+        f0_max_gap_ms: int,
+        f0_min_run_ms: int,
     ) -> None:
         self.repo = Path(
             repo
@@ -286,6 +697,58 @@ class RealtimeProcessor:
             f0_method
             or "rmvpe"
         ).strip().lower()
+
+        self.f0_guard_enabled = bool(
+            f0_guard_enabled
+        )
+        self.f0_diagnostic_enabled = bool(
+            f0_diagnostic_enabled
+        )
+        self.rmvpe_threshold = max(
+            0.001,
+            min(
+                float(
+                    rmvpe_threshold
+                ),
+                0.99,
+            ),
+        )
+        self.f0_quiet_rms_db = max(
+            -90.0,
+            min(
+                float(
+                    f0_quiet_rms_db
+                ),
+                -10.0,
+            ),
+        )
+        self.f0_min_voiced_ratio = max(
+            0.0,
+            min(
+                float(
+                    f0_min_voiced_ratio
+                ),
+                1.0,
+            ),
+        )
+        self.f0_max_gap_ms = max(
+            0,
+            min(
+                int(
+                    f0_max_gap_ms
+                ),
+                200,
+            ),
+        )
+        self.f0_min_run_ms = max(
+            0,
+            min(
+                int(
+                    f0_min_run_ms
+                ),
+                200,
+            ),
+        )
 
         if self.f0_method not in {
             "rmvpe",
@@ -361,6 +824,12 @@ class RealtimeProcessor:
                 faiss_module=faiss,
             )
 
+        if self.f0_method == "rmvpe":
+            # Instance-level replacement. RVC.get_f0() still calls
+            # self.get_f0_rmvpe(), but now the method preserves genuine
+            # unvoiced regions and records the raw RMVPE result.
+            self.rvc.get_f0_rmvpe = self._guarded_get_f0_rmvpe
+
         if not hasattr(
             self.rvc,
             "tgt_sr",
@@ -406,6 +875,64 @@ class RealtimeProcessor:
             * self.block_frame
             // self.zc
         )
+
+        self._f0_current_frames = max(
+            1,
+            int(
+                round(
+                    self.block_frame_16k
+                    / 160.0
+                )
+            ),
+        )
+        self._f0_max_gap_frames = max(
+            0,
+            int(
+                round(
+                    self.f0_max_gap_ms
+                    / 10.0
+                )
+            ),
+        )
+        self._f0_min_run_frames = max(
+            0,
+            int(
+                math.ceil(
+                    self.f0_min_run_ms
+                    / 10.0
+                )
+            ),
+        )
+
+        self._f0_diag_path = (
+            Path(
+                __file__
+            ).resolve().parent
+            / "logs"
+            / "realtime_rvc_f0_last.csv"
+        )
+        self._f0_summary_path = (
+            Path(
+                __file__
+            ).resolve().parent
+            / "logs"
+            / "realtime_rvc_f0_last.json"
+        )
+        self._f0_diag_file = None
+        self._f0_diag_writer = None
+        self._f0_diag_last: dict = {}
+        self._f0_diag_blocks = 0
+        self._f0_guard_triggered_blocks = 0
+        self._f0_quiet_blocks = 0
+        self._f0_short_run_frames_removed = 0
+        self._f0_gap_frames_bridged = 0
+        self._f0_raw_voiced_ratio_sum = 0.0
+        self._f0_guarded_voiced_ratio_sum = 0.0
+        self._f0_previous_stable_median = 0.0
+        self._f0_warmup = True
+
+        if self.f0_diagnostic_enabled:
+            self._open_f0_diagnostics()
 
         self.crossfade_frame = (
             max(
@@ -552,6 +1079,571 @@ class RealtimeProcessor:
 
         self._warmup()
 
+    def _open_f0_diagnostics(
+        self,
+    ) -> None:
+        self._f0_diag_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self._f0_diag_file = self._f0_diag_path.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        )
+
+        fields = [
+            "block",
+            "time_monotonic",
+            "input_rms_db",
+            "rmvpe_threshold",
+            "raw_frames",
+            "raw_voiced_frames",
+            "raw_voiced_ratio",
+            "raw_f0_min",
+            "raw_f0_median",
+            "raw_f0_max",
+            "guarded_voiced_frames",
+            "guarded_voiced_ratio",
+            "guarded_f0_min",
+            "guarded_f0_median",
+            "guarded_f0_max",
+            "removed_run_frames",
+            "bridged_gap_frames",
+            "clear_current",
+            "reason",
+            "previous_stable_median",
+            "f0_jump_ratio",
+            "output_rms_db",
+            "infer_ms",
+        ]
+
+        self._f0_diag_writer = csv.DictWriter(
+            self._f0_diag_file,
+            fieldnames=fields,
+        )
+        self._f0_diag_writer.writeheader()
+        self._f0_diag_file.flush()
+
+    def _write_f0_diagnostic(
+        self,
+        *,
+        output: np.ndarray,
+        infer_ms: float,
+    ) -> None:
+        if (
+            not self.f0_diagnostic_enabled
+            or self._f0_diag_writer is None
+            or self._f0_warmup
+        ):
+            return
+
+        diag = dict(
+            self._f0_diag_last
+        )
+
+        if not diag:
+            return
+
+        output_rms_db = _safe_dbfs(
+            output
+        )
+        diag[
+            "output_rms_db"
+        ] = float(
+            output_rms_db
+        )
+        diag[
+            "infer_ms"
+        ] = float(
+            infer_ms
+        )
+
+        self._f0_diag_writer.writerow(
+            diag
+        )
+        self._f0_diag_blocks += 1
+        self._f0_raw_voiced_ratio_sum += float(
+            diag.get(
+                "raw_voiced_ratio",
+                0.0,
+            )
+        )
+        self._f0_guarded_voiced_ratio_sum += float(
+            diag.get(
+                "guarded_voiced_ratio",
+                0.0,
+            )
+        )
+        self._f0_short_run_frames_removed += int(
+            diag.get(
+                "removed_run_frames",
+                0,
+            )
+        )
+        self._f0_gap_frames_bridged += int(
+            diag.get(
+                "bridged_gap_frames",
+                0,
+            )
+        )
+
+        if bool(
+            diag.get(
+                "clear_current",
+                False,
+            )
+        ):
+            self._f0_guard_triggered_blocks += 1
+
+        if "quiet_block" in str(
+            diag.get(
+                "reason",
+                "",
+            )
+        ):
+            self._f0_quiet_blocks += 1
+
+        if (
+            self._f0_diag_blocks <= 5
+            or self._f0_diag_blocks
+            % 10
+            == 0
+        ):
+            self._f0_diag_file.flush()
+
+    def _guarded_get_f0_rmvpe(
+        self,
+        x,
+        f0_up_key,
+    ):
+        if not hasattr(
+            self.rvc,
+            "model_rmvpe",
+        ):
+            from infer.rmvpe import RMVPE
+
+            print(
+                "[F0 Guard] RMVPE 모델 불러오는 중 / "
+                f"threshold={self.rmvpe_threshold:.3f}",
+                flush=True,
+            )
+            self.rvc.model_rmvpe = RMVPE(
+                "assets/rmvpe/rmvpe.pt",
+                is_half=self.rvc.is_half,
+                device=self.rvc.device,
+            )
+
+        raw_f0 = self.rvc.model_rmvpe.infer_from_audio(
+            x,
+            thred=float(
+                self.rmvpe_threshold
+            ),
+        )
+        raw_f0 = np.asarray(
+            raw_f0,
+            dtype=np.float32,
+        ).reshape(
+            -1
+        )
+
+        if hasattr(
+            x,
+            "detach",
+        ):
+            x_np = (
+                x.detach()
+                .float()
+                .cpu()
+                .numpy()
+                .reshape(
+                    -1
+                )
+            )
+        else:
+            x_np = np.asarray(
+                x,
+                dtype=np.float32,
+            ).reshape(
+                -1
+            )
+
+        latest_audio = x_np[
+            -min(
+                x_np.size,
+                max(
+                    1,
+                    int(
+                        self.block_frame_16k
+                    ),
+                ),
+            ):
+        ]
+        input_rms_db = _safe_dbfs(
+            latest_audio
+        )
+
+        raw_current = raw_f0[
+            -min(
+                raw_f0.size,
+                self._f0_current_frames,
+            ):
+        ]
+        raw_current_stats = _f0_stats(
+            raw_current
+        )
+
+        if self.f0_guard_enabled:
+            guarded_f0, info = _stabilize_f0_array(
+                raw_f0,
+                current_frames=self._f0_current_frames,
+                input_rms_db=input_rms_db,
+                quiet_rms_db=self.f0_quiet_rms_db,
+                min_voiced_ratio=self.f0_min_voiced_ratio,
+                max_gap_frames=self._f0_max_gap_frames,
+                min_run_frames=self._f0_min_run_frames,
+            )
+
+        else:
+            # Exact upstream behavior for comparison:
+            # all zero/unvoiced positions are interpolated/extrapolated from
+            # any detected voiced frames.
+            guarded_f0 = raw_f0.copy()
+            uv = (
+                guarded_f0
+                == 0.0
+            )
+
+            if np.any(
+                ~uv
+            ):
+                guarded_f0[
+                    uv
+                ] = np.interp(
+                    np.where(
+                        uv
+                    )[
+                        0
+                    ],
+                    np.where(
+                        ~uv
+                    )[
+                        0
+                    ],
+                    guarded_f0[
+                        ~uv
+                    ],
+                )
+
+            guarded_current_stats = _f0_stats(
+                guarded_f0[
+                    -min(
+                        guarded_f0.size,
+                        self._f0_current_frames,
+                    ):
+                ]
+            )
+            info = {
+                "raw_current": raw_current_stats,
+                "guarded_current": guarded_current_stats,
+                "removed_run_frames": 0,
+                "bridged_gap_frames": int(
+                    np.sum(
+                        uv
+                    )
+                )
+                if np.any(
+                    ~uv
+                )
+                else 0,
+                "clear_current": False,
+                "reason": "guard_off_upstream_interp",
+            }
+
+        guarded_current_stats = info[
+            "guarded_current"
+        ]
+
+        previous_median = float(
+            self._f0_previous_stable_median
+        )
+        current_median = float(
+            guarded_current_stats[
+                "median"
+            ]
+        )
+        jump_ratio = 0.0
+
+        if (
+            previous_median > 0.0
+            and current_median > 0.0
+        ):
+            jump_ratio = (
+                current_median
+                / previous_median
+            )
+
+        if (
+            current_median > 0.0
+            and float(
+                guarded_current_stats[
+                    "voiced_ratio"
+                ]
+            )
+            >= float(
+                self.f0_min_voiced_ratio
+            )
+            and input_rms_db
+            > float(
+                self.f0_quiet_rms_db
+            )
+        ):
+            self._f0_previous_stable_median = (
+                current_median
+            )
+
+        shifted_f0 = (
+            guarded_f0
+            * pow(
+                2.0,
+                float(
+                    f0_up_key
+                )
+                / 12.0,
+            )
+        )
+
+        block_number = int(
+            self.processed_blocks
+            + 1
+        )
+
+        self._f0_diag_last = {
+            "block": block_number,
+            "time_monotonic": float(
+                time.monotonic()
+            ),
+            "input_rms_db": float(
+                input_rms_db
+            ),
+            "rmvpe_threshold": float(
+                self.rmvpe_threshold
+            ),
+            "raw_frames": int(
+                raw_current_stats[
+                    "frames"
+                ]
+            ),
+            "raw_voiced_frames": int(
+                raw_current_stats[
+                    "voiced_frames"
+                ]
+            ),
+            "raw_voiced_ratio": float(
+                raw_current_stats[
+                    "voiced_ratio"
+                ]
+            ),
+            "raw_f0_min": float(
+                raw_current_stats[
+                    "min"
+                ]
+            ),
+            "raw_f0_median": float(
+                raw_current_stats[
+                    "median"
+                ]
+            ),
+            "raw_f0_max": float(
+                raw_current_stats[
+                    "max"
+                ]
+            ),
+            "guarded_voiced_frames": int(
+                guarded_current_stats[
+                    "voiced_frames"
+                ]
+            ),
+            "guarded_voiced_ratio": float(
+                guarded_current_stats[
+                    "voiced_ratio"
+                ]
+            ),
+            "guarded_f0_min": float(
+                guarded_current_stats[
+                    "min"
+                ]
+            ),
+            "guarded_f0_median": float(
+                guarded_current_stats[
+                    "median"
+                ]
+            ),
+            "guarded_f0_max": float(
+                guarded_current_stats[
+                    "max"
+                ]
+            ),
+            "removed_run_frames": int(
+                info[
+                    "removed_run_frames"
+                ]
+            ),
+            "bridged_gap_frames": int(
+                info[
+                    "bridged_gap_frames"
+                ]
+            ),
+            "clear_current": bool(
+                info[
+                    "clear_current"
+                ]
+            ),
+            "reason": str(
+                info[
+                    "reason"
+                ]
+            ),
+            "previous_stable_median": float(
+                previous_median
+            ),
+            "f0_jump_ratio": float(
+                jump_ratio
+            ),
+            "output_rms_db": 0.0,
+            "infer_ms": 0.0,
+        }
+
+        # Console diagnostic is rate-limited. The CSV has every block.
+        reason = str(
+            info[
+                "reason"
+            ]
+        )
+
+        if (
+            not self._f0_warmup
+            and (
+                block_number <= 5
+                or bool(
+                    info[
+                        "clear_current"
+                    ]
+                )
+                or block_number
+                % 50
+                == 0
+            )
+        ):
+            print(
+                "[F0 Guard] "
+                f"block={block_number} / "
+                f"rms={input_rms_db:.1f}dBFS / "
+                f"raw={raw_current_stats['voiced_ratio']:.2f} "
+                f"{raw_current_stats['median']:.1f}Hz / "
+                f"guarded={guarded_current_stats['voiced_ratio']:.2f} "
+                f"{guarded_current_stats['median']:.1f}Hz / "
+                f"reason={reason}",
+                flush=True,
+            )
+
+        return self.rvc.get_f0_post(
+            shifted_f0
+        )
+
+    def close(
+        self,
+    ) -> None:
+        if self.f0_diagnostic_enabled:
+            blocks = max(
+                1,
+                int(
+                    self._f0_diag_blocks
+                ),
+            )
+
+            summary = {
+                "version": "v4.3",
+                "f0_guard_enabled": bool(
+                    self.f0_guard_enabled
+                ),
+                "f0_diagnostic_enabled": bool(
+                    self.f0_diagnostic_enabled
+                ),
+                "rmvpe_threshold": float(
+                    self.rmvpe_threshold
+                ),
+                "quiet_rms_db": float(
+                    self.f0_quiet_rms_db
+                ),
+                "min_voiced_ratio": float(
+                    self.f0_min_voiced_ratio
+                ),
+                "max_gap_ms": int(
+                    self.f0_max_gap_ms
+                ),
+                "min_run_ms": int(
+                    self.f0_min_run_ms
+                ),
+                "blocks": int(
+                    self._f0_diag_blocks
+                ),
+                "guard_triggered_blocks": int(
+                    self._f0_guard_triggered_blocks
+                ),
+                "quiet_blocks": int(
+                    self._f0_quiet_blocks
+                ),
+                "short_run_frames_removed": int(
+                    self._f0_short_run_frames_removed
+                ),
+                "gap_frames_bridged": int(
+                    self._f0_gap_frames_bridged
+                ),
+                "mean_raw_voiced_ratio": float(
+                    self._f0_raw_voiced_ratio_sum
+                    / blocks
+                ),
+                "mean_guarded_voiced_ratio": float(
+                    self._f0_guarded_voiced_ratio_sum
+                    / blocks
+                ),
+                "csv": str(
+                    self._f0_diag_path
+                ),
+            }
+
+            try:
+                self._f0_summary_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                self._f0_summary_path.write_text(
+                    json.dumps(
+                        summary,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        if self._f0_diag_file is not None:
+            try:
+                self._f0_diag_file.flush()
+            except Exception:
+                pass
+
+            try:
+                self._f0_diag_file.close()
+            except Exception:
+                pass
+
+            self._f0_diag_file = None
+            self._f0_diag_writer = None
+
     def _warmup(
         self,
     ) -> None:
@@ -607,6 +1699,9 @@ class RealtimeProcessor:
             ):
                 self.rvc.cache_pitchf.zero_()
 
+            self._f0_diag_last = {}
+            self._f0_warmup = False
+
     def process(
         self,
         block: np.ndarray,
@@ -651,7 +1746,7 @@ class RealtimeProcessor:
         ) * 1000.0
         self.processed_blocks += 1
 
-        return (
+        output = (
             result.detach()
             .float()
             .cpu()
@@ -661,6 +1756,13 @@ class RealtimeProcessor:
                 copy=False,
             )
         )
+
+        self._write_f0_diagnostic(
+            output=output,
+            infer_ms=self.last_infer_ms,
+        )
+
+        return output
 
     def _process_tensor_block(
         self,
@@ -963,6 +2065,31 @@ def main() -> int:
             f0_method=str(
                 args.f0_method
             ),
+            f0_guard_enabled=bool(
+                int(
+                    args.f0_guard
+                )
+            ),
+            f0_diagnostic_enabled=bool(
+                int(
+                    args.f0_diagnostic
+                )
+            ),
+            rmvpe_threshold=float(
+                args.rmvpe_threshold
+            ),
+            f0_quiet_rms_db=float(
+                args.f0_quiet_rms_db
+            ),
+            f0_min_voiced_ratio=float(
+                args.f0_min_voiced_ratio
+            ),
+            f0_max_gap_ms=int(
+                args.f0_max_gap_ms
+            ),
+            f0_min_run_ms=int(
+                args.f0_min_run_ms
+            ),
         )
 
         server = socket.socket(
@@ -993,7 +2120,9 @@ def main() -> int:
             f"model_sr={processor.model_sample_rate}|"
             f"block_frames={processor.block_frame}|"
             f"block_ms={int(args.block_ms)}|"
-            f"device={processor.config.device}",
+            f"device={processor.config.device}|"
+            f"f0_guard={1 if processor.f0_guard_enabled else 0}|"
+            f"rmvpe_threshold={processor.rmvpe_threshold:.3f}",
             flush=True,
         )
 
@@ -1087,6 +2216,7 @@ def main() -> int:
                     )
 
         server.close()
+        processor.close()
         return 0
 
     except Exception as exc:
@@ -1101,6 +2231,12 @@ def main() -> int:
         traceback.print_exc(
             file=sys.stderr
         )
+
+        try:
+            processor.close()
+        except Exception:
+            pass
+
         return 1
 
 
