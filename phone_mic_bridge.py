@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# V39B_REALTIME_RVC_INDEX_HOTFIX
+# V39A_PHONE_MIC_SCROLL_PATCH
 # V39_REALTIME_RVC_VOICE_CHANGER_PATCH
 # V38_RAW_RECORD_TOGGLE_PATCH
 # V37_NVIDIA_BROADCAST_RECORD_PATCH
@@ -44,8 +46,10 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QMessageBox,
     QPlainTextEdit,
+    QScrollArea,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -2708,12 +2712,51 @@ class PhoneMicBridgeWidget(QWidget):
         self.timer.start()
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(
+        outer = QVBoxLayout(
             self
+        )
+        outer.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        self.page_scroll = QScrollArea(
+            self
+        )
+        self.page_scroll.setWidgetResizable(
+            True
+        )
+        self.page_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.page_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+
+        scroll_content = QWidget()
+        scroll_content.setObjectName(
+            "phoneMicScrollContent"
+        )
+
+        root = QVBoxLayout(
+            scroll_content
+        )
+        root.setSizeConstraint(
+            QLayout.SizeConstraint.SetMinimumSize
+        )
+
+        self.page_scroll.setWidget(
+            scroll_content
+        )
+        outer.addWidget(
+            self.page_scroll,
+            1,
         )
 
         intro = QGroupBox(
-            "Galaxy S24 Ultra Phone Mic Bridge v3.9"
+            "Galaxy S24 Ultra Phone Mic Bridge v3.9a"
         )
         intro_layout = QVBoxLayout(
             intro
@@ -3553,7 +3596,7 @@ class PhoneMicBridgeWidget(QWidget):
             "권장 체인: S24 → Smart Voice Gain → Realtime RVC → "
             "CABLE Input → NVIDIA Broadcast → 게임. "
             "모델 로딩 중/실패 시에는 CLEAN 원음이 자동 통과합니다. "
-            "첫 버전은 RMVPE + SOLA / eager CUDA 경로를 사용합니다."
+            "RMVPE + SOLA / eager CUDA 경로를 사용합니다. v3.9b는 added IVF index의 nprobe=1 sparse-search 문제를 런타임에서 보정합니다."
         )
         rvc_note.setWordWrap(
             True
@@ -3670,6 +3713,9 @@ class PhoneMicBridgeWidget(QWidget):
         )
         self.log_edit.setMaximumBlockCount(
             1500
+        )
+        self.log_edit.setMinimumHeight(
+            140
         )
         log_layout.addWidget(
             self.log_edit

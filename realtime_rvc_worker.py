@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V39B_REALTIME_RVC_INDEX_HOTFIX
 # V39_REALTIME_RVC_VOICE_CHANGER_PATCH
 #
 # Runs under .venv_rvc and the pinned tools/rvc checkout.
@@ -69,6 +70,188 @@ def _parse_args():
     return parser.parse_args()
 
 
+class _SafeFaissSearchProxy:
+    """
+    Small adapter for RVC realtime index search.
+
+    Official infer/rtrvc.py always asks FAISS for k=8 and then rejects the
+    entire retrieval result if even one neighbor id is -1.
+
+    RVC training writes IVF indices with nprobe=1. A sparse probed IVF list
+    can contain fewer than 8 vectors, so FAISS legitimately pads the missing
+    neighbors with -1. The upstream warning then misleadingly says the index
+    is not an added index even when the selected file is already added_*.index.
+
+    This proxy:
+      * sanitizes non-finite HuBERT query values,
+      * clamps k to ntotal for tiny indices,
+      * retries IVF search with progressively larger nprobe if FAISS returns -1.
+    """
+
+    def __init__(
+        self,
+        index,
+        *,
+        faiss_module,
+        log_prefix: str = "[Realtime RVC index]",
+    ) -> None:
+        self._index = index
+        self._faiss = faiss_module
+        self._log_prefix = str(log_prefix)
+        self.ntotal = int(
+            getattr(index, "ntotal", 0)
+        )
+        self.d = int(
+            getattr(index, "d", 0)
+        )
+        self._ivf = None
+        self._initial_nprobe = None
+        self._negative_retry_count = 0
+
+        try:
+            self._ivf = self._faiss.extract_index_ivf(
+                self._index
+            )
+            self._initial_nprobe = int(
+                self._ivf.nprobe
+            )
+
+            nlist = max(
+                1,
+                int(
+                    self._ivf.nlist
+                ),
+            )
+            target = min(
+                nlist,
+                max(
+                    8,
+                    int(
+                        self._ivf.nprobe
+                    ),
+                ),
+            )
+            self._ivf.nprobe = int(
+                target
+            )
+
+            print(
+                f"{self._log_prefix} IVF "
+                f"ntotal={self.ntotal} / "
+                f"nlist={nlist} / "
+                f"nprobe={self._initial_nprobe}->{target}",
+                flush=True,
+            )
+        except Exception:
+            print(
+                f"{self._log_prefix} Flat/non-IVF "
+                f"ntotal={self.ntotal} / d={self.d}",
+                flush=True,
+            )
+
+    def reconstruct_n(
+        self,
+        *args,
+        **kwargs,
+    ):
+        return self._index.reconstruct_n(
+            *args,
+            **kwargs,
+        )
+
+    def search(
+        self,
+        query,
+        k,
+    ):
+        q = np.asarray(
+            query,
+            dtype=np.float32,
+        )
+
+        if not np.isfinite(q).all():
+            q = np.nan_to_num(
+                q,
+                copy=True,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+        if self.ntotal <= 0:
+            return self._index.search(
+                q,
+                int(k),
+            )
+
+        effective_k = max(
+            1,
+            min(
+                int(k),
+                self.ntotal,
+            ),
+        )
+
+        score, ids = self._index.search(
+            q,
+            effective_k,
+        )
+
+        if (
+            ids.size > 0
+            and (ids < 0).any()
+            and self._ivf is not None
+        ):
+            nlist = max(
+                1,
+                int(
+                    self._ivf.nlist
+                ),
+            )
+            current = max(
+                1,
+                int(
+                    self._ivf.nprobe
+                ),
+            )
+
+            # Grow only when necessary. Most models stop at nprobe=8.
+            for candidate in (
+                min(nlist, max(16, current * 2)),
+                min(nlist, max(32, current * 4)),
+                nlist,
+            ):
+                if candidate <= current:
+                    continue
+
+                self._ivf.nprobe = int(
+                    candidate
+                )
+                score, ids = self._index.search(
+                    q,
+                    effective_k,
+                )
+                current = int(
+                    candidate
+                )
+
+                if not (ids < 0).any():
+                    self._negative_retry_count += 1
+
+                    if (
+                        self._negative_retry_count <= 3
+                        or self._negative_retry_count % 100 == 0
+                    ):
+                        print(
+                            f"{self._log_prefix} sparse IVF retry OK / "
+                            f"nprobe={current}",
+                            flush=True,
+                        )
+                    break
+
+        return score, ids
+
+
 class RealtimeProcessor:
     def __init__(
         self,
@@ -114,6 +297,7 @@ class RealtimeProcessor:
             )
 
         # Imports happen only after repo cwd/sys.path are prepared.
+        import faiss
         import torch
         import torch.nn.functional as F
         import torchaudio.transforms as tat
@@ -157,6 +341,25 @@ class RealtimeProcessor:
             self.config,
             None,
         )
+
+        # Official realtime RVC uses k=8 but training writes IVF nprobe=1.
+        # Raise nprobe at runtime and retry sparse IVF searches without
+        # modifying the user's .index file on disk.
+        if (
+            effective_index
+            and float(
+                effective_index_rate
+            ) > 0.0
+            and hasattr(
+                self.rvc,
+                "index",
+            )
+        ):
+            original_index = self.rvc.index
+            self.rvc.index = _SafeFaissSearchProxy(
+                original_index,
+                faiss_module=faiss,
+            )
 
         if not hasattr(
             self.rvc,
