@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V44B_NATIVE_MIC_AUTOBUILD_HOTFIX
 # V44_S24_NATIVE_SCREENOFF_MIC_PATCH
 # V43_REALTIME_RVC_F0_STABILITY_GUARD_PATCH
 # V42_RVC_AB_ALIGNMENT_LOW_LATENCY_PATCH
@@ -349,6 +350,95 @@ def native_mic_installed(
         return False
 
 
+def build_native_mic_apk() -> Path:
+    """
+    Build the Android companion automatically when the APK is missing.
+
+    This runs on the existing Native Mic background action thread, so the
+    PySide6 main loop is not blocked.
+    """
+    root = project_root()
+    build_bat = (
+        root
+        / "dev_tools"
+        / "BUILD_S24_NATIVE_MIC.bat"
+    )
+
+    if not build_bat.is_file():
+        raise RuntimeError(
+            "Native Mic APK가 없고 자동 빌드 BAT도 찾지 못했습니다.\n"
+            f"필요 파일: {build_bat}"
+        )
+
+    # Use cmd.exe so the .bat can set JAVA_HOME / ANDROID_SDK_ROOT itself.
+    result = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            str(
+                build_bat
+            ),
+        ],
+        cwd=str(
+            root
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=900.0,
+        check=False,
+    )
+
+    raw = (
+        result.stdout
+        or b""
+    )
+
+    # Windows console output can be UTF-8, CP949, or the active ANSI codepage.
+    output = ""
+
+    for encoding in (
+        "utf-8",
+        "cp949",
+        "mbcs",
+    ):
+        try:
+            output = raw.decode(
+                encoding
+            )
+            break
+        except Exception:
+            continue
+
+    if not output:
+        output = raw.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    apk = find_native_mic_apk()
+
+    if (
+        result.returncode != 0
+        or apk is None
+    ):
+        tail = output[
+            -12000:
+        ]
+
+        raise RuntimeError(
+            "S24 Native Mic APK 자동 빌드에 실패했습니다.\n\n"
+            "아래는 빌드 로그 마지막 부분입니다.\n"
+            "----------------------------------------\n"
+            + (
+                tail.strip()
+                or "(출력 없음)"
+            )
+        )
+
+    return apk
+
+
 def install_native_mic_app(
     *,
     serial: str | None = None,
@@ -361,11 +451,7 @@ def install_native_mic_app(
     apk = find_native_mic_apk()
 
     if apk is None:
-        raise RuntimeError(
-            "빌드된 S24 Native Mic APK를 찾지 못했습니다.\n\n"
-            "먼저 프로젝트의 dev_tools\\BUILD_S24_NATIVE_MIC.bat 을 실행하세요.\n"
-            "Android Studio/Android SDK가 한 번은 설치되어 있어야 합니다."
-        )
+        apk = build_native_mic_apk()
 
     result = _run_adb(
         [
@@ -3296,7 +3382,8 @@ class PhoneMicBridgeWidget(QWidget):
         )
 
         native_note = QLabel(
-            "최초 1회 APK 빌드가 필요하면 dev_tools\\BUILD_S24_NATIVE_MIC.bat을 실행하세요. "
+            "APK가 없으면 'Native Mic APK 설치' 버튼이 자동으로 Android APK 빌드부터 시도합니다. "
+            "최초 빌드는 Gradle/Android 구성 다운로드 때문에 시간이 걸릴 수 있습니다. "
             "앱에서 마이크 권한을 허용한 뒤 'Start native mic'을 누르면 지속 알림이 표시됩니다. "
             "그 알림이 떠 있는 동안에는 화면을 꺼도 마이크 서비스가 계속 동작합니다. "
             "삼성 배터리 절전이 강하게 적용되는 경우 앱 배터리 사용을 '제한 없음'으로 바꾸세요."
