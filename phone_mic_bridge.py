@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V45_FINAL_VOICE_MONITOR_PATCH
 # V44B_NATIVE_MIC_AUTOBUILD_HOTFIX
 # V44_S24_NATIVE_SCREENOFF_MIC_PATCH
 # V43_REALTIME_RVC_F0_STABILITY_GUARD_PATCH
@@ -806,6 +807,452 @@ def _resample_linear(
     ).astype(np.float32)
 
 
+class FinalVoiceMonitor:
+    """
+    Separate final-output monitor.
+
+    Existing output stream:
+        CLEAN/RVC -> CABLE Input -> NVIDIA Broadcast
+
+    This monitor:
+        Microphone (NVIDIA Broadcast) -> physical speakers/headphones
+    """
+
+    def __init__(
+        self,
+        *,
+        log_callback=None,
+    ) -> None:
+        self.log_callback = log_callback
+        self._input_stream = None
+        self._output_stream = None
+
+        self.input_device: int | None = None
+        self.output_device: int | None = None
+        self.input_name = ""
+        self.output_name = ""
+
+        self.input_sample_rate = DEFAULT_SAMPLE_RATE
+        self.output_sample_rate = DEFAULT_SAMPLE_RATE
+        self.output_channels = 2
+
+        self.gain_db = -6.0
+        self.prebuffer_ms = 30
+
+        self.peak_dbfs = -120.0
+        self.status = "idle"
+        self.received_frames = 0
+        self.played_frames = 0
+
+        self.ring = AudioRingBuffer(
+            sample_rate=DEFAULT_SAMPLE_RATE,
+            capacity_seconds=3.0,
+        )
+
+    @property
+    def running(self) -> bool:
+        return (
+            self._input_stream is not None
+            and self._output_stream is not None
+        )
+
+    def _log(self, text: str) -> None:
+        if self.log_callback is not None:
+            self.log_callback(str(text))
+
+    @staticmethod
+    def _safe_rate(
+        value,
+        fallback: int = DEFAULT_SAMPLE_RATE,
+    ) -> int:
+        try:
+            result = int(round(float(value)))
+        except Exception:
+            result = int(fallback)
+
+        return max(8000, min(result, 192000))
+
+    def _input_callback(
+        self,
+        indata,
+        frames,
+        time_info,
+        status,
+    ) -> None:
+        if status:
+            self.status = "input: " + str(status)
+
+        arr = np.asarray(indata, dtype=np.float32)
+
+        if arr.ndim == 2:
+            if arr.shape[1] == 1:
+                mono = arr[:, 0]
+            else:
+                mono = np.mean(
+                    arr,
+                    axis=1,
+                    dtype=np.float32,
+                )
+        else:
+            mono = arr.reshape(-1)
+
+        if mono.size <= 0:
+            return
+
+        mono = np.asarray(
+            mono,
+            dtype=np.float32,
+        ).copy()
+
+        np.nan_to_num(
+            mono,
+            copy=False,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        peak = float(
+            np.max(
+                np.abs(mono)
+            )
+        )
+        self.peak_dbfs = (
+            20.0 * math.log10(max(peak, 1e-8))
+            if peak > 0.0
+            else -120.0
+        )
+
+        if self.input_sample_rate != self.output_sample_rate:
+            mono = _resample_linear(
+                mono,
+                self.input_sample_rate,
+                self.output_sample_rate,
+            )
+
+        gain = float(
+            10.0
+            ** (
+                float(self.gain_db)
+                / 20.0
+            )
+        )
+
+        if abs(gain - 1.0) > 1e-5:
+            mono *= gain
+
+        np.clip(
+            mono,
+            -1.0,
+            1.0,
+            out=mono,
+        )
+
+        self.ring.write(mono)
+        self.received_frames += int(frames)
+
+    def _output_callback(
+        self,
+        outdata,
+        frames,
+        time_info,
+        status,
+    ) -> None:
+        if status:
+            self.status = "output: " + str(status)
+
+        prebuffer = max(
+            int(frames),
+            int(
+                self.output_sample_rate
+                * float(self.prebuffer_ms)
+                / 1000.0
+            ),
+        )
+
+        mono = self.ring.read(
+            int(frames),
+            prebuffer_samples=prebuffer,
+        )
+
+        if outdata.ndim == 1:
+            outdata[:] = mono
+        else:
+            for channel in range(
+                outdata.shape[1]
+            ):
+                outdata[:, channel] = mono
+
+        self.played_frames += int(frames)
+
+    def start(
+        self,
+        *,
+        input_device: int,
+        output_device: int,
+        gain_db: float = -6.0,
+        prebuffer_ms: int = 30,
+    ) -> None:
+        self.stop()
+
+        if sd is None:
+            raise RuntimeError(
+                "sounddevice가 없어 최종 보이스 모니터를 시작할 수 없습니다. "
+                + (_SOUNDDEVICE_IMPORT_ERROR or "unknown")
+            )
+
+        input_device = int(input_device)
+        output_device = int(output_device)
+
+        input_info = sd.query_devices(
+            input_device,
+            "input",
+        )
+        output_info = sd.query_devices(
+            output_device,
+            "output",
+        )
+
+        if int(input_info.get("max_input_channels", 0)) <= 0:
+            raise RuntimeError(
+                "선택한 NVIDIA Broadcast 최종 마이크가 입력 장치가 아닙니다."
+            )
+
+        max_output_channels = int(
+            output_info.get(
+                "max_output_channels",
+                0,
+            )
+        )
+        if max_output_channels <= 0:
+            raise RuntimeError(
+                "선택한 최종 모니터 장치가 출력 장치가 아닙니다."
+            )
+
+        input_default = self._safe_rate(
+            input_info.get(
+                "default_samplerate",
+                DEFAULT_SAMPLE_RATE,
+            )
+        )
+        output_default = self._safe_rate(
+            output_info.get(
+                "default_samplerate",
+                DEFAULT_SAMPLE_RATE,
+            )
+        )
+        channels = 2 if max_output_channels >= 2 else 1
+
+        common_rate = None
+        rate_candidates = []
+
+        for rate in (
+            DEFAULT_SAMPLE_RATE,
+            input_default,
+            output_default,
+        ):
+            rate = int(rate)
+            if rate not in rate_candidates:
+                rate_candidates.append(rate)
+
+        for rate in rate_candidates:
+            try:
+                sd.check_input_settings(
+                    device=input_device,
+                    channels=1,
+                    dtype="float32",
+                    samplerate=rate,
+                )
+                sd.check_output_settings(
+                    device=output_device,
+                    channels=channels,
+                    dtype="float32",
+                    samplerate=rate,
+                )
+                common_rate = int(rate)
+                break
+            except Exception:
+                continue
+
+        if common_rate is None:
+            input_rate = int(input_default)
+            output_rate = int(output_default)
+        else:
+            input_rate = common_rate
+            output_rate = common_rate
+
+        self.input_device = input_device
+        self.output_device = output_device
+        self.input_name = str(
+            input_info.get(
+                "name",
+                f"Device {input_device}",
+            )
+        )
+        self.output_name = str(
+            output_info.get(
+                "name",
+                f"Device {output_device}",
+            )
+        )
+        self.input_sample_rate = int(input_rate)
+        self.output_sample_rate = int(output_rate)
+        self.output_channels = int(channels)
+        self.gain_db = max(
+            -40.0,
+            min(float(gain_db), 12.0),
+        )
+        self.prebuffer_ms = max(
+            10,
+            min(int(prebuffer_ms), 250),
+        )
+
+        self.ring = AudioRingBuffer(
+            sample_rate=self.output_sample_rate,
+            capacity_seconds=3.0,
+        )
+        self.peak_dbfs = -120.0
+        self.received_frames = 0
+        self.played_frames = 0
+        self.status = "starting"
+
+        input_stream = None
+        output_stream = None
+
+        try:
+            output_stream = sd.OutputStream(
+                samplerate=self.output_sample_rate,
+                blocksize=0,
+                device=output_device,
+                channels=channels,
+                dtype="float32",
+                latency="low",
+                callback=self._output_callback,
+            )
+            input_stream = sd.InputStream(
+                samplerate=self.input_sample_rate,
+                blocksize=0,
+                device=input_device,
+                channels=1,
+                dtype="float32",
+                latency="low",
+                callback=self._input_callback,
+            )
+
+            output_stream.start()
+            input_stream.start()
+
+            self._output_stream = output_stream
+            self._input_stream = input_stream
+            self.status = "monitoring"
+
+        except Exception:
+            if input_stream is not None:
+                with contextlib.suppress(Exception):
+                    input_stream.stop()
+                with contextlib.suppress(Exception):
+                    input_stream.close()
+
+            if output_stream is not None:
+                with contextlib.suppress(Exception):
+                    output_stream.stop()
+                with contextlib.suppress(Exception):
+                    output_stream.close()
+
+            self._input_stream = None
+            self._output_stream = None
+            self.status = "open failed"
+            self.ring.clear()
+            raise
+
+        rate_text = (
+            f"{self.input_sample_rate}→{self.output_sample_rate} Hz"
+            if self.input_sample_rate != self.output_sample_rate
+            else f"{self.output_sample_rate} Hz"
+        )
+
+        self._log(
+            "[Final Voice Monitor] ON: "
+            f"{self.input_name} → {self.output_name} / "
+            f"{rate_text} / gain={self.gain_db:+.1f}dB / "
+            f"prebuffer={self.prebuffer_ms}ms"
+        )
+
+    def set_gain_db(
+        self,
+        value: float,
+    ) -> None:
+        self.gain_db = max(
+            -40.0,
+            min(float(value), 12.0),
+        )
+
+    def stop(self) -> None:
+        input_stream = self._input_stream
+        output_stream = self._output_stream
+        self._input_stream = None
+        self._output_stream = None
+
+        if input_stream is not None:
+            with contextlib.suppress(Exception):
+                input_stream.stop()
+            with contextlib.suppress(Exception):
+                input_stream.close()
+
+        if output_stream is not None:
+            with contextlib.suppress(Exception):
+                output_stream.stop()
+            with contextlib.suppress(Exception):
+                output_stream.close()
+
+        self.ring.clear()
+
+        if self.status != "idle":
+            self.status = "stopped"
+
+    def snapshot(self) -> dict:
+        rate = max(
+            1,
+            int(self.output_sample_rate),
+        )
+
+        return {
+            "running": bool(self.running),
+            "status": str(self.status),
+            "input_device": self.input_device,
+            "output_device": self.output_device,
+            "input_name": str(self.input_name),
+            "output_name": str(self.output_name),
+            "input_sample_rate": int(
+                self.input_sample_rate
+            ),
+            "output_sample_rate": int(
+                self.output_sample_rate
+            ),
+            "gain_db": float(self.gain_db),
+            "prebuffer_ms": int(
+                self.prebuffer_ms
+            ),
+            "peak_dbfs": float(self.peak_dbfs),
+            "received_frames": int(
+                self.received_frames
+            ),
+            "played_frames": int(
+                self.played_frames
+            ),
+            "buffer_ms": (
+                self.ring.available_samples
+                * 1000.0
+                / float(rate)
+            ),
+            "underflow_ms": (
+                self.ring.underflow_samples
+                * 1000.0
+                / float(rate)
+            ),
+        }
+
+
 class SimpleDSP:
     """
     Intentionally conservative real-time DSP.
@@ -1300,6 +1747,15 @@ class PhoneMicRuntime:
         self.broadcast_record_enabled = True
         self.broadcast_input_device: int | None = None
 
+        # v4.5: final NVIDIA Broadcast voice -> local speaker/headphone monitor.
+        self.final_monitor_enabled = False
+        self.final_monitor_output_device: int | None = None
+        self.final_monitor_gain_db = -6.0
+        self.final_monitor_prebuffer_ms = 30
+        self.final_voice_monitor = FinalVoiceMonitor(
+            log_callback=self.log
+        )
+
         # v4.1 RVC A/B debug recorder.
         self.rvc_ab_debug_enabled = False
         self._ab_clean_original_wave: wave.Wave_write | None = None
@@ -1427,6 +1883,9 @@ class PhoneMicRuntime:
         record_clean_copy: bool,
         broadcast_record_enabled: bool,
         broadcast_input_device: int | None,
+        final_monitor_enabled: bool,
+        final_monitor_output_device: int | None,
+        final_monitor_gain_db: float,
         realtime_rvc_enabled: bool,
         rvc_ab_debug_enabled: bool,
     ) -> None:
@@ -1483,6 +1942,24 @@ class PhoneMicRuntime:
                 int(broadcast_input_device)
                 if broadcast_input_device is not None
                 else None
+            )
+            self.final_monitor_enabled = bool(
+                final_monitor_enabled
+            )
+            self.final_monitor_output_device = (
+                int(final_monitor_output_device)
+                if final_monitor_output_device is not None
+                else None
+            )
+            self.final_monitor_gain_db = max(
+                -40.0,
+                min(
+                    float(final_monitor_gain_db),
+                    12.0,
+                ),
+            )
+            self.final_voice_monitor.set_gain_db(
+                self.final_monitor_gain_db
             )
             self.realtime_rvc_enabled = bool(
                 realtime_rvc_enabled
@@ -1658,6 +2135,112 @@ class PhoneMicRuntime:
             self.log(
                 "실시간 모니터 출력 OFF / 녹음은 계속됩니다."
             )
+
+    def _open_final_voice_monitor(
+        self,
+    ) -> None:
+        if not self.final_monitor_enabled:
+            return
+
+        if self.final_voice_monitor.running:
+            return
+
+        input_device = self.broadcast_input_device
+        output_device = self.final_monitor_output_device
+
+        if input_device is None:
+            raise RuntimeError(
+                "NVIDIA Broadcast 최종 마이크 입력을 선택하세요."
+            )
+
+        if output_device is None:
+            raise RuntimeError(
+                "최종 보이스를 들을 스피커/헤드폰을 선택하세요."
+            )
+
+        if (
+            self.output_enabled
+            and self.output_device is not None
+            and int(output_device) == int(self.output_device)
+        ):
+            self.log(
+                "[Final Voice Monitor] 경고: 최종 모니터 출력이 "
+                "CLEAN/RVC 전달 출력과 같습니다. CABLE Input을 선택했다면 "
+                "루프가 생길 수 있습니다."
+            )
+
+        self.final_voice_monitor.start(
+            input_device=int(input_device),
+            output_device=int(output_device),
+            gain_db=float(
+                self.final_monitor_gain_db
+            ),
+            prebuffer_ms=int(
+                self.final_monitor_prebuffer_ms
+            ),
+        )
+
+    def _close_final_voice_monitor(
+        self,
+    ) -> None:
+        was_running = bool(
+            self.final_voice_monitor.running
+        )
+        self.final_voice_monitor.stop()
+
+        if was_running:
+            self.log(
+                "[Final Voice Monitor] OFF"
+            )
+
+    def set_final_monitor_enabled(
+        self,
+        enabled: bool,
+    ) -> None:
+        enabled = bool(enabled)
+
+        with self._settings_lock:
+            self.final_monitor_enabled = enabled
+
+        if not self._running:
+            return
+
+        if enabled:
+            self._open_final_voice_monitor()
+        else:
+            self._close_final_voice_monitor()
+
+    def restart_final_voice_monitor(
+        self,
+    ) -> None:
+        if not self._running:
+            return
+
+        with self._settings_lock:
+            enabled = bool(
+                self.final_monitor_enabled
+            )
+
+        self._close_final_voice_monitor()
+
+        if enabled:
+            self._open_final_voice_monitor()
+
+    def set_final_monitor_gain_db(
+        self,
+        gain_db: float,
+    ) -> None:
+        value = max(
+            -40.0,
+            min(float(gain_db), 12.0),
+        )
+
+        with self._settings_lock:
+            self.final_monitor_gain_db = value
+
+        self.final_voice_monitor.set_gain_db(
+            value
+        )
 
     def _on_realtime_rvc_audio(
         self,
@@ -2229,6 +2812,16 @@ class PhoneMicRuntime:
         # Output stream first so a device error is reported before servers
         # begin accepting microphone data.
         self._open_output_stream()
+
+        if self.final_monitor_enabled:
+            try:
+                self._open_final_voice_monitor()
+            except Exception as exc:
+                self.log(
+                    "[Final Voice Monitor] 시작 실패: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
         self._start_http()
 
         self._ws_thread = threading.Thread(
@@ -2257,6 +2850,7 @@ class PhoneMicRuntime:
 
         self.stop_recording()
         self.stop_realtime_rvc()
+        self._close_final_voice_monitor()
 
         loop = self._ws_loop
         stop_event = self._ws_stop_async
@@ -2689,6 +3283,10 @@ class PhoneMicRuntime:
                 reopen_output = bool(
                     self.output_enabled
                 )
+                reopen_final_monitor = bool(
+                    self.final_monitor_enabled
+                    and self.final_voice_monitor.running
+                )
 
             self.log(
                 "[RVC A/B] Broadcast 2종 렌더 중에는 "
@@ -2700,6 +3298,9 @@ class PhoneMicRuntime:
             )
 
             try:
+                if reopen_final_monitor:
+                    self._close_final_voice_monitor()
+
                 self._close_output_stream()
                 self.ring.clear()
 
@@ -2818,6 +3419,18 @@ class PhoneMicRuntime:
                     except Exception as exc:
                         self.log(
                             "[RVC A/B] 실시간 출력 복구 실패: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+                if (
+                    reopen_final_monitor
+                    and self._running
+                ):
+                    try:
+                        self._open_final_voice_monitor()
+                    except Exception as exc:
+                        self.log(
+                            "[RVC A/B] 최종 보이스 모니터 복구 실패: "
                             f"{type(exc).__name__}: {exc}"
                         )
 
@@ -2983,6 +3596,7 @@ class PhoneMicRuntime:
 
         now = time.monotonic()
         broadcast = self.broadcast_capture.snapshot()
+        final_monitor = self.final_voice_monitor.snapshot()
         realtime_rvc = self._realtime_rvc_snapshot()
 
         return {
@@ -3138,6 +3752,30 @@ class PhoneMicRuntime:
             "broadcast_status": str(
                 broadcast["status"]
             ),
+            "final_monitor_running": bool(
+                final_monitor["running"]
+            ),
+            "final_monitor_status": str(
+                final_monitor["status"]
+            ),
+            "final_monitor_peak_dbfs": float(
+                final_monitor["peak_dbfs"]
+            ),
+            "final_monitor_buffer_ms": float(
+                final_monitor["buffer_ms"]
+            ),
+            "final_monitor_underflow_ms": float(
+                final_monitor["underflow_ms"]
+            ),
+            "final_monitor_input_name": str(
+                final_monitor["input_name"]
+            ),
+            "final_monitor_output_name": str(
+                final_monitor["output_name"]
+            ),
+            "final_monitor_gain_db": float(
+                final_monitor["gain_db"]
+            ),
             "realtime_rvc": realtime_rvc,
         }
 
@@ -3176,6 +3814,7 @@ class PhoneMicBridgeWidget(QWidget):
         )
         self._devices: list[tuple[int, str]] = []
         self._broadcast_input_devices: list[tuple[int, str]] = []
+        self._final_monitor_output_devices: list[tuple[int, str]] = []
         self._camera_device_signature: tuple = ()
         self._camera_preview_seq = -1
         self._native_action_busy = False
@@ -3467,6 +4106,9 @@ class PhoneMicBridgeWidget(QWidget):
             "보통 'Microphone (NVIDIA Broadcast)' 또는 "
             "'마이크(NVIDIA Broadcast)'를 선택합니다."
         )
+        self.broadcast_input_combo.currentIndexChanged.connect(
+            self.on_final_monitor_device_changed
+        )
 
         broadcast_row = QHBoxLayout()
         broadcast_row.addWidget(
@@ -3491,6 +4133,86 @@ class PhoneMicBridgeWidget(QWidget):
         )
         output_layout.addRow(
             broadcast_note
+        )
+
+        self.final_monitor_check = QCheckBox(
+            "상대방에게 전달되는 최종 보이스를 내 PC에서도 듣기"
+        )
+        self.final_monitor_check.setChecked(
+            self.settings.value(
+                "phone_mic_final_monitor_enabled_v45",
+                False,
+                type=bool,
+            )
+        )
+        self.final_monitor_check.setToolTip(
+            "Microphone (NVIDIA Broadcast) 최종 출력을 다시 캡처해 "
+            "선택한 실제 스피커/헤드폰으로 재생합니다."
+        )
+        self.final_monitor_check.toggled.connect(
+            self.on_final_monitor_toggled
+        )
+        output_layout.addRow(
+            "최종 보이스 모니터",
+            self.final_monitor_check,
+        )
+
+        final_monitor_row = QHBoxLayout()
+
+        self.final_monitor_output_combo = QComboBox()
+        self.final_monitor_output_combo.setToolTip(
+            "최종 보이스를 들을 실제 스피커/헤드폰을 선택하세요. "
+            "CABLE Input을 선택하지 않는 것을 권장합니다."
+        )
+        self.final_monitor_output_combo.currentIndexChanged.connect(
+            self.on_final_monitor_device_changed
+        )
+        final_monitor_row.addWidget(
+            self.final_monitor_output_combo,
+            1,
+        )
+
+        self.final_monitor_gain_spin = QDoubleSpinBox()
+        self.final_monitor_gain_spin.setRange(
+            -40.0,
+            12.0,
+        )
+        self.final_monitor_gain_spin.setDecimals(1)
+        self.final_monitor_gain_spin.setSingleStep(1.0)
+        self.final_monitor_gain_spin.setSuffix(" dB")
+        self.final_monitor_gain_spin.setValue(
+            float(
+                self.settings.value(
+                    "phone_mic_final_monitor_gain_db_v45",
+                    -6.0,
+                )
+            )
+        )
+        self.final_monitor_gain_spin.setToolTip(
+            "내가 듣는 모니터 볼륨만 조절합니다. "
+            "Discord/게임으로 전달되는 마이크 볼륨에는 영향을 주지 않습니다."
+        )
+        self.final_monitor_gain_spin.valueChanged.connect(
+            self.on_final_monitor_gain_changed
+        )
+        final_monitor_row.addWidget(
+            self.final_monitor_gain_spin
+        )
+
+        output_layout.addRow(
+            "내 모니터 출력",
+            final_monitor_row,
+        )
+
+        final_monitor_note = QLabel(
+            "경로: Microphone (NVIDIA Broadcast) → 내 스피커/헤드폰. "
+            "즉 CLEAN/RVC가 아니라 상대방에게 전달되는 최종 보이스를 그대로 듣습니다. "
+            "스피커 사용 시 S24 마이크가 다시 소리를 받아 에코/하울링이 생길 수 있으므로 "
+            "가능하면 헤드폰/이어폰을 권장합니다."
+        )
+        final_monitor_note.setWordWrap(True)
+        output_layout.addRow(
+            final_monitor_note
         )
 
         self.jitter_spin = QSpinBox()
@@ -4913,6 +5635,19 @@ class PhoneMicBridgeWidget(QWidget):
         except Exception:
             return None
 
+    def _selected_final_monitor_output_device(
+        self,
+    ) -> int | None:
+        data = self.final_monitor_output_combo.currentData()
+
+        if data is None:
+            return None
+
+        try:
+            return int(data)
+        except Exception:
+            return None
+
     def _selected_broadcast_input_device(
         self,
     ) -> int | None:
@@ -4978,6 +5713,8 @@ class PhoneMicBridgeWidget(QWidget):
 
         self.output_combo.clear()
         self._devices.clear()
+        self.final_monitor_output_combo.clear()
+        self._final_monitor_output_devices.clear()
 
         if sd is None:
             self.output_combo.addItem(
@@ -4986,6 +5723,10 @@ class PhoneMicBridgeWidget(QWidget):
             )
             self.broadcast_input_combo.clear()
             self.broadcast_input_combo.addItem(
+                "sounddevice 미설치",
+                None,
+            )
+            self.final_monitor_output_combo.addItem(
                 "sounddevice 미설치",
                 None,
             )
@@ -5002,6 +5743,40 @@ class PhoneMicBridgeWidget(QWidget):
 
         best_index = -1
         fallback_index = -1
+
+        final_previous = self.settings.value(
+            "phone_mic_final_monitor_output_device_name_v45",
+            "",
+            type=str,
+        )
+        final_saved_index = -1
+        final_default_index = -1
+        final_physical_index = -1
+        final_nonvirtual_index = -1
+
+        try:
+            default_output_device = int(
+                sd.default.device[1]
+            )
+        except Exception:
+            default_output_device = -1
+
+        virtual_keywords = (
+            "cable input",
+            "vb-audio",
+            "voicemeeter",
+            "nvidia broadcast",
+            "stereo mix",
+        )
+        physical_keywords = (
+            "speaker",
+            "speakers",
+            "headphone",
+            "headphones",
+            "스피커",
+            "헤드폰",
+            "이어폰",
+        )
 
         for index, info in enumerate(
             devices
@@ -5033,11 +5808,52 @@ class PhoneMicBridgeWidget(QWidget):
                 - 1
             )
 
+            self.final_monitor_output_combo.addItem(
+                label,
+                index,
+            )
+            final_combo_index = (
+                self.final_monitor_output_combo.count()
+                - 1
+            )
+
             self._devices.append(
+                (index, name)
+            )
+            self._final_monitor_output_devices.append(
                 (index, name)
             )
 
             lower = name.lower()
+            is_virtual = any(
+                keyword in lower
+                for keyword in virtual_keywords
+            )
+
+            if final_previous and final_previous == name:
+                final_saved_index = final_combo_index
+
+            if (
+                int(index) == int(default_output_device)
+                and not is_virtual
+            ):
+                final_default_index = final_combo_index
+
+            if (
+                final_physical_index < 0
+                and not is_virtual
+                and any(
+                    keyword in lower
+                    for keyword in physical_keywords
+                )
+            ):
+                final_physical_index = final_combo_index
+
+            if (
+                final_nonvirtual_index < 0
+                and not is_virtual
+            ):
+                final_nonvirtual_index = final_combo_index
 
             if (
                 "cable input" in lower
@@ -5057,6 +5873,23 @@ class PhoneMicBridgeWidget(QWidget):
         elif best_index >= 0:
             self.output_combo.setCurrentIndex(
                 best_index
+            )
+
+        final_choice = -1
+
+        for candidate in (
+            final_saved_index,
+            final_default_index,
+            final_physical_index,
+            final_nonvirtual_index,
+        ):
+            if candidate >= 0:
+                final_choice = int(candidate)
+                break
+
+        if final_choice >= 0:
+            self.final_monitor_output_combo.setCurrentIndex(
+                final_choice
             )
 
         self._refresh_broadcast_input_devices()
@@ -5231,6 +6064,30 @@ class PhoneMicBridgeWidget(QWidget):
             "phone_mic_broadcast_input_device_name",
             broadcast_name,
         )
+
+        final_monitor_device = (
+            self._selected_final_monitor_output_device()
+        )
+        final_monitor_name = ""
+
+        for index, name in self._final_monitor_output_devices:
+            if index == final_monitor_device:
+                final_monitor_name = name
+                break
+
+        self.settings.setValue(
+            "phone_mic_final_monitor_enabled_v45",
+            self.final_monitor_check.isChecked(),
+        )
+        self.settings.setValue(
+            "phone_mic_final_monitor_output_device_name_v45",
+            final_monitor_name,
+        )
+        self.settings.setValue(
+            "phone_mic_final_monitor_gain_db_v45",
+            self.final_monitor_gain_spin.value(),
+        )
+
         self._save_realtime_rvc_settings()
         self._save_camera_settings()
 
@@ -5255,6 +6112,9 @@ class PhoneMicBridgeWidget(QWidget):
             record_clean_copy=self.clean_record_check.isChecked(),
             broadcast_record_enabled=self.broadcast_record_check.isChecked(),
             broadcast_input_device=self._selected_broadcast_input_device(),
+            final_monitor_enabled=self.final_monitor_check.isChecked(),
+            final_monitor_output_device=self._selected_final_monitor_output_device(),
+            final_monitor_gain_db=self.final_monitor_gain_spin.value(),
             realtime_rvc_enabled=self.realtime_rvc_enable_check.isChecked(),
             rvc_ab_debug_enabled=self.rvc_ab_debug_check.isChecked(),
         )
@@ -5305,6 +6165,9 @@ class PhoneMicBridgeWidget(QWidget):
                 record_clean_copy=self.clean_record_check.isChecked(),
                 broadcast_record_enabled=self.broadcast_record_check.isChecked(),
                 broadcast_input_device=self._selected_broadcast_input_device(),
+                final_monitor_enabled=self.final_monitor_check.isChecked(),
+                final_monitor_output_device=self._selected_final_monitor_output_device(),
+                final_monitor_gain_db=self.final_monitor_gain_spin.value(),
                 realtime_rvc_enabled=self.realtime_rvc_enable_check.isChecked(),
                 rvc_ab_debug_enabled=self.rvc_ab_debug_check.isChecked(),
             )
@@ -5313,6 +6176,103 @@ class PhoneMicBridgeWidget(QWidget):
                 "모니터 출력 전환 실패",
                 f"{type(exc).__name__}: {exc}",
             )
+
+    def on_final_monitor_toggled(
+        self,
+        checked: bool,
+    ) -> None:
+        self._save_settings()
+        self._apply_runtime_settings()
+
+        if not self.runtime.running:
+            return
+
+        if checked:
+            if self._selected_broadcast_input_device() is None:
+                self.final_monitor_check.blockSignals(True)
+                self.final_monitor_check.setChecked(False)
+                self.final_monitor_check.blockSignals(False)
+                self._save_settings()
+
+                QMessageBox.warning(
+                    self,
+                    "최종 보이스 입력 없음",
+                    "NVIDIA Broadcast 최종 마이크 입력을 선택하세요.\n"
+                    "보통 Microphone (NVIDIA Broadcast) 또는 "
+                    "마이크(NVIDIA Broadcast)입니다.",
+                )
+                return
+
+            if self._selected_final_monitor_output_device() is None:
+                self.final_monitor_check.blockSignals(True)
+                self.final_monitor_check.setChecked(False)
+                self.final_monitor_check.blockSignals(False)
+                self._save_settings()
+
+                QMessageBox.warning(
+                    self,
+                    "모니터 출력 없음",
+                    "최종 보이스를 들을 스피커/헤드폰을 선택하세요.",
+                )
+                return
+
+        try:
+            self.runtime.set_final_monitor_enabled(
+                bool(checked)
+            )
+        except Exception as exc:
+            self.final_monitor_check.blockSignals(True)
+            self.final_monitor_check.setChecked(False)
+            self.final_monitor_check.blockSignals(False)
+            self._save_settings()
+            self._apply_runtime_settings()
+
+            QMessageBox.warning(
+                self,
+                "최종 보이스 모니터 시작 실패",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def on_final_monitor_device_changed(
+        self,
+        *_args,
+    ) -> None:
+        # During initial UI construction this signal can fire before all
+        # final-monitor widgets exist.
+        if not hasattr(
+            self,
+            "final_monitor_check",
+        ):
+            return
+
+        self._save_settings()
+        self._apply_runtime_settings()
+
+        if (
+            not self.runtime.running
+            or not self.final_monitor_check.isChecked()
+        ):
+            return
+
+        try:
+            self.runtime.restart_final_voice_monitor()
+        except Exception as exc:
+            self.runtime.log(
+                "[Final Voice Monitor] 장치 전환 실패: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def on_final_monitor_gain_changed(
+        self,
+        value: float,
+    ) -> None:
+        self.settings.setValue(
+            "phone_mic_final_monitor_gain_db_v45",
+            float(value),
+        )
+        self.runtime.set_final_monitor_gain_db(
+            float(value)
+        )
 
     def start_bridge(self) -> None:
         if self.runtime.running:
@@ -5334,6 +6294,19 @@ class PhoneMicBridgeWidget(QWidget):
                 "수신/RAW 녹음만 하려면 'Windows 출력 활성화'를 끄세요.",
             )
             return
+
+        if self.final_monitor_check.isChecked():
+            if (
+                self._selected_broadcast_input_device() is None
+                or self._selected_final_monitor_output_device() is None
+            ):
+                QMessageBox.warning(
+                    self,
+                    "최종 보이스 모니터 장치 확인",
+                    "최종 보이스 모니터가 켜져 있지만 입력 또는 출력 장치가 없습니다.\n"
+                    "NVIDIA Broadcast 최종 마이크와 내 스피커/헤드폰을 선택하세요.",
+                )
+                return
 
         try:
             self.runtime.start()
@@ -5850,7 +6823,10 @@ class PhoneMicBridgeWidget(QWidget):
             f"auto gain {snap['smart_gain_db']:+.1f}dB / "
             f"clean RMS {snap['smart_gain_output_rms_db']:.1f}dBFS / "
             f"Broadcast {snap['broadcast_status']} "
-            f"{snap['broadcast_peak_dbfs']:.1f}dBFS"
+            f"{snap['broadcast_peak_dbfs']:.1f}dBFS / "
+            f"FinalMon "
+            f"{'ON' if snap['final_monitor_running'] else 'OFF'} "
+            f"{snap['final_monitor_peak_dbfs']:.1f}dBFS"
         )
 
         rt = snap.get(
