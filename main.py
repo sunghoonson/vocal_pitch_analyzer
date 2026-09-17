@@ -122,8 +122,9 @@ from rvc_training_dataset_cleaner import (
 from phone_mic_bridge import PhoneMicBridgeWidget
 
 
-APP_TITLE = "Vocal Pitch Analyzer - Prototype v4.5 / Final Voice Monitor"
+APP_TITLE = "Vocal Pitch Analyzer - Prototype v4.6 / S24 Voice Focus + Native Mic Lab"
 
+# V46_S24_VOICE_FOCUS_NATIVE_MIC_LAB_PATCH
 # V45_FINAL_VOICE_MONITOR_PATCH
 # V44_S24_NATIVE_SCREENOFF_MIC_PATCH
 # V43_REALTIME_RVC_F0_STABILITY_GUARD_PATCH

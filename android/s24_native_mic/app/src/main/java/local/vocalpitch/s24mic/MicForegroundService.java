@@ -10,8 +10,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.media.MicrophoneDirection;
+import android.media.MicrophoneInfo;
 import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
@@ -19,8 +22,11 @@ import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.SystemClock;
 
+import org.json.JSONObject;
+
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.List;
 import java.util.Locale;
 
 public final class MicForegroundService
@@ -37,6 +43,12 @@ public final class MicForegroundService
             "echo_cancellation";
     static final String EXTRA_AGC =
             "auto_gain_control";
+    static final String EXTRA_AUDIO_SOURCE =
+            "audio_source";
+    static final String EXTRA_DIRECTION =
+            "microphone_direction";
+    static final String EXTRA_FIELD_ZOOM =
+            "microphone_field_zoom";
 
     static final int SAMPLE_RATE = 48000;
     static final int PACKET_FRAMES = 960;
@@ -59,6 +71,18 @@ public final class MicForegroundService
     private boolean useNs = true;
     private boolean useAec = false;
     private boolean useAgc = false;
+
+    private int requestedAudioSource =
+            MediaRecorder.AudioSource.VOICE_RECOGNITION;
+    private int actualAudioSource =
+            MediaRecorder.AudioSource.VOICE_RECOGNITION;
+    private int preferredDirection =
+            MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER;
+    private float microphoneFieldZoom = 0.75f;
+
+    private boolean directionApplied = false;
+    private boolean fieldApplied = false;
+    private String activeMicrophoneSummary = "";
 
     @Override
     public void onCreate() {
@@ -110,6 +134,24 @@ public final class MicForegroundService
                     EXTRA_AGC,
                     false
             );
+            requestedAudioSource = sanitizeAudioSource(
+                    intent.getIntExtra(
+                            EXTRA_AUDIO_SOURCE,
+                            MediaRecorder.AudioSource.VOICE_RECOGNITION
+                    )
+            );
+            preferredDirection = sanitizeDirection(
+                    intent.getIntExtra(
+                            EXTRA_DIRECTION,
+                            MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER
+                    )
+            );
+            microphoneFieldZoom = clampZoom(
+                    intent.getFloatExtra(
+                            EXTRA_FIELD_ZOOM,
+                            0.75f
+                    )
+            );
         }
 
         startForeground(
@@ -124,7 +166,11 @@ public final class MicForegroundService
         if (!running) {
             startBridge();
         } else {
-            applyAudioEffects();
+            // Source/direction changes require rebuilding AudioRecord.
+            updateStatus(
+                    "설정 변경은 Stop 후 Start에서 적용됩니다.",
+                    connected
+            );
         }
 
         return START_STICKY;
@@ -141,8 +187,6 @@ public final class MicForegroundService
     public void onTaskRemoved(
             Intent rootIntent
     ) {
-        // Deliberately do not stop. The foreground service is the actual mic
-        // bridge and must survive the Activity/task being backgrounded.
         super.onTaskRemoved(
                 rootIntent
         );
@@ -246,27 +290,10 @@ public final class MicForegroundService
             );
 
             AudioRecord recorder =
-                    new AudioRecord.Builder()
-                            .setAudioSource(
-                                    MediaRecorder.AudioSource.VOICE_RECOGNITION
-                            )
-                            .setAudioFormat(
-                                    new AudioFormat.Builder()
-                                            .setEncoding(
-                                                    AudioFormat.ENCODING_PCM_16BIT
-                                            )
-                                            .setSampleRate(
-                                                    SAMPLE_RATE
-                                            )
-                                            .setChannelMask(
-                                                    AudioFormat.CHANNEL_IN_MONO
-                                            )
-                                            .build()
-                            )
-                            .setBufferSizeInBytes(
-                                    bufferBytes
-                            )
-                            .build();
+                    buildRecorder(
+                            requestedAudioSource,
+                            bufferBytes
+                    );
 
             if (
                     recorder.getState()
@@ -279,6 +306,16 @@ public final class MicForegroundService
             }
 
             audioRecord = recorder;
+
+            directionApplied =
+                    recorder.setPreferredMicrophoneDirection(
+                            preferredDirection
+                    );
+            fieldApplied =
+                    recorder.setPreferredMicrophoneFieldDimension(
+                            microphoneFieldZoom
+                    );
+
             applyAudioEffects();
 
             recorder.startRecording();
@@ -291,6 +328,17 @@ public final class MicForegroundService
                         "AudioRecord start failed"
                 );
             }
+
+            SystemClock.sleep(
+                    80
+            );
+
+            activeMicrophoneSummary =
+                    describeActiveMicrophones(
+                            recorder
+                    );
+
+            persistNativeMicState();
 
             short[] input = new short[
                     PACKET_FRAMES
@@ -313,7 +361,7 @@ public final class MicForegroundService
                                 || !webSocket.isOpen()
                 ) {
                     SystemClock.sleep(
-                            500
+                            250
                     );
                     continue;
                 }
@@ -366,8 +414,7 @@ public final class MicForegroundService
                     if (!connected) {
                         connected = true;
                         updateStatus(
-                                "PC 연결됨 / 48kHz / "
-                                        + effectsText(),
+                                connectedStatusText(),
                                 true
                         );
                     }
@@ -426,6 +473,97 @@ public final class MicForegroundService
         }
     }
 
+    private AudioRecord buildRecorder(
+            int requestedSource,
+            int bufferBytes
+    ) {
+        int candidate = requestedSource;
+
+        if (
+                candidate
+                        == MediaRecorder.AudioSource.UNPROCESSED
+                && !supportsUnprocessed()
+        ) {
+            candidate =
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION;
+        }
+
+        try {
+            AudioRecord recorder =
+                    buildRecorderOnce(
+                            candidate,
+                            bufferBytes
+                    );
+            actualAudioSource = candidate;
+            return recorder;
+
+        } catch (Exception first) {
+            if (
+                    candidate
+                            == MediaRecorder.AudioSource.VOICE_RECOGNITION
+            ) {
+                throw first;
+            }
+
+            AudioRecord fallback =
+                    buildRecorderOnce(
+                            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                            bufferBytes
+                    );
+            actualAudioSource =
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION;
+            return fallback;
+        }
+    }
+
+    private AudioRecord buildRecorderOnce(
+            int source,
+            int bufferBytes
+    ) {
+        return new AudioRecord.Builder()
+                .setAudioSource(
+                        source
+                )
+                .setAudioFormat(
+                        new AudioFormat.Builder()
+                                .setEncoding(
+                                        AudioFormat.ENCODING_PCM_16BIT
+                                )
+                                .setSampleRate(
+                                        SAMPLE_RATE
+                                )
+                                .setChannelMask(
+                                        AudioFormat.CHANNEL_IN_MONO
+                                )
+                                .build()
+                )
+                .setBufferSizeInBytes(
+                        bufferBytes
+                )
+                .build();
+    }
+
+    private boolean supportsUnprocessed() {
+        try {
+            AudioManager manager =
+                    (AudioManager) getSystemService(
+                            Context.AUDIO_SERVICE
+                    );
+
+            String value =
+                    manager.getProperty(
+                            AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED
+                    );
+
+            return Boolean.parseBoolean(
+                    value
+            );
+
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     private void ensureConnected() {
         if (
                 webSocket != null
@@ -449,44 +587,15 @@ public final class MicForegroundService
                     "/"
             );
 
-            String hello = String.format(
-                    Locale.US,
-                    "{"
-                            + "\"type\":\"hello\","
-                            + "\"sampleRate\":%d,"
-                            + "\"packetFrames\":%d,"
-                            + "\"deviceLabel\":\"S24 Native AudioRecord\","
-                            + "\"trackSettings\":{"
-                            + "\"source\":\"VOICE_RECOGNITION\","
-                            + "\"screenOffForegroundService\":true"
-                            + "},"
-                            + "\"requestedNoiseSuppression\":%s,"
-                            + "\"requestedEchoCancellation\":%s,"
-                            + "\"requestedAutoGainControl\":%s"
-                            + "}",
-                    SAMPLE_RATE,
-                    PACKET_FRAMES,
-                    useNs
-                            ? "true"
-                            : "false",
-                    useAec
-                            ? "true"
-                            : "false",
-                    useAgc
-                            ? "true"
-                            : "false"
-            );
-
             candidate.sendText(
-                    hello
+                    buildHelloJson()
             );
 
             webSocket = candidate;
             connected = true;
 
             updateStatus(
-                    "PC 연결됨 / 48kHz / "
-                            + effectsText(),
+                    connectedStatusText(),
                     true
             );
 
@@ -504,6 +613,113 @@ public final class MicForegroundService
             SystemClock.sleep(
                     1000
             );
+        }
+    }
+
+    private String buildHelloJson() {
+        try {
+            JSONObject root =
+                    new JSONObject();
+
+            root.put(
+                    "type",
+                    "hello"
+            );
+            root.put(
+                    "sampleRate",
+                    SAMPLE_RATE
+            );
+            root.put(
+                    "packetFrames",
+                    PACKET_FRAMES
+            );
+            root.put(
+                    "deviceLabel",
+                    "S24 Native AudioRecord v4.6"
+            );
+
+            JSONObject track =
+                    new JSONObject();
+
+            track.put(
+                    "source",
+                    audioSourceName(
+                            actualAudioSource
+                    )
+            );
+            track.put(
+                    "screenOffForegroundService",
+                    true
+            );
+            root.put(
+                    "trackSettings",
+                    track
+            );
+
+            root.put(
+                    "requestedNoiseSuppression",
+                    useNs
+            );
+            root.put(
+                    "requestedEchoCancellation",
+                    useAec
+            );
+            root.put(
+                    "requestedAutoGainControl",
+                    useAgc
+            );
+
+            root.put(
+                    "actualNoiseSuppression",
+                    actualNoiseSuppression()
+            );
+            root.put(
+                    "actualEchoCancellation",
+                    actualEchoCancellation()
+            );
+            root.put(
+                    "actualAutoGainControl",
+                    actualAutoGainControl()
+            );
+
+            root.put(
+                    "audioSourceName",
+                    audioSourceName(
+                            actualAudioSource
+                    )
+            );
+            root.put(
+                    "microphoneDirectionName",
+                    directionName(
+                            preferredDirection
+                    )
+            );
+            root.put(
+                    "microphoneFieldZoom",
+                    microphoneFieldZoom
+            );
+            root.put(
+                    "directionApplied",
+                    directionApplied
+            );
+            root.put(
+                    "fieldApplied",
+                    fieldApplied
+            );
+            root.put(
+                    "activeMicrophones",
+                    activeMicrophoneSummary
+            );
+
+            return root.toString();
+
+        } catch (Exception exc) {
+            return "{"
+                    + "\"type\":\"hello\","
+                    + "\"sampleRate\":48000,"
+                    + "\"packetFrames\":960,"
+                    + "\"deviceLabel\":\"S24 Native AudioRecord v4.6\""
+                    + "}";
         }
     }
 
@@ -600,25 +816,337 @@ public final class MicForegroundService
         }
     }
 
+    private boolean actualNoiseSuppression() {
+        try {
+            return noiseSuppressor != null
+                    && noiseSuppressor.getEnabled();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean actualEchoCancellation() {
+        try {
+            return echoCanceler != null
+                    && echoCanceler.getEnabled();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean actualAutoGainControl() {
+        try {
+            return autoGainControl != null
+                    && autoGainControl.getEnabled();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     private String effectsText() {
         return "NS="
                 + (
-                useNs
+                actualNoiseSuppression()
                         ? "ON"
                         : "OFF"
         )
                 + " / AEC="
                 + (
-                useAec
+                actualEchoCancellation()
                         ? "ON"
                         : "OFF"
         )
                 + " / AGC="
                 + (
-                useAgc
+                actualAutoGainControl()
                         ? "ON"
                         : "OFF"
         );
+    }
+
+    private String connectedStatusText() {
+        return "PC 연결됨 / 48kHz / "
+                + audioSourceName(
+                actualAudioSource
+        )
+                + " / "
+                + directionName(
+                preferredDirection
+        )
+                + String.format(
+                Locale.US,
+                " / focus=%+.2f / ",
+                microphoneFieldZoom
+        )
+                + effectsText();
+    }
+
+    private String describeActiveMicrophones(
+            AudioRecord recorder
+    ) {
+        try {
+            List<MicrophoneInfo> microphones =
+                    recorder.getActiveMicrophones();
+
+            if (
+                    microphones == null
+                            || microphones.isEmpty()
+            ) {
+                return "none/reported-empty";
+            }
+
+            StringBuilder result =
+                    new StringBuilder();
+
+            for (
+                    int i = 0;
+                    i < microphones.size();
+                    i++
+            ) {
+                MicrophoneInfo mic =
+                        microphones.get(
+                                i
+                        );
+
+                if (i > 0) {
+                    result.append(
+                            " | "
+                    );
+                }
+
+                result.append(
+                        "#"
+                );
+                result.append(
+                        i
+                );
+                result.append(
+                        " id="
+                );
+                result.append(
+                        mic.getId()
+                );
+                result.append(
+                        " "
+                );
+                result.append(
+                        directionalityName(
+                                mic.getDirectionality()
+                        )
+                );
+                result.append(
+                        " group="
+                );
+                result.append(
+                        mic.getGroup()
+                );
+                result.append(
+                        "/"
+                );
+                result.append(
+                        mic.getIndexInTheGroup()
+                );
+                result.append(
+                        " map="
+                );
+                result.append(
+                        mic.getChannelMapping()
+                );
+            }
+
+            return result.toString();
+
+        } catch (Exception exc) {
+            return "query-error:"
+                    + exc.getClass()
+                    .getSimpleName();
+        }
+    }
+
+    private void persistNativeMicState() {
+        getSharedPreferences(
+                "state",
+                MODE_PRIVATE
+        )
+                .edit()
+                .putString(
+                        "audio_source",
+                        audioSourceName(
+                                actualAudioSource
+                        )
+                )
+                .putString(
+                        "direction",
+                        directionName(
+                                preferredDirection
+                        )
+                )
+                .putFloat(
+                        "field_zoom",
+                        microphoneFieldZoom
+                )
+                .putBoolean(
+                        "direction_applied",
+                        directionApplied
+                )
+                .putBoolean(
+                        "field_applied",
+                        fieldApplied
+                )
+                .putString(
+                        "active_mics",
+                        activeMicrophoneSummary
+                )
+                .putBoolean(
+                        "actual_ns",
+                        actualNoiseSuppression()
+                )
+                .putBoolean(
+                        "actual_aec",
+                        actualEchoCancellation()
+                )
+                .putBoolean(
+                        "actual_agc",
+                        actualAutoGainControl()
+                )
+                .apply();
+    }
+
+    private static int sanitizeAudioSource(
+            int value
+    ) {
+        if (
+                value
+                        == MediaRecorder.AudioSource.MIC
+                || value
+                        == MediaRecorder.AudioSource.VOICE_RECOGNITION
+                || value
+                        == MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                || value
+                        == MediaRecorder.AudioSource.UNPROCESSED
+                || value
+                        == MediaRecorder.AudioSource.VOICE_PERFORMANCE
+        ) {
+            return value;
+        }
+
+        return MediaRecorder.AudioSource.VOICE_RECOGNITION;
+    }
+
+    private static int sanitizeDirection(
+            int value
+    ) {
+        if (
+                value
+                        == MicrophoneDirection.MIC_DIRECTION_UNSPECIFIED
+                || value
+                        == MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER
+                || value
+                        == MicrophoneDirection.MIC_DIRECTION_AWAY_FROM_USER
+        ) {
+            return value;
+        }
+
+        return MicrophoneDirection.MIC_DIRECTION_UNSPECIFIED;
+    }
+
+    private static float clampZoom(
+            float value
+    ) {
+        return Math.max(
+                -1.0f,
+                Math.min(
+                        value,
+                        1.0f
+                )
+        );
+    }
+
+    static String audioSourceName(
+            int source
+    ) {
+        if (
+                source
+                        == MediaRecorder.AudioSource.VOICE_PERFORMANCE
+        ) {
+            return "VOICE_PERFORMANCE";
+        }
+        if (
+                source
+                        == MediaRecorder.AudioSource.UNPROCESSED
+        ) {
+            return "UNPROCESSED";
+        }
+        if (
+                source
+                        == MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        ) {
+            return "VOICE_COMMUNICATION";
+        }
+        if (
+                source
+                        == MediaRecorder.AudioSource.MIC
+        ) {
+            return "MIC";
+        }
+
+        return "VOICE_RECOGNITION";
+    }
+
+    static String directionName(
+            int direction
+    ) {
+        if (
+                direction
+                        == MicrophoneDirection.MIC_DIRECTION_TOWARDS_USER
+        ) {
+            return "TOWARDS_USER";
+        }
+        if (
+                direction
+                        == MicrophoneDirection.MIC_DIRECTION_AWAY_FROM_USER
+        ) {
+            return "AWAY_FROM_USER";
+        }
+
+        return "UNSPECIFIED";
+    }
+
+    static String directionalityName(
+            int directionality
+    ) {
+        if (
+                directionality
+                        == MicrophoneInfo.DIRECTIONALITY_OMNI
+        ) {
+            return "OMNI";
+        }
+        if (
+                directionality
+                        == MicrophoneInfo.DIRECTIONALITY_BI_DIRECTIONAL
+        ) {
+            return "BI";
+        }
+        if (
+                directionality
+                        == MicrophoneInfo.DIRECTIONALITY_CARDIOID
+        ) {
+            return "CARDIOID";
+        }
+        if (
+                directionality
+                        == MicrophoneInfo.DIRECTIONALITY_HYPER_CARDIOID
+        ) {
+            return "HYPER_CARDIOID";
+        }
+        if (
+                directionality
+                        == MicrophoneInfo.DIRECTIONALITY_SUPER_CARDIOID
+        ) {
+            return "SUPER_CARDIOID";
+        }
+
+        return "UNKNOWN";
     }
 
     private void acquireCpuWakeLock() {

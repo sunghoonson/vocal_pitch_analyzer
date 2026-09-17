@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# V46_S24_VOICE_FOCUS_NATIVE_MIC_LAB_PATCH
 # V45_FINAL_VOICE_MONITOR_PATCH
 # V44B_NATIVE_MIC_AUTOBUILD_HOTFIX
 # V44_S24_NATIVE_SCREENOFF_MIC_PATCH
@@ -2611,6 +2612,65 @@ class PhoneMicRuntime:
                             )
                         )
 
+                        source_profile = str(
+                            payload.get(
+                                "audioSourceName",
+                                "",
+                            )
+                            or ""
+                        )
+                        direction_name = str(
+                            payload.get(
+                                "microphoneDirectionName",
+                                "",
+                            )
+                            or ""
+                        )
+                        field_zoom = float(
+                            payload.get(
+                                "microphoneFieldZoom",
+                                0.0,
+                            )
+                            or 0.0
+                        )
+                        direction_applied = bool(
+                            payload.get(
+                                "directionApplied",
+                                False,
+                            )
+                        )
+                        field_applied = bool(
+                            payload.get(
+                                "fieldApplied",
+                                False,
+                            )
+                        )
+                        actual_ns = bool(
+                            payload.get(
+                                "actualNoiseSuppression",
+                                requested_ns,
+                            )
+                        )
+                        actual_aec = bool(
+                            payload.get(
+                                "actualEchoCancellation",
+                                requested_aec,
+                            )
+                        )
+                        actual_agc = bool(
+                            payload.get(
+                                "actualAutoGainControl",
+                                requested_agc,
+                            )
+                        )
+                        active_mics = str(
+                            payload.get(
+                                "activeMicrophones",
+                                "",
+                            )
+                            or ""
+                        )
+
                         with self._stats_lock:
                             self.client_sample_rate = rate
                             self.packet_frames = packet_frames
@@ -2621,10 +2681,21 @@ class PhoneMicRuntime:
                             f"{label or 'microphone'} / "
                             f"{rate} Hz / "
                             f"{packet_frames} frames / "
-                            f"NS={'ON' if requested_ns else 'OFF'} / "
-                            f"AEC={'ON' if requested_aec else 'OFF'} / "
-                            f"AGC={'ON' if requested_agc else 'OFF'}"
+                            f"source={source_profile or 'unknown'} / "
+                            f"direction={direction_name or 'default'}"
+                            f"({'OK' if direction_applied else 'HAL?'}) / "
+                            f"field={field_zoom:+.2f}"
+                            f"({'OK' if field_applied else 'HAL?'}) / "
+                            f"NS={'ON' if actual_ns else 'OFF'} / "
+                            f"AEC={'ON' if actual_aec else 'OFF'} / "
+                            f"AGC={'ON' if actual_agc else 'OFF'}"
                         )
+
+                        if active_mics:
+                            self.log(
+                                "Galaxy active microphones: "
+                                + active_mics
+                            )
 
                     continue
 
@@ -4262,6 +4333,22 @@ class PhoneMicBridgeWidget(QWidget):
         )
         dsp_layout.addRow(
             raw_note
+        )
+
+        self.s24_voice_focus_dsp_button = QPushButton(
+            "S24 Voice Focus DSP 권장값"
+        )
+        self.s24_voice_focus_dsp_button.setToolTip(
+            "S24 내장 마이크용 보수적 프리셋입니다. "
+            "80Hz 저역 컷, 순간음 억제, Smart Voice Gain, limiter를 켜고 "
+            "Hard Gate는 사용하지 않습니다. 각 값은 적용 후 다시 개별 조절할 수 있습니다."
+        )
+        self.s24_voice_focus_dsp_button.clicked.connect(
+            self.apply_s24_voice_focus_dsp_preset
+        )
+        dsp_layout.addRow(
+            "",
+            self.s24_voice_focus_dsp_button,
         )
 
         self.gain_spin = QDoubleSpinBox()
@@ -6117,6 +6204,52 @@ class PhoneMicBridgeWidget(QWidget):
             final_monitor_gain_db=self.final_monitor_gain_spin.value(),
             realtime_rvc_enabled=self.realtime_rvc_enable_check.isChecked(),
             rvc_ab_debug_enabled=self.rvc_ab_debug_check.isChecked(),
+        )
+
+    def apply_s24_voice_focus_dsp_preset(
+        self,
+    ) -> None:
+        self.gain_spin.setValue(
+            0.0
+        )
+        self.highpass_check.setChecked(
+            True
+        )
+        self.highpass_spin.setValue(
+            80.0
+        )
+        self.gate_check.setChecked(
+            False
+        )
+        self.transient_check.setChecked(
+            True
+        )
+        self.transient_reduction_spin.setValue(
+            10.0
+        )
+        self.smart_gain_check.setChecked(
+            True
+        )
+        self.smart_gain_target_spin.setValue(
+            -20.0
+        )
+        self.smart_gain_max_spin.setValue(
+            12.0
+        )
+        self.limiter_check.setChecked(
+            True
+        )
+        self.limiter_ceiling_spin.setValue(
+            -1.0
+        )
+
+        self._save_settings()
+        self._apply_runtime_settings()
+
+        self.runtime.log(
+            "[S24 Voice Focus DSP] 적용: "
+            "HPF=80Hz / Gate=OFF / Click-Key=ON 10dB / "
+            "SmartGain target=-20dBFS max=+12dB / Limiter=-1dBFS"
         )
 
     def on_monitor_toggled(
